@@ -45,8 +45,11 @@ pub mod glyph_names;
 pub mod markdown_layout;
 #[doc(hidden)]
 pub mod ocr;
+
 #[doc(hidden)]
 pub mod ocr_merge;
+/// Native readers for office formats (DOCX today), bypassing LibreOffice.
+pub mod office;
 #[doc(hidden)]
 pub mod output;
 #[doc(hidden)]

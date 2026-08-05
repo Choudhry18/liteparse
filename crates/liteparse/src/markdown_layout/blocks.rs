@@ -39,6 +39,20 @@ pub enum Block {
         header: Option<Vec<String>>,
         rows: Vec<Vec<String>>,
     },
+    /// Table whose cells carry explicit spans. Emitted by producers that know
+    /// the merge structure outright (the native office path reads `gridSpan` /
+    /// `vMerge` from the DOCX) rather than inferring it from coordinates.
+    ///
+    /// `rows` is *not* rectangular: a cell absorbed by a neighbour's
+    /// `colspan`/`rowspan` is omitted entirely, exactly as in HTML. `header_rows`
+    /// is the count of leading rows that are header rows (`<th>`); 0 means none.
+    ///
+    /// Renders as a GFM pipe table when it degenerates to a plain grid, and as
+    /// HTML `<table>` otherwise — pipe tables cannot express spans at all.
+    MergedTable {
+        rows: Vec<Vec<Cell>>,
+        header_rows: usize,
+    },
     /// Tabular-looking region we couldn't classify confidently — rendered
     /// verbatim inside a fenced block to preserve visual structure for the
     /// downstream LLM. Strictly better than emitting a mangled pipe table.
@@ -54,6 +68,54 @@ pub enum Block {
         id: String,
         format: String,
     },
+}
+
+/// One cell of a [`Block::MergedTable`]. `colspan`/`rowspan` are 1 for an
+/// ordinary cell; the cells they cover are absent from `rows` rather than
+/// present-and-empty, matching HTML's occupancy model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    pub text: String,
+    pub colspan: u16,
+    pub rowspan: u16,
+}
+
+impl Cell {
+    /// A plain 1x1 cell.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            colspan: 1,
+            rowspan: 1,
+        }
+    }
+
+    /// A cell spanning `colspan` columns and `rowspan` rows. Zero is coerced to
+    /// 1 — a zero span is meaningless in HTML and `rowspan="0"` means "to the
+    /// end of the section", which is not what any producer here intends.
+    pub fn spanning(text: impl Into<String>, colspan: u16, rowspan: u16) -> Self {
+        Self {
+            text: text.into(),
+            colspan: colspan.max(1),
+            rowspan: rowspan.max(1),
+        }
+    }
+
+    fn is_plain(&self) -> bool {
+        self.colspan <= 1 && self.rowspan <= 1
+    }
+}
+
+impl From<&str> for Cell {
+    fn from(s: &str) -> Self {
+        Cell::new(s)
+    }
+}
+
+impl From<String> for Cell {
+    fn from(s: String) -> Self {
+        Cell::new(s)
+    }
 }
 
 /// Resolve a `ParaAccum` to a `Block::Paragraph`. When the paragraph was
@@ -94,6 +156,97 @@ fn wrap_emphasis(text: &str, bold: bool, italic: bool) -> String {
         (false, true) => format!("*{text}*"),
         (false, false) => text.to_string(),
     }
+}
+
+/// Render a GFM pipe table. `head` is the header row (already chosen by the
+/// caller); `body` the remaining rows. No-ops when there are no columns.
+fn render_pipe_table(head: Option<&[String]>, body: &[Vec<String>], out: &mut String) {
+    let column_count = head.map(|h| h.len()).unwrap_or(0);
+    if column_count == 0 {
+        return;
+    }
+    out.push_str("| ");
+    for (i, cell) in head.unwrap().iter().enumerate() {
+        if i > 0 {
+            out.push_str(" | ");
+        }
+        out.push_str(&escape_table_cell(cell));
+    }
+    out.push_str(" |\n");
+    out.push('|');
+    for _ in 0..column_count {
+        out.push_str("---|");
+    }
+    for row in body {
+        out.push_str("\n| ");
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" | ");
+            }
+            out.push_str(&escape_table_cell(cell));
+        }
+        out.push_str(" |");
+    }
+}
+
+/// Escape a cell for HTML `<td>` content. Markdown specials are deliberately
+/// left alone — inside an HTML block they are literal text, and escaping them
+/// would surface backslashes in the rendered output.
+fn escape_html_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\n' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// True when a merged table degenerates to a plain rectangular grid, in which
+/// case the pipe rendering is both valid and nicer to read.
+fn is_plain_grid(rows: &[Vec<Cell>], header_rows: usize) -> bool {
+    // GFM has exactly one header row, or none.
+    if header_rows > 1 {
+        return false;
+    }
+    if !rows.iter().all(|r| r.iter().all(Cell::is_plain)) {
+        return false;
+    }
+    // Ragged rows can only have come from spans we've just ruled out, but check
+    // anyway: a pipe table with uneven rows renders as a broken table.
+    let width = rows.first().map(|r| r.len()).unwrap_or(0);
+    rows.iter().all(|r| r.len() == width)
+}
+
+/// Render a merged table as HTML. Cells covered by a neighbour's span are
+/// simply absent from `rows`, so this is a direct transcription.
+fn render_html_table(rows: &[Vec<Cell>], header_rows: usize, out: &mut String) {
+    out.push_str("<table>");
+    for (r, row) in rows.iter().enumerate() {
+        out.push_str("\n<tr>");
+        let tag = if r < header_rows { "th" } else { "td" };
+        for cell in row {
+            out.push_str("\n<");
+            out.push_str(tag);
+            if cell.colspan > 1 {
+                out.push_str(&format!(" colspan=\"{}\"", cell.colspan));
+            }
+            if cell.rowspan > 1 {
+                out.push_str(&format!(" rowspan=\"{}\"", cell.rowspan));
+            }
+            out.push('>');
+            out.push_str(&escape_html_cell(&cell.text));
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
+        }
+        out.push_str("\n</tr>");
+    }
+    out.push_str("\n</table>");
 }
 
 /// Render a list of blocks to a markdown string.
@@ -181,31 +334,30 @@ pub fn render_blocks(blocks: &[Block]) -> String {
                         None => (None, rows.as_slice()),
                     },
                 };
-                let column_count = head.map(|h| h.len()).unwrap_or(0);
-                if column_count == 0 {
+                render_pipe_table(head, body, &mut out);
+            }
+            Block::MergedTable { rows, header_rows } => {
+                if rows.is_empty() {
                     continue;
                 }
-                out.push_str("| ");
-                for (i, cell) in head.unwrap().iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(" | ");
-                    }
-                    out.push_str(&escape_table_cell(cell));
-                }
-                out.push_str(" |\n");
-                out.push('|');
-                for _ in 0..column_count {
-                    out.push_str("---|");
-                }
-                for row in body {
-                    out.push_str("\n| ");
-                    for (i, cell) in row.iter().enumerate() {
-                        if i > 0 {
-                            out.push_str(" | ");
-                        }
-                        out.push_str(&escape_table_cell(cell));
-                    }
-                    out.push_str(" |");
+                if is_plain_grid(rows, *header_rows) {
+                    // Degenerate case — no merges, so pipes are expressive
+                    // enough. Reuse the exact same rendering the PDF path gets,
+                    // including the promote-first-row-when-headerless rule.
+                    let plain: Vec<Vec<String>> = rows
+                        .iter()
+                        .map(|r| r.iter().map(|c| c.text.clone()).collect())
+                        .collect();
+                    // `header_rows` is 0 or 1 here (>1 forces HTML). Either way
+                    // the first row leads: as the real header, or promoted into
+                    // one because GFM has no headerless table.
+                    let (head, body) = match plain.split_first() {
+                        Some((first, rest)) => (Some(first.as_slice()), rest),
+                        None => (None, plain.as_slice()),
+                    };
+                    render_pipe_table(head, body, &mut out);
+                } else {
+                    render_html_table(rows, *header_rows, &mut out);
                 }
             }
             Block::GridFallback { lines } => {
@@ -387,6 +539,90 @@ mod tests {
         // Trailing dash not preceded by a letter doesn't splice.
         let s = render_blocks(&[p("a -"), p("dash line")]);
         assert_eq!(s, "a -\n\ndash line");
+    }
+
+    #[test]
+    fn merged_table_without_spans_renders_as_pipes() {
+        // A merge-aware producer that happens to emit a plain grid must be
+        // byte-identical to the PDF path's pipe table — otherwise the same
+        // table looks different depending on which pipeline produced it.
+        let plain = Block::Table {
+            header: Some(vec!["a".into(), "b".into()]),
+            rows: vec![vec!["1".into(), "2".into()]],
+        };
+        let merged = Block::MergedTable {
+            header_rows: 1,
+            rows: vec![
+                vec![Cell::new("a"), Cell::new("b")],
+                vec![Cell::new("1"), Cell::new("2")],
+            ],
+        };
+        assert_eq!(render_blocks(&[plain]), render_blocks(&[merged]));
+    }
+
+    #[test]
+    fn merged_table_with_spans_renders_as_html() {
+        // Cells covered by a span are absent, not empty — row 1 has one cell.
+        let s = render_blocks(&[Block::MergedTable {
+            header_rows: 1,
+            rows: vec![
+                vec![Cell::spanning("wide", 2, 1)],
+                vec![Cell::spanning("tall", 1, 2), Cell::new("x")],
+                vec![Cell::new("y")],
+            ],
+        }]);
+        assert_eq!(
+            s,
+            "<table>\n<tr>\n<th colspan=\"2\">wide</th>\n</tr>\n\
+             <tr>\n<td rowspan=\"2\">tall</td>\n<td>x</td>\n</tr>\n\
+             <tr>\n<td>y</td>\n</tr>\n</table>"
+        );
+    }
+
+    #[test]
+    fn merged_table_escapes_html_not_markdown() {
+        // Inside an HTML block, markdown specials are literal; `<` is not.
+        let s = render_blocks(&[Block::MergedTable {
+            header_rows: 0,
+            rows: vec![vec![Cell::new("a|b *c* <d> &e"), Cell::spanning("f", 2, 1)]],
+        }]);
+        assert!(s.contains("<td>a|b *c* &lt;d&gt; &amp;e</td>"), "{s}");
+    }
+
+    #[test]
+    fn merged_table_multiple_header_rows_force_html() {
+        // Two header rows have no pipe-table representation even with no spans.
+        let s = render_blocks(&[Block::MergedTable {
+            header_rows: 2,
+            rows: vec![
+                vec![Cell::new("a"), Cell::new("b")],
+                vec![Cell::new("c"), Cell::new("d")],
+                vec![Cell::new("1"), Cell::new("2")],
+            ],
+        }]);
+        assert!(s.starts_with("<table>"), "{s}");
+        assert_eq!(s.matches("<th>").count(), 4);
+        assert_eq!(s.matches("<td>").count(), 2);
+    }
+
+    #[test]
+    fn merged_table_ragged_rows_force_html() {
+        // Uneven row widths with no declared spans would render as a broken
+        // pipe table; HTML at least preserves the cells.
+        let s = render_blocks(&[Block::MergedTable {
+            header_rows: 1,
+            rows: vec![vec![Cell::new("a"), Cell::new("b")], vec![Cell::new("1")]],
+        }]);
+        assert!(s.starts_with("<table>"), "{s}");
+    }
+
+    #[test]
+    fn zero_span_is_coerced_to_one() {
+        // `rowspan="0"` means "to the end of the section" in HTML — never what
+        // a producer means here, so it must not survive into the output.
+        let c = Cell::spanning("x", 0, 0);
+        assert_eq!((c.colspan, c.rowspan), (1, 1));
+        assert!(c.is_plain());
     }
 
     #[test]
