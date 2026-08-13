@@ -363,17 +363,26 @@ impl LiteParse {
         self.validate_output_config()?;
 
         // Native DOCX path: parse + resolve + layout in-process, no
-        // LibreOffice, no PDFium, no OCR. Fail-open: any error (or panic — the
-        // layout engine is young) logs and falls through to the conversion
-        // path, as does a config asking for something the native path cannot
-        // honor and a text-sparse document when OCR is on.
+        // LibreOffice, no PDFium, no OCR. Fail-open only for *engine*
+        // failures: any error (or panic — the layout engine is young) logs
+        // and falls through to the conversion path, as does a text-sparse
+        // document when OCR is on. A config asking for something the native
+        // path cannot honor is a hard error instead — the user picks the
+        // engine, the engine never silently swaps itself out.
         #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
         if self.config.office_native {
             if let Some(reason) = self.native_docx_ineligible_reason() {
+                // Unsupported option + native mode = a hard error, not a
+                // silent engine swap: falling back to LibreOffice here would
+                // hand back different geometry/pagination than every other
+                // parse of the same document. The user opts into the
+                // conversion path explicitly instead.
                 if crate::office::docx_bytes(&input).is_some() {
-                    log(&format!(
-                        "[liteparse] office_native: conversion path ({reason})"
-                    ));
+                    return Err(LiteParseError::Config(format!(
+                        "`{reason}` is not supported by the native DOCX path; \
+                         disable it, or set office_native = false \
+                         (CLI: --no-office-native) to parse via the conversion path"
+                    )));
                 }
             } else if let Some(bytes) = crate::office::docx_bytes(&input) {
                 match self.try_parse_docx_native(&bytes) {
@@ -756,18 +765,19 @@ impl LiteParse {
     /// in the list: it is `None` for converted inputs already, and the native
     /// path keeps that rule.
     #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    /// Config options the native DOCX path cannot honor. Hitting one with
+    /// `office_native` on is a hard `Config` error, not a fallback — see the
+    /// check in `parse_input`. `extract_images` (native media bytes) and
+    /// `extract_xfa_packets` (honestly empty — DOCX has no XFA) are
+    /// supported and deliberately absent from this list.
     fn native_docx_ineligible_reason(&self) -> Option<&'static str> {
         let c = &self.config;
-        if c.effective_extract_images() {
-            Some("extract_images")
-        } else if c.extract_annotations {
+        if c.extract_annotations {
             Some("extract_annotations")
         } else if c.extract_form_fields {
             Some("extract_form_fields")
         } else if c.extract_structure_tree {
             Some("extract_structure_tree")
-        } else if c.extract_xfa_packets {
-            Some("extract_xfa_packets")
         } else if c.extract_vector_graphics {
             Some("extract_vector_graphics")
         } else if c.include_complexity {
@@ -834,7 +844,32 @@ impl LiteParse {
             }
         }
 
-        let tagged = docx::emit_with_sources(&resolved);
+        // Figures mirror the PDF path's gate (interleaved only when
+        // `image_mode != Off`); pixel bytes surface only under
+        // `effective_extract_images`, also as on the PDF path.
+        let want_figures = self.config.image_mode != crate::config::ImageMode::Off;
+        let want_images = self.config.effective_extract_images();
+        let native_images = if want_figures || want_images {
+            docx_layout::collect_images(&layouted)
+        } else {
+            docx_layout::NativeImages {
+                images: Vec::new(),
+                figure_ids: std::collections::HashMap::new(),
+            }
+        };
+        let images = if want_images {
+            native_images.images
+        } else {
+            Vec::new()
+        };
+
+        let tagged = docx::emit_with_sources(
+            &resolved,
+            docx::EmitOptions {
+                links: self.config.extract_links,
+                figures: want_figures.then_some(native_images.figure_ids),
+            },
+        );
         let n_pages = native.pages.len();
         let page_blocks = split_blocks_by_page(&tagged, &native.block_pages, n_pages);
         let all_blocks: Vec<crate::markdown_layout::Block> =
@@ -859,12 +894,23 @@ impl LiteParse {
         }
         let (pages, page_blocks): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
 
-        Ok(Some(self.parse_from_native_blocks(
+        let mut result = self.parse_from_native_blocks(
             pages,
             page_blocks,
             (!page_filtered).then_some(all_blocks),
             native.outline,
-        )))
+            images,
+        );
+
+        // Same post-passes as the PDF path, same order: duplicate figure refs
+        // point at the canonical name, then only canonical files are written.
+        if self.config.output_format == crate::config::OutputFormat::Markdown {
+            rewrite_duplicate_image_refs(&mut result.pages, &mut result.text, &result.images);
+        }
+        if want_images && let Some(output_dir) = self.config.image_output_dir.as_deref() {
+            write_extracted_images(output_dir, &mut result.images)?;
+        }
+        Ok(Some(result))
     }
 
     /// `parse_from_pages`'s native sibling: no projection — the block model
@@ -887,6 +933,7 @@ impl LiteParse {
         page_blocks: Vec<Vec<crate::markdown_layout::Block>>,
         all_blocks: Option<Vec<crate::markdown_layout::Block>>,
         outline: Vec<OutlineTarget>,
+        images: Vec<crate::types::ExtractedImage>,
     ) -> ParseResult {
         let markdown_out = self.config.output_format == crate::config::OutputFormat::Markdown;
         let parsed_pages: Vec<ParsedPage> = pages
@@ -947,13 +994,16 @@ impl LiteParse {
             pages: parsed_pages,
             text: full_text,
             outline,
-            images: Vec::new(),
+            images,
             image_error_count: 0,
             form_type: None,
             creator: None,
             producer: None,
             doc_meta: None,
-            xfa_packets: None,
+            // XFA is a PDF/LiveCycle container; a DOCX cannot carry packets.
+            // `Some([])` keeps the JSON shape identical to the conversion
+            // path, which also finds none in a LibreOffice-produced PDF.
+            xfa_packets: self.config.extract_xfa_packets.then(Vec::new),
         }
     }
 

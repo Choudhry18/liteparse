@@ -102,6 +102,11 @@ async fn test_parse_bytes_office_integration() {
     {
         return;
     }
+    // `sample3.doc` is a renamed Word 2007+ (.docx) file, so byte input has no
+    // extension to go on and the container sniff routes it down the native
+    // DOCX path when that feature is on. Native pagination is host-dependent
+    // (font substitution can spill a page — see NATIVE_OFFICE_PLAN.md), so
+    // assert a page range rather than pinning LibreOffice's exact count.
     let fixture_path = "../../integration_tests_data/sample3.doc";
     let lit = LiteParse::new(LiteParseConfig::default());
     let data = tokio::fs::read(fixture_path)
@@ -112,7 +117,12 @@ async fn test_parse_bytes_office_integration() {
         .parse_input(input)
         .await
         .expect("Should be able to parse");
-    assert_eq!(parsed.pages.len(), 2);
+    assert!(
+        (2..=3).contains(&parsed.pages.len()),
+        "expected 2-3 pages, got {}",
+        parsed.pages.len()
+    );
+    assert!(parsed.pages.iter().all(|p| !p.text_items.is_empty()));
 }
 
 #[tokio::test]
@@ -291,6 +301,12 @@ async fn test_annotation_text_complexity_reason() {
 /// doc-level markdown byte-identical to the pure structure path
 /// (`docx_to_blocks` → `render_blocks`) — the invariant that pins the
 /// docx_rules_eval corpus score.
+///
+/// The byte-identity holds under the default `image_mode` because this
+/// fixture's only images are header decorations, which the body walk never
+/// reaches — no `Block::Figure`s are emitted. A fixture with body images
+/// would need `image_mode: Off` here, since the structure-only path cannot
+/// produce the layout-assigned figure ids.
 #[cfg(feature = "docx-native")]
 #[tokio::test]
 #[serial]
@@ -304,7 +320,8 @@ async fn test_parse_docx_native_integration() {
     let parsed = lit.parse(path).await.expect("native parse succeeds");
 
     let data = std::fs::read(path).expect("fixture readable");
-    let blocks = liteparse::office::docx::docx_to_blocks(&data).expect("blocks");
+    // `true` mirrors the default `extract_links` the parse above ran with.
+    let blocks = liteparse::office::docx::docx_to_blocks(&data, true).expect("blocks");
     let expected = liteparse::markdown_layout::render_blocks(&blocks);
     assert_eq!(
         parsed.text, expected,
@@ -338,4 +355,72 @@ async fn test_parse_docx_native_integration() {
             .all(|p| p.page_width > 0.0 && p.page_height > 0.0),
         "real page dimensions"
     );
+}
+
+/// Native image extraction: original embedded bytes surface on
+/// `ParseResult.images` with platform naming, markdown carries matching
+/// figure refs for body images, and repeated media (the per-page header
+/// logo case) dedups to one canonical entry.
+#[cfg(feature = "docx-native")]
+#[tokio::test]
+#[serial]
+async fn test_parse_docx_native_images_integration() {
+    let lit = LiteParse::new(LiteParseConfig {
+        output_format: liteparse::config::OutputFormat::Markdown,
+        extract_images: true,
+        quiet: true,
+        ..Default::default()
+    });
+
+    // Body images: every extracted entry has bytes and a matching markdown
+    // figure reference.
+    let parsed = lit
+        .parse("../../docx_files/financial/fdic_srs_user_guide.docx")
+        .await
+        .expect("native parse succeeds");
+    assert!(
+        !parsed.images.is_empty(),
+        "drawing commands surface as extracted images"
+    );
+    for img in &parsed.images {
+        assert!(!img.bytes.is_empty(), "{}: bytes present", img.id);
+        assert!(
+            img.width > 0 && img.height > 0,
+            "{}: real pixel dims",
+            img.id
+        );
+        assert!(
+            parsed
+                .text
+                .contains(&format!("![](img_{}.{})", img.id, img.format)),
+            "{}: figure ref in markdown",
+            img.id
+        );
+    }
+
+    // Header-logo dedup: one canonical entry, every other placement points
+    // at it and shares its bytes.
+    let parsed = lit
+        .parse("../../docx_files/enterprise/nitaac_sow_template.docx")
+        .await
+        .expect("native parse succeeds");
+    let canonical: Vec<_> = parsed
+        .images
+        .iter()
+        .filter(|i| i.duplicate_of.is_none())
+        .collect();
+    let dups: Vec<_> = parsed
+        .images
+        .iter()
+        .filter(|i| i.duplicate_of.is_some())
+        .collect();
+    assert_eq!(canonical.len(), 1, "one canonical logo");
+    assert!(!dups.is_empty(), "repeated placements dedup");
+    for d in &dups {
+        assert_eq!(d.duplicate_of.as_deref(), Some(canonical[0].id.as_str()));
+        assert!(
+            std::sync::Arc::ptr_eq(&d.bytes, &canonical[0].bytes),
+            "duplicates share the canonical buffer"
+        );
+    }
 }

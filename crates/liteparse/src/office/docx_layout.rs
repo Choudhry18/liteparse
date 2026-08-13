@@ -10,21 +10,20 @@
 //!
 //! Facts that are geometric inferences on the PDF path arrive here as data:
 //! `LinkAnnotation` → [`TextItem::link`], `Outline` marks →
-//! [`OutlineTarget`]s. Two deliberate v1 gaps, both documented in the plan:
-//! `TextItem::strike` stays `false` (the vendored layout never draws
-//! strikethrough lines — markdown strike comes from the block emitter's
-//! cascade, which reads the source instead of geometry), and `Image`/`Path`
-//! commands feed nothing (no Figure blocks exist on the native markdown path
-//! yet; `ParseResult.images` stays empty).
+//! [`OutlineTarget`]s, `Image` commands → [`ExtractedImage`]s with the
+//! *original* embedded bytes (see [`collect_images`]). One deliberate v1 gap,
+//! documented in the plan: `TextItem::strike` stays `false` (the vendored
+//! layout never draws strikethrough lines — markdown strike comes from the
+//! block emitter's cascade, which reads the source instead of geometry).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use liteparse_docx::render::fonts::FontRegistry;
 use liteparse_docx::render::layout::draw_command::{DrawCommand, LayoutedPage, OutlineMark};
 use liteparse_docx::render::layout::fragment::FontProps;
 use liteparse_docx::render::layout::measurer::TextMeasurer;
 
-use crate::types::{OutlineTarget, Page, Rect, TextItem, WordBox};
+use crate::types::{ExtractedImage, OutlineTarget, Page, Rect, TextItem, WordBox};
 
 /// Everything the native pipeline taps out of a laid-out document.
 pub struct NativeLayout {
@@ -280,6 +279,147 @@ fn assign_links(items: &mut [TextItem], links: &[(Rect, String)]) {
             }
         }
     }
+}
+
+/// Native images tapped from the draw-command stream.
+pub struct NativeImages {
+    /// One entry per surfaced placement, in (page, draw-order). Duplicate
+    /// placements of one media entry carry `duplicate_of` and share the
+    /// canonical entry's bytes, matching the PDF path's dedup contract.
+    pub images: Vec<ExtractedImage>,
+    /// Media identity (`MediaEntry::data` allocation pointer) → FIFO of
+    /// `(figure id, extension)` in draw order. The block emitter pops from
+    /// these queues to give its `Block::Figure`s the layout-assigned
+    /// page-scoped ids, joining the two walks without guessing.
+    pub figure_ids: HashMap<usize, VecDeque<(String, String)>>,
+}
+
+/// File extension for a media format we surface as an extracted image.
+///
+/// `None` skips the image entirely: EMF/WMF are vector metafiles and SVG is
+/// XML — the PDF path only ever emits raster jpg/png (PDFium rasterizes
+/// everything), so surfacing bytes most consumers cannot decode would be a
+/// worse contract than omitting them. Word's SVG embeds normally carry a PNG
+/// fallback blip, which is the one the layout draws.
+fn media_extension(format: liteparse_docx::model::ImageFormat) -> Option<&'static str> {
+    use liteparse_docx::model::ImageFormat as F;
+    match format {
+        F::Png => Some("png"),
+        F::Jpeg => Some("jpg"),
+        F::Gif => Some("gif"),
+        F::Bmp => Some("bmp"),
+        F::Tiff => Some("tiff"),
+        F::WebP => Some("webp"),
+        F::Svg | F::Emf | F::Wmf | F::Unknown => None,
+    }
+}
+
+/// Collect embedded images from the draw-command stream.
+///
+/// Ids follow the platform extractor's `p{page}_{n}` naming (1-based, per
+/// page, in draw order) so `img_{id}.{ext}` file names line up with the PDF
+/// path's. Bytes are the *original* embedded media — no re-encode, unlike the
+/// PDF path which rasterizes through PDFium — so a JPEG stays the exact JPEG
+/// the author inserted. `src_rect` crops are not applied to the bytes; `bbox`
+/// is the placed rectangle either way.
+pub fn collect_images(layouted: &[LayoutedPage]) -> NativeImages {
+    use std::hash::{Hash, Hasher};
+
+    let mut images: Vec<ExtractedImage> = Vec::new();
+    let mut figure_ids: HashMap<usize, VecDeque<(String, String)>> = HashMap::new();
+    // Same media Arc ⇒ same bytes, free dedup for the common repeated-rel
+    // case (a logo in every page's header is ONE relationship).
+    let mut by_ptr: HashMap<usize, usize> = HashMap::new();
+    // Distinct rels can still hold identical bytes; hash → candidate
+    // canonical indices, confirmed by full compare like the PDF path's cache.
+    let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+
+    for (page_idx, lp) in layouted.iter().enumerate() {
+        let page_number = (page_idx + 1) as u32;
+        let mut n = 0u32;
+        for cmd in &lp.commands {
+            let DrawCommand::Image {
+                rect, image_data, ..
+            } = cmd
+            else {
+                continue;
+            };
+            let Some(ext) = media_extension(image_data.format) else {
+                continue;
+            };
+            n += 1;
+            let id = format!("p{page_number}_{n}");
+            let bbox = Rect {
+                x: rect.origin.x.raw(),
+                y: rect.origin.y.raw(),
+                width: rect.size.width.raw(),
+                height: rect.size.height.raw(),
+            };
+            let ptr = image_data.data.as_ptr() as usize;
+
+            let canonical_idx = by_ptr.get(&ptr).copied().or_else(|| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                image_data.data.hash(&mut h);
+                by_hash
+                    .get(&h.finish())?
+                    .iter()
+                    .copied()
+                    .find(|&i| *images[i].bytes == *image_data.data)
+            });
+
+            let entry = if let Some(ci) = canonical_idx {
+                let canonical = &images[ci];
+                ExtractedImage {
+                    id: id.clone(),
+                    name: format!("img_{id}.{ext}"),
+                    path: None,
+                    page: page_number,
+                    bbox,
+                    width: canonical.width,
+                    height: canonical.height,
+                    rotation: 0.0,
+                    format: ext.to_string(),
+                    duplicate_of: Some(canonical.id.clone()),
+                    bytes: std::sync::Arc::clone(&canonical.bytes),
+                }
+            } else {
+                let bytes = std::sync::Arc::new(image_data.data.to_vec());
+                let (width, height) =
+                    image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+                        .with_guessed_format()
+                        .ok()
+                        .and_then(|r| r.into_dimensions().ok())
+                        .unwrap_or((0, 0));
+                ExtractedImage {
+                    id: id.clone(),
+                    name: format!("img_{id}.{ext}"),
+                    path: None,
+                    page: page_number,
+                    bbox,
+                    width,
+                    height,
+                    rotation: 0.0,
+                    format: ext.to_string(),
+                    duplicate_of: None,
+                    bytes,
+                }
+            };
+
+            if canonical_idx.is_none() {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                image_data.data.hash(&mut h);
+                by_hash.entry(h.finish()).or_default().push(images.len());
+                by_ptr.insert(ptr, images.len());
+            }
+            figure_ids
+                .entry(ptr)
+                .or_default()
+                .push_back((id, ext.to_string()));
+            images.push(entry);
+        }
+    }
+
+    NativeImages { images, figure_ids }
 }
 
 fn union_bounds(items: &[TextItem]) -> Option<Rect> {
