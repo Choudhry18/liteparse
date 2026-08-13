@@ -4,9 +4,12 @@ This crate is a vendored subset of **[dxpdf](https://github.com/nerdy-pro/dxpdf)
 v0.4.0** by nerdy.pro, used under the MIT License (see `LICENSE`).
 
 Upstream is a DOCX→PDF engine (`parse → resolve → layout → subset → paint`)
-built on Skia. We vendor only the first two stages, which contain no Skia
-references, so the result is pure Rust and builds on musl (rust-skia ships no
-musl prebuilts, and `skia-safe` on musl falls back to a ~1hr from-source build).
+built on Skia. We vendor `parse → resolve → layout`, with layout's one
+production Skia dependency (the `TextMeasurer`) rewritten over fontdb + skrifa,
+so the result is pure Rust and builds on musl (rust-skia ships no musl
+prebuilts, and `skia-safe` on musl falls back to a ~1hr from-source build).
+`subset` and `paint` are PDF-emission concerns and stay out — layout ends at
+`LayoutedPage` (draw commands), not a PDF.
 
 ## What was copied verbatim
 
@@ -15,24 +18,65 @@ src/docx/                 src/model/
 src/field/                src/render/resolve/
 src/error.rs
 src/render/{dimension,geometry,error}.rs
-src/render/layout/draw_command.rs   (referenced by resolve::shape_visuals)
-src/render/emoji/cluster.rs         (referenced by draw_command)
+src/render/layout/        (everything except measurer.rs and mod-decl edits;
+                           the whole build/fragment/paragraph/section/table
+                           pagination engine — vendored 2026-08-13)
+src/render/emoji/cluster.rs
+src/render/emoji/resolve.rs
+render/mod.rs sections: estimate_cursor_y, resolve_and_layout,
+                        layout_document, measure_header_footer_clearance,
+                        measure_header_bottom, measure_footer_extent
 ```
 
 ## What was changed
 
-1. `src/render/emf.rs` — **dropped**. The subset's only genuine `skia_safe`
-   import; converts Windows metafiles for the painter, unreachable from the
-   structure path.
-2. `src/render/fonts.rs` — **replaced with a shim.** Upstream is a Skia
-   `FontRegistry`; only `TypefaceEntry` is named here (one field of
-   `DrawCommand::Text`). This is the seam for a future harfrust+skrifa port.
-3. `src/lib.rs`, `src/render/mod.rs`, `src/render/layout/mod.rs`,
-   `src/render/emoji/mod.rs` — **rewritten** to declare only the copied modules.
-4. Edition-2024 pattern fixes (`ref mut` in an implicit borrow) in
-   `render/resolve/properties.rs` and `docx/parse/rel_rewrite.rs` — upstream
-   pins an older toolchain.
-5. Unknown-element tolerance — see below.
+1. `src/render/emf.rs` — **dropped**. Converts Windows metafiles for the
+   painter, unreachable from the structure and layout paths.
+2. `src/render/fonts.rs` — **rewritten over fontdb** (was a Skia
+   `FontRegistry`; briefly a shim between the structure vendor and the layout
+   vendor). Same consumed surface (`build`/`resolve`/`resolve_exact`/
+   `resolve_system_only`/`preload`, `TypefaceEntry`, `FontStyle`), with the
+   resolution rules proven in spikes 6–8: embedded-first, exact, face-alias
+   index (PostScript names + weight-qualified face names, with upstream's
+   ambiguity rule and `merged_alias_weight`), style-suffix strip, the
+   metric/visual substitution table, generic, and an explicit `LAST_RESORT`
+   chain (`fontdb::Family::SansSerif` is not a reliable floor). Every
+   resolution records a `ResolveRule`; only embedded/exact/alias/suffix/
+   `Substitution(Metric)` claim cross-host reproducibility. Geometry is
+   deliberately host-dependent beyond that (decision 2026-08-13: no bundled
+   fonts, no checksum pinning).
+3. `src/render/layout/measurer.rs` — **rewritten over skrifa.** Measurement
+   arithmetic copied verbatim (cmap advance sum, §17.3.2.45 text scale,
+   §17.3.2.35 char spacing); unmapped codepoints take .notdef's advance
+   (zero-contribution was tried and disproved, spike 6). Underline offsets are
+   negative-below — skrifa's `post` value passes through untouched; upstream's
+   comment at its `measurer.rs:156` states the opposite of what its code does.
+   Emoji cluster advances are cmap-only (upstream's own fallback path) until a
+   harfrust shaper is wired; `emoji/{shape,raster}.rs` are not vendored.
+4. `src/render/emoji/resolve.rs` — one import swapped (`skia_safe::FontStyle`
+   → `crate::render::fonts::FontStyle`); its test helper builds a
+   `TypefaceEntry` from the fontdb registry instead of a Skia `FontMgr`.
+5. `src/lib.rs`, `src/render/mod.rs`, `src/render/emoji/mod.rs` —
+   **rewritten** to declare only the vendored modules;
+   `src/render/layout/mod.rs` is now upstream's verbatim.
+6. Edition-2024 pattern fixes (`ref mut` in an implicit borrow) in
+   `render/resolve/properties.rs`, `docx/parse/rel_rewrite.rs`,
+   `render/layout/fragment/collect.rs`, `render/layout/paragraph/mod.rs` —
+   upstream pins an older toolchain.
+7. Test-only constructor edits: `FontRegistry::new(skia_safe::FontMgr::new())`
+   → `FontRegistry::new()` across layout test modules.
+8. Unknown-element tolerance — see below.
+
+## Layout parity (measured 2026-08-13, macOS host)
+
+Against upstream dxpdf 0.4.0 with Skia, same 48-doc corpus + long documents:
+48/48 within one page, 41/48 exact; of the exact docs, 37 have identical full
+draw-command censuses and 32 identical per-page text/char counts (identical
+line breaking). Every page diff is +1 and confined to documents requesting
+fonts the host lacks (Calibri/Cambria/Aptos) — the two engines fall back to
+different faces (Helvetica 1.00 em vs Arial-metrics 1.15 em line height), which
+is a host-font-book fact, not measurer error. `civil_jury.docx`: 616 vs 615
+pages (0.16% at 615 pages — drift does not compound).
 
 ## Fail-open parsing (the main deliberate divergence)
 

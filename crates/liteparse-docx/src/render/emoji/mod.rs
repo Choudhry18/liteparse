@@ -1,7 +1,10 @@
-//! Only `cluster`, the Skia-free half of dxpdf's emoji handling.
+//! The Skia-free half of dxpdf's emoji handling.
 //!
-//! `raster`, `resolve` and `shape` drive Skia colour-font (COLR/CBDT) painting
-//! and are omitted. `cluster` is pure Unicode segmentation and is referenced by
-//! `layout::draw_command`.
+//! `cluster` is pure Unicode segmentation (UAX #29 / UTS #51). `resolve` picks
+//! a color emoji typeface through the `FontRegistry` — typeface *identity*
+//! only, no rasterization. `raster` and `shape` drive Skia colour-font
+//! painting upstream and are omitted; cluster advances fall back to the
+//! cmap-only path in `layout::measurer`.
 
 pub mod cluster;
+pub mod resolve;
