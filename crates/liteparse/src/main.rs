@@ -54,6 +54,12 @@ struct ParseCommand {
     #[arg(long)]
     no_ocr: bool,
 
+    /// Force the LibreOffice conversion path for DOCX instead of the native
+    /// parser (builds with the docx-native feature parse DOCX natively by
+    /// default)
+    #[arg(long)]
+    no_office_native: bool,
+
     /// OCR language (Tesseract format, e.g. "eng", "fra", "deu")
     #[arg(long, default_value = "eng")]
     ocr_language: String,
@@ -204,6 +210,12 @@ struct BatchParseCommand {
     /// Disable OCR
     #[arg(long)]
     no_ocr: bool,
+
+    /// Force the LibreOffice conversion path for DOCX instead of the native
+    /// parser (builds with the docx-native feature parse DOCX natively by
+    /// default)
+    #[arg(long)]
+    no_office_native: bool,
 
     /// OCR language (Tesseract format, e.g. "eng", "fra", "deu")
     #[arg(long, default_value = "eng")]
@@ -385,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
+                office_native: !cmd.no_office_native,
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: cmd.target_pages,
@@ -488,6 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
+                office_native: !cmd.no_office_native,
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: None,

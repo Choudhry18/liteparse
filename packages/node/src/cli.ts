@@ -87,6 +87,10 @@ program
     collectHeader,
   )
   .option("--no-ocr", "Disable OCR")
+  .option(
+    "--no-office-native",
+    "Force the LibreOffice conversion path for DOCX instead of the native parser",
+  )
   .option("--ocr-language <lang>", "OCR language (default: eng)")
   .option("--max-pages <n>", "Max pages to parse", parseInt)
   .option(
@@ -132,6 +136,7 @@ program
       if (opts.extractImages) config.extractImages = true;
       if (opts.links === false) config.extractLinks = false;
       if (opts.keepHeadersFooters) config.keepHeadersFooters = true;
+      if (opts.officeNative === false) config.officeNative = false;
       if (opts.extractAnnotations) config.extractAnnotations = true;
       if (opts.extractFormFields) config.extractFormFields = true;
       if (opts.extractStructureTree) config.extractStructureTree = true;
@@ -317,6 +322,10 @@ program
   .argument("<output-dir>", "Output directory")
   .option("--format <format>", 'Output format: json|text|markdown (default: "text")')
   .option("--no-ocr", "Disable OCR")
+  .option(
+    "--no-office-native",
+    "Force the LibreOffice conversion path for DOCX instead of the native parser",
+  )
   .option("--ocr-language <lang>", "OCR language (default: eng)")
   .option("--ocr-server-url <url>", "HTTP OCR server URL")
   .option(
@@ -362,6 +371,7 @@ program
         const format = (opts.format as string) ?? "text";
         config.outputFormat = format as "json" | "text" | "markdown";
         if (opts.ocr === false) config.ocrEnabled = false;
+        if (opts.officeNative === false) config.officeNative = false;
         if (opts.ocrLanguage) config.ocrLanguage = opts.ocrLanguage as string;
         if (opts.ocrServerUrl)
           config.ocrServerUrl = opts.ocrServerUrl as string;

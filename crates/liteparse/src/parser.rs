@@ -362,6 +362,41 @@ impl LiteParse {
 
         self.validate_output_config()?;
 
+        // Native DOCX path: parse + resolve + layout in-process, no
+        // LibreOffice, no PDFium, no OCR. Fail-open: any error (or panic — the
+        // layout engine is young) logs and falls through to the conversion
+        // path, as does a config asking for something the native path cannot
+        // honor and a text-sparse document when OCR is on.
+        #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+        if self.config.office_native {
+            if let Some(reason) = self.native_docx_ineligible_reason() {
+                if crate::office::docx_bytes(&input).is_some() {
+                    log(&format!(
+                        "[liteparse] office_native: conversion path ({reason})"
+                    ));
+                }
+            } else if let Some(bytes) = crate::office::docx_bytes(&input) {
+                match self.try_parse_docx_native(&bytes) {
+                    Ok(Some(result)) => {
+                        let total =
+                            web_time::Instant::now().duration_since(t0).as_secs_f64() * 1000.0;
+                        log(&format!("[liteparse] native docx total: {:.1}ms", total));
+                        return Ok(result);
+                    }
+                    Ok(None) => {
+                        log(
+                            "[liteparse] office_native: text-sparse docx, falling back to conversion path for OCR",
+                        );
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "[liteparse] office_native failed ({e}); falling back to conversion path"
+                        ));
+                    }
+                }
+            }
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         let (validated_input, _guard) =
             conversion::resolve_pdf_input(input, self.config.password.as_deref(), false).await?;
@@ -716,6 +751,212 @@ impl LiteParse {
         }
     }
 
+    /// Config the native DOCX path cannot honor — these force the conversion
+    /// path so the caller still gets what they asked for. `doc_meta` is not
+    /// in the list: it is `None` for converted inputs already, and the native
+    /// path keeps that rule.
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    fn native_docx_ineligible_reason(&self) -> Option<&'static str> {
+        let c = &self.config;
+        if c.effective_extract_images() {
+            Some("extract_images")
+        } else if c.extract_annotations {
+            Some("extract_annotations")
+        } else if c.extract_form_fields {
+            Some("extract_form_fields")
+        } else if c.extract_structure_tree {
+            Some("extract_structure_tree")
+        } else if c.extract_xfa_packets {
+            Some("extract_xfa_packets")
+        } else if c.extract_vector_graphics {
+            Some("extract_vector_graphics")
+        } else if c.include_complexity {
+            Some("include_complexity")
+        } else if c.crop_box.is_some() {
+            Some("crop_box")
+        } else if c.skip_diagonal_text {
+            Some("skip_diagonal_text")
+        } else {
+            None
+        }
+    }
+
+    /// Run the native DOCX pipeline. `Ok(None)` means "eligible fallback":
+    /// the document is text-sparse and OCR is enabled, so the conversion path
+    /// (which can OCR embedded images) serves the caller better. Panics from
+    /// the vendored layout engine are caught and mapped to `Err` so the
+    /// caller degrades to LibreOffice instead of aborting.
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    fn try_parse_docx_native(&self, data: &[u8]) -> Result<Option<ParseResult>, LiteParseError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parse_docx_native_inner(data)
+        }))
+        .unwrap_or_else(|_| {
+            Err(LiteParseError::Conversion(
+                "native docx layout panicked".to_string(),
+            ))
+        })
+    }
+
+    /// Total text length below which a DOCX counts as text-sparse (likely a
+    /// scanned document pasted into Word) when OCR is enabled.
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    const NATIVE_TEXT_SPARSE_CHARS: usize = 32;
+
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    fn parse_docx_native_inner(&self, data: &[u8]) -> Result<Option<ParseResult>, LiteParseError> {
+        use crate::office::{docx, docx_layout};
+
+        let parsed = liteparse_docx::docx::parse(data)
+            .map_err(|e| LiteParseError::Conversion(format!("docx parse failed: {e}")))?;
+        let resolved = liteparse_docx::render::resolve::resolve(parsed);
+        // Build the registry directly rather than via `resolve_and_layout`,
+        // whose `.expect` panics on a font-less host; here that is a clean
+        // fallback to the conversion path instead.
+        let registry = liteparse_docx::render::fonts::FontRegistry::build(
+            &resolved.embedded_fonts,
+            &resolved.font_families,
+        )
+        .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
+        let layouted = liteparse_docx::render::layout_document(&resolved, &registry);
+        let native =
+            docx_layout::layout_to_pages(&layouted, &registry, self.config.emit_word_boxes);
+
+        if self.config.ocr_enabled {
+            let total_chars: usize = native
+                .pages
+                .iter()
+                .flat_map(|p| &p.text_items)
+                .map(|i| i.text.trim().len())
+                .sum();
+            if total_chars < Self::NATIVE_TEXT_SPARSE_CHARS {
+                return Ok(None);
+            }
+        }
+
+        let tagged = docx::emit_with_sources(&resolved);
+        let n_pages = native.pages.len();
+        let page_blocks = split_blocks_by_page(&tagged, &native.block_pages, n_pages);
+        let all_blocks: Vec<crate::markdown_layout::Block> =
+            tagged.into_iter().map(|(b, _)| b).collect();
+
+        // Page selection, mirroring the PDF path: `target_pages` filters by
+        // 1-based page number, then `max_pages` truncates. The outline stays
+        // whole-document, as it does on the PDF path. A page selection also
+        // narrows the doc-level text to the surviving pages' blocks.
+        let mut selected: Vec<(Page, Vec<crate::markdown_layout::Block>)> =
+            native.pages.into_iter().zip(page_blocks).collect();
+        let mut page_filtered = false;
+        if let Some(targets) = self.resolve_target_pages()? {
+            let keep: std::collections::HashSet<usize> =
+                targets.iter().map(|p| *p as usize).collect();
+            selected.retain(|(p, _)| keep.contains(&p.page_number));
+            page_filtered = true;
+        }
+        if selected.len() > self.config.max_pages {
+            selected.truncate(self.config.max_pages);
+            page_filtered = true;
+        }
+        let (pages, page_blocks): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
+
+        Ok(Some(self.parse_from_native_blocks(
+            pages,
+            page_blocks,
+            (!page_filtered).then_some(all_blocks),
+            native.outline,
+        )))
+    }
+
+    /// `parse_from_pages`'s native sibling: no projection — the block model
+    /// arrives from the DOCX source, so markdown is `render_blocks` per page
+    /// and page text is a straight reading-order join of the text items.
+    ///
+    /// Doc-level markdown renders from `all_blocks` when given, NOT by
+    /// joining the page renders: `render_blocks` is context-sensitive across
+    /// block boundaries (tight lists join with `\n`, soft-hyphen paragraph
+    /// splices join with nothing), so a page-boundary join would perturb
+    /// whitespace wherever a page break falls inside a list. Rendering the
+    /// whole sequence keeps `ParseResult.text` byte-identical to the pure
+    /// structure path; the per-page markdown is the paged *view* of the same
+    /// blocks. `None` (page-filtered parse) falls back to joining the
+    /// surviving pages.
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    fn parse_from_native_blocks(
+        &self,
+        pages: Vec<Page>,
+        page_blocks: Vec<Vec<crate::markdown_layout::Block>>,
+        all_blocks: Option<Vec<crate::markdown_layout::Block>>,
+        outline: Vec<OutlineTarget>,
+    ) -> ParseResult {
+        let markdown_out = self.config.output_format == crate::config::OutputFormat::Markdown;
+        let parsed_pages: Vec<ParsedPage> = pages
+            .into_iter()
+            .zip(page_blocks)
+            .map(|(p, blocks)| {
+                let text = native_page_text(&p.text_items);
+                let markdown = if markdown_out {
+                    crate::markdown_layout::render_blocks(&blocks)
+                } else {
+                    String::new()
+                };
+                ParsedPage {
+                    page_number: p.page_number,
+                    page_width: p.page_width,
+                    page_height: p.page_height,
+                    content_bounds: self
+                        .config
+                        .extract_content_bounds
+                        .then_some(p.content_bounds)
+                        .flatten(),
+                    text,
+                    markdown,
+                    text_items: p.text_items,
+                    projected_lines: Vec::new(),
+                    regions: crate::types::Region::default(),
+                    graphics: Vec::new(),
+                    vector_graphics: None,
+                    figures: Vec::new(),
+                    struct_nodes: Vec::new(),
+                    image_refs: Vec::new(),
+                    complexity: None,
+                    annotations: None,
+                    form_fields: None,
+                    structure_tree: None,
+                }
+            })
+            .collect();
+
+        let full_text = if markdown_out {
+            match all_blocks {
+                Some(blocks) => crate::markdown_layout::render_blocks(&blocks),
+                None => parsed_pages
+                    .iter()
+                    .map(|p| p.markdown.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n-----\n\n"),
+            }
+        } else {
+            parsed_pages
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        ParseResult {
+            pages: parsed_pages,
+            text: full_text,
+            outline,
+            images: Vec::new(),
+            image_error_count: 0,
+            form_type: None,
+            creator: None,
+            producer: None,
+            doc_meta: None,
+            xfa_packets: None,
+        }
+    }
+
     /// Generate screenshots of document pages as PNG bytes.
     ///
     /// Non-PDF files are automatically converted to PDF first (requires
@@ -778,6 +1019,74 @@ impl LiteParse {
     pub fn config(&self) -> &LiteParseConfig {
         &self.config
     }
+}
+
+/// Distribute the emitted blocks across pages using the layout's block→page
+/// map. A forward cursor plus `max` keeps the per-page lists a partition of
+/// the input in its original order — concatenating them reproduces the
+/// doc-level markdown exactly — while filling forward for blocks the layout
+/// recorded nowhere (empty paragraphs) and clamping any out-of-order page
+/// assignment a float relocation might produce. `Note` blocks land on the
+/// last page: doc-level output must keep notes at the very end, and many
+/// emitted notes (referenced only from headers or textboxes) have no
+/// physical body page at all.
+#[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+fn split_blocks_by_page(
+    tagged: &[(
+        crate::markdown_layout::Block,
+        crate::office::docx::BlockSource,
+    )],
+    block_pages: &std::collections::HashMap<usize, usize>,
+    n_pages: usize,
+) -> Vec<Vec<crate::markdown_layout::Block>> {
+    use crate::office::docx::BlockSource;
+    let n_pages = n_pages.max(1);
+    let mut out: Vec<Vec<crate::markdown_layout::Block>> =
+        (0..n_pages).map(|_| Vec::new()).collect();
+    let mut current = 0usize;
+    for (block, source) in tagged {
+        let page = match source {
+            BlockSource::Body(i) => block_pages
+                .get(i)
+                .copied()
+                .map_or(current, |p| current.max(p)),
+            BlockSource::Note => n_pages - 1,
+        };
+        let page = page.min(n_pages - 1);
+        current = page;
+        out[page].push(block.clone());
+    }
+    out
+}
+
+/// Reading-order plain text from native text items: emission order is the
+/// engine's layout order, so lines are rebuilt by baseline proximity and
+/// word gaps rather than by re-sorting (which would interleave columns).
+#[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+fn native_page_text(items: &[crate::types::TextItem]) -> String {
+    /// Fraction of the font size an x-gap must exceed to count as a missing
+    /// inter-word space (word commands carry no trailing spaces). Adjacent
+    /// same-word run splits sit at ~0 gap; a real space is ~0.25em.
+    const WORD_GAP_EM: f32 = 0.15;
+    let mut out = String::new();
+    let mut prev: Option<&crate::types::TextItem> = None;
+    for item in items.iter().filter(|i| !i.text.is_empty()) {
+        if let Some(p) = prev {
+            let font_size = p.font_size.unwrap_or(12.0).max(1.0);
+            let baseline = item.y + item.font_ascent.unwrap_or(item.height);
+            let prev_baseline = p.y + p.font_ascent.unwrap_or(p.height);
+            if (baseline - prev_baseline).abs() < 0.5 * font_size {
+                if item.x - (p.x + p.width) > WORD_GAP_EM * font_size {
+                    out.push(' ');
+                }
+            } else {
+                out.push('\n');
+            }
+        }
+        out.push_str(&item.text);
+        prev = Some(item);
+    }
+    out
 }
 
 #[cfg(test)]

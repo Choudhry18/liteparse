@@ -286,3 +286,56 @@ async fn test_annotation_text_complexity_reason() {
         page.reasons
     );
 }
+
+/// Native DOCX path end-to-end: real geometry per page, links as data, and
+/// doc-level markdown byte-identical to the pure structure path
+/// (`docx_to_blocks` → `render_blocks`) — the invariant that pins the
+/// docx_rules_eval corpus score.
+#[cfg(feature = "docx-native")]
+#[tokio::test]
+#[serial]
+async fn test_parse_docx_native_integration() {
+    let path = "../../docx_files/legal/uk_parl_media_bill_ia.docx";
+    let lit = LiteParse::new(LiteParseConfig {
+        output_format: liteparse::config::OutputFormat::Markdown,
+        quiet: true,
+        ..Default::default()
+    });
+    let parsed = lit.parse(path).await.expect("native parse succeeds");
+
+    let data = std::fs::read(path).expect("fixture readable");
+    let blocks = liteparse::office::docx::docx_to_blocks(&data).expect("blocks");
+    let expected = liteparse::markdown_layout::render_blocks(&blocks);
+    assert_eq!(
+        parsed.text, expected,
+        "native pipeline markdown must match the structure path byte-for-byte"
+    );
+
+    assert!(
+        parsed.pages.len() > 1,
+        "multi-page doc: {}",
+        parsed.pages.len()
+    );
+    assert!(
+        parsed.pages.iter().all(|p| !p.text_items.is_empty()),
+        "every page carries real text geometry"
+    );
+    let linked = parsed
+        .pages
+        .iter()
+        .flat_map(|p| &p.text_items)
+        .filter(|i| i.link.is_some())
+        .count();
+    assert!(linked > 0, "hyperlinks arrive as TextItem.link");
+    assert!(
+        !parsed.outline.is_empty(),
+        "outline extracted from headings"
+    );
+    assert!(
+        parsed
+            .pages
+            .iter()
+            .all(|p| p.page_width > 0.0 && p.page_height > 0.0),
+        "real page dimensions"
+    );
+}

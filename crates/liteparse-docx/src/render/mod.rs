@@ -142,6 +142,11 @@ pub fn layout_document(
     let mut pending_continuation: Option<layout::section::ContinuationState> = None;
     let even_and_odd = resolved.even_and_odd_headers;
 
+    // liteparse instrumentation: running offset turning each section's local
+    // block indices into indices over the flattened concatenation of every
+    // section's `blocks` — the same flattening the structure emitter walks.
+    let mut body_base: usize = 0;
+
     // Phase 1: layout all sections to determine total page count.
     for (section_idx, section) in resolved.sections.iter().enumerate() {
         let config = PageConfig::from_section(&section.properties);
@@ -161,6 +166,9 @@ pub fn layout_document(
         );
 
         let built = build_section_blocks(section, &config, &ctx, &mut state);
+        let block_sources: Vec<usize> =
+            built.source_indices.iter().map(|i| i + body_base).collect();
+        body_base += section.blocks.len();
         let measure_fn = |text: &str,
                           font: &layout::fragment::FontProps|
          -> (dimension::Pt, layout::fragment::TextMetrics) {
@@ -186,6 +194,7 @@ pub fn layout_document(
                 continuation,
                 clearance: &clearance,
                 logical_page_base,
+                block_sources: &block_sources,
             },
         );
 

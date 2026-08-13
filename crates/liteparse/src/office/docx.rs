@@ -35,15 +35,41 @@ pub fn docx_to_blocks(data: &[u8]) -> Result<Vec<Block>, LiteParseError> {
 
 /// Emit blocks for an already-resolved document.
 pub fn emit(doc: &ResolvedDocument) -> Vec<Block> {
-    let body: Vec<DocxBlock> = doc
-        .sections
-        .iter()
-        .flat_map(|s| s.blocks.iter().cloned())
-        .collect();
+    emit_with_sources(doc).into_iter().map(|(b, _)| b).collect()
+}
 
+/// Where an emitted [`Block`] came from, for the layout block→page join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSource {
+    /// Index into the flattened concatenation of every section's blocks
+    /// (section breaks included) — the same flattening whose indices the
+    /// layout engine records in `LayoutedPage::block_starts`.
+    Body(usize),
+    /// Footnote/endnote bodies, and the `HorizontalRule` that precedes them.
+    Note,
+}
+
+/// [`emit`], with each block tagged by the source body block that produced it.
+///
+/// One source block maps to zero or one emitted blocks today (empty paragraphs
+/// and section breaks emit nothing; nothing merges across source blocks), but
+/// the tagging tolerates zero-or-more either way.
+pub fn emit_with_sources(doc: &ResolvedDocument) -> Vec<(Block, BlockSource)> {
     let mut em = Emitter::new(doc);
-    let mut out = Vec::new();
-    em.blocks(&body, &mut out);
+    let mut out: Vec<(Block, BlockSource)> = Vec::new();
+    // One Emitter across all blocks: list counters must persist so an ordered
+    // list interrupted by prose continues its count.
+    let mut scratch = Vec::new();
+    let mut flat_idx = 0usize;
+    for section in &doc.sections {
+        for block in &section.blocks {
+            em.blocks(std::slice::from_ref(block), &mut scratch);
+            for b in scratch.drain(..) {
+                out.push((b, BlockSource::Body(flat_idx)));
+            }
+            flat_idx += 1;
+        }
+    }
 
     // Note bodies are appended after the document, behind a rule. Emit *all* of
     // them, not just those whose reference we walked past: notes are frequently
@@ -60,8 +86,8 @@ pub fn emit(doc: &ResolvedDocument) -> Vec<Block> {
         }
     }
     if !notes.is_empty() {
-        out.push(Block::HorizontalRule);
-        out.extend(notes);
+        out.push((Block::HorizontalRule, BlockSource::Note));
+        out.extend(notes.into_iter().map(|b| (b, BlockSource::Note)));
     }
     out
 }
@@ -569,5 +595,60 @@ mod tests {
             true,
         );
         assert_eq!(text, "**ab**!");
+    }
+
+    /// Provenance tagging must not change what is emitted; body indices must
+    /// be non-decreasing (the block→page join walks them with a forward
+    /// cursor); and note bodies must form a `Note`-tagged tail behind the
+    /// rule, so the page split can send them to the last page.
+    #[test]
+    fn emit_with_sources_is_emit_plus_tags() {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docx_files/legal/courts_3rd_circuit_ch4.docx"
+        ))
+        .expect("corpus fixture");
+        let parsed = liteparse_docx::docx::parse(&data).expect("fixture parses");
+        let doc = liteparse_docx::render::resolve::resolve(parsed);
+
+        let tagged = emit_with_sources(&doc);
+        let plain = emit(&doc);
+        assert_eq!(
+            format!("{plain:?}"),
+            format!("{:?}", tagged.iter().map(|(b, _)| b).collect::<Vec<_>>()),
+            "tagging must be a pure annotation"
+        );
+
+        let body: Vec<usize> = tagged
+            .iter()
+            .filter_map(|(_, s)| match s {
+                BlockSource::Body(i) => Some(*i),
+                BlockSource::Note => None,
+            })
+            .collect();
+        assert!(!body.is_empty());
+        assert!(
+            body.windows(2).all(|w| w[0] <= w[1]),
+            "body indices are non-decreasing"
+        );
+
+        let first_note = tagged
+            .iter()
+            .position(|(_, s)| *s == BlockSource::Note)
+            .expect("fixture has footnotes");
+        assert!(
+            matches!(tagged[first_note].0, Block::HorizontalRule),
+            "notes start with the separating rule"
+        );
+        assert!(
+            tagged[first_note..]
+                .iter()
+                .all(|(_, s)| *s == BlockSource::Note),
+            "notes are a contiguous tail"
+        );
+        assert!(
+            tagged[first_note..].len() > 1,
+            "note bodies follow the rule"
+        );
     }
 }

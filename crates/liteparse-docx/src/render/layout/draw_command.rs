@@ -362,6 +362,15 @@ impl DrawCommand {
 pub struct LayoutedPage {
     pub commands: Vec<DrawCommand>,
     pub page_size: PtSize,
+    /// liteparse instrumentation (no upstream equivalent): flattened body-block
+    /// indices — into the concatenation of every section's `blocks`, section
+    /// breaks included — whose first content command landed on this page.
+    /// Deliberately a side-channel field rather than a `DrawCommand` variant:
+    /// the command enum is matched exhaustively across the crate by design, and
+    /// a field rides along with the page through checkpoint/replay and
+    /// `Continuous`-section continuation for free. Blocks that emit no content
+    /// (empty paragraphs) appear on no page; consumers fill forward.
+    pub block_starts: Vec<usize>,
 }
 
 impl LayoutedPage {
@@ -369,6 +378,7 @@ impl LayoutedPage {
         Self {
             commands: Vec::new(),
             page_size,
+            block_starts: Vec::new(),
         }
     }
 }

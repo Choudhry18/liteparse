@@ -100,6 +100,11 @@ struct PageLayoutState<'doc> {
     /// §17.3.3.1: an inline page break at the end of a paragraph defers the
     /// page break to the start of the next block.
     pending_page_break: bool,
+    /// liteparse instrumentation: the current block's flattened source index,
+    /// waiting to be recorded on the page that receives the block's first
+    /// content command (`note_block_start`). Re-assigned at the top of the
+    /// block loop — including on replay — so it needs no checkpoint entry.
+    pending_block_start: Option<usize>,
 }
 
 impl<'doc> PageLayoutState<'doc> {
@@ -135,6 +140,18 @@ impl<'doc> PageLayoutState<'doc> {
             page_start_block: 0,
             prev_table_style_id: None,
             pending_page_break: false,
+            pending_block_start: None,
+        }
+    }
+
+    /// Record the pending block's source index on the page currently being
+    /// assembled. Called immediately before a block's first content commands
+    /// are appended; `take()` makes it record once per block, on the page
+    /// where content actually landed (a block that emits nothing records
+    /// nowhere, and consumers fill forward).
+    fn note_block_start(&mut self) {
+        if let Some(idx) = self.pending_block_start.take() {
+            self.current_page.block_starts.push(idx);
         }
     }
 
@@ -1103,6 +1120,9 @@ fn emit_split_paragraph<'doc>(
             );
         }
         let segment_x = col_x(state.current_col);
+        if !segment.commands.is_empty() {
+            state.note_block_start();
+        }
         for mut cmd in segment.commands {
             cmd.shift_y(state.cursor_y);
             cmd.shift_x(segment_x);
@@ -1228,6 +1248,10 @@ pub(crate) struct SectionStart<'a> {
     /// §17.10.6: logical number of the section's first page, with
     /// `w:pgNumType/@start` applied. Drives §20.4.3.1 float mirroring.
     pub logical_page_base: usize,
+    /// liteparse instrumentation: flattened document-level source index for
+    /// each entry of `blocks`, parallel to it (see `BuiltSection`). Callers
+    /// that don't need block→page provenance pass `&[]`.
+    pub block_sources: &'a [usize],
 }
 
 /// Lay out a sequence of blocks into pages.
@@ -1255,6 +1279,7 @@ pub fn layout_section(
             // A section laid out on its own starts at page 1 — the §17.10.6
             // renumbering only exists across a document's section list.
             logical_page_base: 1,
+            block_sources: &[],
         },
     )
 }
@@ -1273,6 +1298,7 @@ pub(crate) fn layout_section_with_clearance(
         continuation,
         clearance,
         logical_page_base,
+        block_sources,
     } = start;
     let content_width = config.content_width();
     let num_cols = config.num_columns();
@@ -1308,6 +1334,11 @@ pub(crate) fn layout_section_with_clearance(
 
     'blocks: while block_idx < blocks.len() {
         let block = &blocks[block_idx];
+        // liteparse instrumentation: arm the block→page marker for this block.
+        // Re-assigned on every iteration — including `continue 'blocks`
+        // replays, whose checkpoint restore has already rolled back any
+        // marker the replayed page recorded.
+        state.pending_block_start = block_sources.get(block_idx).copied();
         // §17.3.3.1: a deferred inline page break from the previous block
         // forces this block onto a new page.
         if state.pending_page_break {
@@ -1773,6 +1804,9 @@ pub(crate) fn layout_section_with_clearance(
                                 col_x(state.current_col).raw(),
                                 para.size.height.raw()
                             );
+                            if !para.commands.is_empty() {
+                                state.note_block_start();
+                            }
                             for mut cmd in para.commands {
                                 cmd.shift_y(state.cursor_y);
                                 cmd.shift_x(col_x(state.current_col));
@@ -2031,6 +2065,9 @@ pub(crate) fn layout_section_with_clearance(
                         };
                         let slice_height = slice.size.height;
 
+                        if !slice.commands.is_empty() {
+                            state.note_block_start();
+                        }
                         for mut cmd in slice.commands {
                             cmd.shift_y(y_start);
                             cmd.shift_x(table_x);
@@ -2111,6 +2148,9 @@ pub(crate) fn layout_section_with_clearance(
                     if slice_idx > 0 {
                         // Continuation slice — start a new page.
                         state.push_new_page(block_idx, &ctx);
+                    }
+                    if !slice.commands.is_empty() {
+                        state.note_block_start();
                     }
                     for mut cmd in slice.commands {
                         cmd.shift_y(state.cursor_y);

@@ -53,6 +53,17 @@ pub struct LiteParseConfig {
     /// downstream than risk losing content. Only affects Markdown output.
     #[serde(default)]
     pub keep_headers_footers: bool,
+    /// Parse DOCX natively (vendored layout engine) instead of converting via
+    /// LibreOffice. Default `true`; effective only when built with the
+    /// `docx-native` cargo feature and the input is a `.docx` — every other
+    /// format always takes the conversion path. Set `false` to force the
+    /// LibreOffice path (A/B comparison). The native path never runs OCR
+    /// (text is born digital; a text-sparse DOCX falls back to conversion so
+    /// scanned images still OCR), produces no screenshots, and falls back to
+    /// conversion for config it cannot honor (image/annotation/form/structure
+    /// extraction, crop, complexity).
+    #[serde(default = "default_true")]
+    pub office_native: bool,
     /// Extract all PDF annotations into each parsed page. Default `false`.
     /// This is independent of `extract_links`, which only controls Markdown
     /// link reconstruction.
@@ -224,6 +235,7 @@ impl Default for LiteParseConfig {
             image_output_dir: None,
             extract_links: true,
             keep_headers_footers: false,
+            office_native: true,
             extract_annotations: false,
             extract_form_fields: false,
             extract_structure_tree: false,
@@ -245,6 +257,10 @@ impl Default for LiteParseConfig {
 }
 
 /// Returns the default number of OCR workers: CPU cores - 1, minimum 1.
+fn default_true() -> bool {
+    true
+}
+
 fn default_num_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))

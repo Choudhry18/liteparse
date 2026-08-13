@@ -37,6 +37,10 @@ struct ParseCommand {
     format: String,
     #[arg(long)]
     no_ocr: bool,
+    /// Force the LibreOffice conversion path for DOCX instead of the native
+    /// parser.
+    #[arg(long)]
+    no_office_native: bool,
     #[arg(long, default_value = "eng")]
     ocr_language: String,
     #[arg(long, default_value = None)]
@@ -149,6 +153,10 @@ struct BatchParseCommand {
     format: String,
     #[arg(long)]
     no_ocr: bool,
+    /// Force the LibreOffice conversion path for DOCX instead of the native
+    /// parser.
+    #[arg(long)]
+    no_office_native: bool,
     #[arg(long, default_value = "eng")]
     ocr_language: String,
     #[arg(long, default_value = None)]
@@ -266,6 +274,7 @@ pub fn run_cli(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let mut config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
+                office_native: !cmd.no_office_native,
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: cmd.target_pages,
@@ -364,6 +373,7 @@ pub fn run_cli(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let mut config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
+                office_native: !cmd.no_office_native,
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: None,

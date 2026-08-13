@@ -313,6 +313,7 @@ mod tests {
                 continuation: None,
                 clearance: &clearance,
                 logical_page_base: 2,
+                block_sources: &[],
             },
         );
 
@@ -862,6 +863,7 @@ mod tests {
                 continuation: None,
                 clearance: &clearance,
                 logical_page_base: 1,
+                block_sources: &[],
             },
         );
 
@@ -936,6 +938,7 @@ mod tests {
                 continuation: None,
                 clearance: &clearance,
                 logical_page_base: 1,
+                block_sources: &[],
             },
         );
 
@@ -1011,6 +1014,7 @@ mod tests {
                 continuation: None,
                 clearance: &clearance,
                 logical_page_base: 1,
+                block_sources: &[],
             },
         );
 
@@ -1741,6 +1745,7 @@ mod tests {
                 continuation: None,
                 clearance: &clearance,
                 logical_page_base: 1,
+                block_sources: &[],
             },
         );
 
@@ -1813,6 +1818,7 @@ mod tests {
                 continuation: None,
                 clearance: &clearance,
                 logical_page_base: 1,
+                block_sources: &[],
             },
         );
         let separator_y = pages[0]
@@ -3381,5 +3387,130 @@ mod tests {
             8,
             "all words land in one column or the other"
         );
+    }
+
+    // ── block_starts instrumentation (liteparse) ────────────────────────────
+    // The block→page markers feed liteparse's per-page markdown split; the
+    // contract is "a block's index appears on exactly the page that received
+    // its first content command, and blocks that emit nothing appear nowhere".
+
+    fn layout_with_sources(
+        blocks: &[LayoutBlock],
+        sources: &[usize],
+    ) -> Vec<crate::render::layout::draw_command::LayoutedPage> {
+        let config = small_config();
+        let clearance = HeaderFooterClearance::uniform(&config);
+        super::layout::layout_section_with_clearance(
+            blocks,
+            &config,
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            super::layout::SectionStart {
+                continuation: None,
+                clearance: &clearance,
+                logical_page_base: 1,
+                block_sources: sources,
+            },
+        )
+    }
+
+    #[test]
+    fn block_starts_record_the_page_where_each_block_lands() {
+        // Global (flattened) indices are opaque to layout — pass arbitrary
+        // non-contiguous ones and expect them back verbatim.
+        let blocks = vec![
+            styled_para_block("p1", false, false),
+            styled_para_block("p2", false, true),
+            styled_para_block("p3", false, true),
+        ];
+        let pages = layout_with_sources(&blocks, &[10, 20, 30]);
+        assert_eq!(pages.len(), 3, "page_break_before splits them");
+        assert_eq!(pages[0].block_starts, vec![10]);
+        assert_eq!(pages[1].block_starts, vec![20]);
+        assert_eq!(pages[2].block_starts, vec![30]);
+    }
+
+    #[test]
+    fn a_split_paragraph_records_only_its_start_page() {
+        // 12 full-width lines at 14pt in an 80pt body: the paragraph must
+        // break across pages, and the marker belongs to the page holding the
+        // first segment only.
+        let fragments: Vec<Fragment> = (0..12)
+            .map(|i| text_frag(&format!("line{i}"), 170.0, 14.0))
+            .collect();
+        let blocks = vec![LayoutBlock::Paragraph {
+            fragments,
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        }];
+        let pages = layout_with_sources(&blocks, &[5]);
+        assert!(
+            pages.len() >= 2,
+            "the paragraph spans pages: {}",
+            pages.len()
+        );
+        assert_eq!(pages[0].block_starts, vec![5]);
+        for (i, page) in pages.iter().enumerate().skip(1) {
+            assert!(
+                page.block_starts.is_empty(),
+                "continuation page {i} must not re-record the block"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_that_emits_nothing_records_nowhere() {
+        let blocks = vec![
+            styled_para_block("p1", false, false),
+            LayoutBlock::Paragraph {
+                fragments: vec![],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+            styled_para_block("p3", false, false),
+        ];
+        let pages = layout_with_sources(&blocks, &[0, 1, 2]);
+        let all: Vec<usize> = pages.iter().flat_map(|p| p.block_starts.clone()).collect();
+        assert!(
+            all.contains(&0) && all.contains(&2),
+            "content blocks recorded: {all:?}"
+        );
+        assert!(
+            !all.contains(&1),
+            "the empty paragraph must not be recorded: {all:?}"
+        );
+    }
+
+    #[test]
+    fn a_paginated_table_records_only_its_first_slice_page() {
+        let rows: Vec<(String, bool)> = (0..12).map(|i| (format!("row{i}"), false)).collect();
+        let rows_ref: Vec<(&str, bool)> = rows.iter().map(|(t, h)| (t.as_str(), *h)).collect();
+        let blocks = vec![one_column_table(&rows_ref)];
+        let pages = layout_with_sources(&blocks, &[7]);
+        assert!(pages.len() >= 2, "the table paginates: {}", pages.len());
+        assert_eq!(pages[0].block_starts, vec![7]);
+        for page in &pages[1..] {
+            assert!(
+                page.block_starts.is_empty(),
+                "continuation slices must not re-record"
+            );
+        }
+    }
+
+    #[test]
+    fn without_sources_no_markers_are_recorded() {
+        let blocks = vec![
+            styled_para_block("p1", false, false),
+            styled_para_block("p2", false, true),
+        ];
+        let pages = layout_with_sources(&blocks, &[]);
+        assert!(pages.iter().all(|p| p.block_starts.is_empty()));
     }
 }

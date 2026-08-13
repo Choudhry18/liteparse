@@ -101,6 +101,12 @@ pub struct BuildState {
 /// Built section output — layout blocks.
 pub struct BuiltSection {
     pub blocks: Vec<LayoutBlock>,
+    /// liteparse instrumentation: `blocks[i]` was built from
+    /// `section.blocks[source_indices[i]]`. Section-local indices — the
+    /// document-level flattening offset is applied by `layout_document`.
+    /// Source blocks that build to nothing (section breaks, drop-cap
+    /// paragraphs merged into their successor) have no entry.
+    pub source_indices: Vec<usize>,
 }
 
 /// Build layout blocks for one section by recursing into its block tree.
@@ -111,21 +117,25 @@ pub fn build_section_blocks(
     state: &mut BuildState,
 ) -> BuiltSection {
     let mut pending_dropcap: Option<crate::render::layout::paragraph::DropCapInfo> = None;
-    let blocks: Vec<LayoutBlock> = section
-        .blocks
-        .iter()
-        .filter_map(|block| {
-            build_block(
-                block,
-                config.content_width(),
-                ctx,
-                state,
-                &mut pending_dropcap,
-            )
-        })
-        .collect();
+    let mut blocks = Vec::new();
+    let mut source_indices = Vec::new();
+    for (idx, block) in section.blocks.iter().enumerate() {
+        if let Some(built) = build_block(
+            block,
+            config.content_width(),
+            ctx,
+            state,
+            &mut pending_dropcap,
+        ) {
+            blocks.push(built);
+            source_indices.push(idx);
+        }
+    }
 
-    BuiltSection { blocks }
+    BuiltSection {
+        blocks,
+        source_indices,
+    }
 }
 
 /// §17.11.2: build the document's endnote content, rendered once at the end of

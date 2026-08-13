@@ -19,7 +19,7 @@ name = "docx_blocks"
 required-features = ["docx-native"]
 
 [features]
-default = ["tesseract"]
+default = ["tesseract", "docx-native"]
 oar-ocr = ["dep:oar-ocr"]
 oar-ocr-auto-download = ["oar-ocr", "oar-ocr/auto-download"]
 oar-ocr-cuda = ["oar-ocr", "oar-ocr/cuda"]

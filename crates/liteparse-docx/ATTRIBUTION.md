@@ -66,6 +66,20 @@ render/mod.rs sections: estimate_cursor_y, resolve_and_layout,
 7. Test-only constructor edits: `FontRegistry::new(skia_safe::FontMgr::new())`
    → `FontRegistry::new()` across layout test modules.
 8. Unknown-element tolerance — see below.
+9. **Block→page instrumentation (liteparse-only, no upstream equivalent).**
+   `LayoutedPage.block_starts` records, per page, the flattened body-block
+   indices (over the concatenation of every section's `blocks`) whose first
+   content command landed on that page — this feeds liteparse's per-page
+   markdown split. Supporting plumbing: `BuiltSection.source_indices`
+   (`layout/build/mod.rs`), `SectionStart.block_sources` +
+   `PageLayoutState.pending_block_start`/`note_block_start` with flush sites
+   at the four content-append points (`layout/section/layout.rs`), and the
+   `body_base` offset accumulation in `render/mod.rs::layout_document`.
+   Deliberately a side-channel field rather than a `DrawCommand` variant — the
+   command enum is matched exhaustively across the crate by design, and a page
+   field inherits checkpoint/replay and `Continuous`-continuation semantics
+   for free. Verified behaviour-preserving: `layout_probe` command censuses
+   over the 48-doc corpus + long documents are byte-identical before/after.
 
 ## Layout parity (measured 2026-08-13, macOS host)
 
