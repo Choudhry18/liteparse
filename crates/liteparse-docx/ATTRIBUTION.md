@@ -80,6 +80,23 @@ render/mod.rs sections: estimate_cursor_y, resolve_and_layout,
    field inherits checkpoint/replay and `Continuous`-continuation semantics
    for free. Verified behaviour-preserving: `layout_probe` command censuses
    over the 48-doc corpus + long documents are byte-identical before/after.
+10. **`src/render/raster.rs` (liteparse-only, no upstream equivalent;
+    `raster` cargo feature).** Rasterizes `LayoutedPage` draw commands to
+    RGBA over tiny-skia + skrifa outlines — the role upstream's
+    `painter.rs`+Skia plays for PDF emission, rebuilt for PNG screenshots
+    without Skia. Glyph pen advances re-derive the measurer's arithmetic
+    against the same `FontRegistry` faces, so raster and `TextItem` geometry
+    share one coordinate space by construction. Paints in four layers
+    (shape < shading rect < image < ink), each in stream order:
+    `DrawCommand` carries no z-order and §20.4.2.3 `behindDoc` is honored by
+    emission position only within a header/footer run, so a body-anchored
+    behind-doc shape lands mid-stream after the header's text — upstream's
+    sequential painter has the same artifact. The command stream itself is
+    untouched (censuses, image-FIFO naming and text-item order all
+    unaffected). Optional deps: `tiny-skia` 0.11 (the line resvg already
+    pins in the liteparse tree), `image` 0.25 (decode only). The
+    `cmd_dump` example prints a page's command stream compactly — it is the
+    debug tool for z-order/ordering questions.
 
 ## Layout parity (measured 2026-08-13, macOS host)
 

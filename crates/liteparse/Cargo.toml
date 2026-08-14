@@ -30,7 +30,7 @@ oar-ocr-webgpu = ["oar-ocr", "oar-ocr/webgpu"]
 oar-ocr-openvino = ["oar-ocr", "oar-ocr/openvino"]
 tesseract = ["dep:tesseract-rs"]
 # Native DOCX structure reading (no LibreOffice, no projection).
-docx-native = ["dep:liteparse-docx"]
+docx-native = ["dep:liteparse-docx", "liteparse-docx/raster"]
 
 [dependencies]
 blake3 = "1"

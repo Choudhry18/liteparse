@@ -190,6 +190,11 @@ struct ScreenshotCommand {
     #[arg(long)]
     password: Option<String>,
 
+    /// Disable the native office parser (DOCX renders via LibreOffice
+    /// conversion instead of the native layout raster)
+    #[arg(long)]
+    no_office_native: bool,
+
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
@@ -468,6 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_pages: cmd.target_pages.clone(),
                 dpi: cmd.dpi,
                 password: cmd.password.clone(),
+                office_native: !cmd.no_office_native,
                 quiet: cmd.quiet,
                 ..Default::default()
             };

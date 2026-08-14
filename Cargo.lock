@@ -2076,6 +2076,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
  "fontdb",
+ "image",
  "log",
  "quick-xml",
  "rustc-hash",
@@ -2083,6 +2084,7 @@ dependencies = [
  "serde_json",
  "skrifa",
  "thiserror 2.0.19",
+ "tiny-skia",
  "unicode-normalization",
  "unicode-properties",
  "unicode-segmentation",

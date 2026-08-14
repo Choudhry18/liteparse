@@ -913,6 +913,93 @@ impl LiteParse {
         Ok(Some(result))
     }
 
+    /// Native DOCX screenshot: rasterize the layout's own draw commands
+    /// (tiny-skia + skrifa) instead of converting through LibreOffice.
+    ///
+    /// Error contract, relied on by the `screenshot_input` call site:
+    /// `Conversion` means the engine failed and the caller should fall back
+    /// to the conversion path; any other error (bad page range, PNG encode)
+    /// is the caller's and surfaces directly. Panics from the vendored
+    /// engine map to `Conversion` like the parse side.
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    fn try_screenshot_docx_native(
+        &self,
+        data: &[u8],
+        page_numbers: Option<&[u32]>,
+    ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.screenshot_docx_native_inner(data, page_numbers)
+        }))
+        .unwrap_or_else(|_| {
+            Err(LiteParseError::Conversion(
+                "native docx layout panicked".to_string(),
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    fn screenshot_docx_native_inner(
+        &self,
+        data: &[u8],
+        page_numbers: Option<&[u32]>,
+    ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
+        let parsed = liteparse_docx::docx::parse(data)
+            .map_err(|e| LiteParseError::Conversion(format!("docx parse failed: {e}")))?;
+        let resolved = liteparse_docx::render::resolve::resolve(parsed);
+        let registry = liteparse_docx::render::fonts::FontRegistry::build(
+            &resolved.embedded_fonts,
+            &resolved.font_families,
+        )
+        .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
+        let layouted = liteparse_docx::render::layout_document(&resolved, &registry);
+
+        let page_count = layouted.len() as u32;
+        let pages: Vec<u32> = match page_numbers {
+            Some(nums) => nums.to_vec(),
+            None => (1..=page_count).collect(),
+        };
+        let scale = self.config.dpi / 72.0;
+        let mut results = Vec::with_capacity(pages.len());
+        for page_num in pages {
+            if page_num < 1 || page_num > page_count {
+                return Err(LiteParseError::Other(format!(
+                    "page {page_num} out of range (document has {page_count} pages)"
+                )));
+            }
+            let raster = liteparse_docx::render::raster::rasterize_page(
+                &layouted[(page_num - 1) as usize],
+                &registry,
+                scale,
+            )
+            .map_err(LiteParseError::Conversion)?;
+            let (w, h) = (raster.width as usize, raster.height as usize);
+            let is_solid_fill = render::is_solid_fill_rgba(&raster.rgba, w, h);
+            // Same skip rule as the PDFium path: a solid-fill page has no
+            // structure to find.
+            let rects = if self.config.detect_screenshot_rects && !is_solid_fill {
+                render::find_solid_rects_rgba(
+                    &raster.rgba,
+                    w,
+                    h,
+                    raster.page_width_pt,
+                    raster.page_height_pt,
+                )
+            } else {
+                Vec::new()
+            };
+            let png = crate::extract::encode_png(&raster.rgba, raster.width, raster.height)?;
+            results.push(ScreenshotResult {
+                page_num,
+                width: raster.width,
+                height: raster.height,
+                image_bytes: png,
+                is_solid_fill,
+                rects,
+            });
+        }
+        Ok(results)
+    }
+
     /// `parse_from_pages`'s native sibling: no projection — the block model
     /// arrives from the DOCX source, so markdown is `render_blocks` per page
     /// and page text is a straight reading-order join of the text items.
@@ -1034,6 +1121,27 @@ impl LiteParse {
                 eprintln!("{}", msg);
             }
         };
+
+        // Native DOCX raster: same layout engine as the native parse, so the
+        // screenshot shares the native TextItem coordinate space — the
+        // LibreOffice raster never did, which is why highlight-on-screenshot
+        // was blocked. Engine failures (`Conversion` errors / panics) fall
+        // back to the conversion path, same net as the parse side; other
+        // errors (bad page range) are the caller's and surface directly.
+        // `render_form_fields` is irrelevant here: the LibreOffice-converted
+        // PDF carries no interactive fields either.
+        #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+        if self.config.office_native
+            && let Some(bytes) = crate::office::docx_bytes(&input)
+        {
+            match self.try_screenshot_docx_native(&bytes, page_numbers.as_deref()) {
+                Ok(results) => return Ok(results),
+                Err(LiteParseError::Conversion(e)) => log(&format!(
+                    "[liteparse] native docx screenshot failed ({e}); falling back to conversion"
+                )),
+                Err(e) => return Err(e),
+            }
+        }
 
         let (validated_input, _guard) =
             conversion::resolve_pdf_input(input, self.config.password.as_deref(), true).await?;

@@ -14,6 +14,8 @@ pub mod error;
 pub mod fonts;
 pub mod geometry;
 pub mod layout;
+#[cfg(feature = "raster")]
+pub mod raster;
 pub mod resolve;
 
 use crate::model::Document;
