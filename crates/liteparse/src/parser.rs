@@ -767,21 +767,20 @@ impl LiteParse {
     #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
     /// Config options the native DOCX path cannot honor. Hitting one with
     /// `office_native` on is a hard `Config` error, not a fallback — see the
-    /// check in `parse_input`. `extract_images` (native media bytes) and
-    /// `extract_xfa_packets` (honestly empty — DOCX has no XFA) are
-    /// supported and deliberately absent from this list.
+    /// check in `parse_input`. Supported and deliberately absent from this
+    /// list: `extract_images` (native media bytes), `extract_xfa_packets`
+    /// (honestly empty — DOCX has no XFA), `extract_annotations` (hyperlink +
+    /// internal-link rects merged to `link` annotations), and
+    /// `include_complexity` (native facts; see
+    /// `calculate_native_page_complexity`).
     fn native_docx_ineligible_reason(&self) -> Option<&'static str> {
         let c = &self.config;
-        if c.extract_annotations {
-            Some("extract_annotations")
-        } else if c.extract_form_fields {
+        if c.extract_form_fields {
             Some("extract_form_fields")
         } else if c.extract_structure_tree {
             Some("extract_structure_tree")
         } else if c.extract_vector_graphics {
             Some("extract_vector_graphics")
-        } else if c.include_complexity {
-            Some("include_complexity")
         } else if c.crop_box.is_some() {
             Some("crop_box")
         } else if c.skip_diagonal_text {
@@ -829,8 +828,12 @@ impl LiteParse {
         )
         .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
         let layouted = liteparse_docx::render::layout_document(&resolved, &registry);
-        let native =
-            docx_layout::layout_to_pages(&layouted, &registry, self.config.emit_word_boxes);
+        let native = docx_layout::layout_to_pages(
+            &layouted,
+            &registry,
+            self.config.emit_word_boxes,
+            self.config.extract_annotations,
+        );
 
         if self.config.ocr_enabled {
             let total_chars: usize = native
@@ -875,24 +878,71 @@ impl LiteParse {
         let all_blocks: Vec<crate::markdown_layout::Block> =
             tagged.into_iter().map(|(b, _)| b).collect();
 
+        // Per-page complexity from native facts: placed-media rects, the
+        // page's table blocks (exact, not detected), and the section-declared
+        // column count — see `calculate_native_page_complexity` for the
+        // documented divergences from the PDF pair.
+        let complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>> =
+            if self.config.include_complexity {
+                let col_counts =
+                    docx_layout::page_column_counts(&resolved, &native.block_pages, n_pages);
+                let img_rects = docx_layout::image_rects_per_page(&layouted);
+                native
+                    .pages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let tables = page_blocks[i]
+                            .iter()
+                            .filter(|b| {
+                                matches!(
+                                    b,
+                                    crate::markdown_layout::Block::Table { .. }
+                                        | crate::markdown_layout::Block::MergedTable { .. }
+                                )
+                            })
+                            .count();
+                        Some(crate::ocr_merge::calculate_native_page_complexity(
+                            p,
+                            img_rects.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                            tables,
+                            col_counts[i],
+                        ))
+                    })
+                    .collect()
+            } else {
+                vec![None; n_pages]
+            };
+
         // Page selection, mirroring the PDF path: `target_pages` filters by
         // 1-based page number, then `max_pages` truncates. The outline stays
         // whole-document, as it does on the PDF path. A page selection also
         // narrows the doc-level text to the surviving pages' blocks.
-        let mut selected: Vec<(Page, Vec<crate::markdown_layout::Block>)> =
-            native.pages.into_iter().zip(page_blocks).collect();
+        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> = native
+            .pages
+            .into_iter()
+            .zip(page_blocks)
+            .zip(complexity)
+            .collect();
         let mut page_filtered = false;
         if let Some(targets) = self.resolve_target_pages()? {
             let keep: std::collections::HashSet<usize> =
                 targets.iter().map(|p| *p as usize).collect();
-            selected.retain(|(p, _)| keep.contains(&p.page_number));
+            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
             page_filtered = true;
         }
         if selected.len() > self.config.max_pages {
             selected.truncate(self.config.max_pages);
             page_filtered = true;
         }
-        let (pages, page_blocks): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
+        let mut pages = Vec::with_capacity(selected.len());
+        let mut page_blocks = Vec::with_capacity(selected.len());
+        let mut page_stats = Vec::with_capacity(selected.len());
+        for ((p, b), s) in selected {
+            pages.push(p);
+            page_blocks.push(b);
+            page_stats.push(s);
+        }
 
         let mut result = self.parse_from_native_blocks(
             pages,
@@ -900,6 +950,7 @@ impl LiteParse {
             (!page_filtered).then_some(all_blocks),
             native.outline,
             images,
+            page_stats,
         );
 
         // Same post-passes as the PDF path, same order: duplicate figure refs
@@ -1021,12 +1072,14 @@ impl LiteParse {
         all_blocks: Option<Vec<crate::markdown_layout::Block>>,
         outline: Vec<OutlineTarget>,
         images: Vec<crate::types::ExtractedImage>,
+        page_stats: Vec<Option<crate::ocr_merge::PageComplexityStats>>,
     ) -> ParseResult {
         let markdown_out = self.config.output_format == crate::config::OutputFormat::Markdown;
         let parsed_pages: Vec<ParsedPage> = pages
             .into_iter()
             .zip(page_blocks)
-            .map(|(p, blocks)| {
+            .zip(page_stats)
+            .map(|((p, blocks), stats)| {
                 let text = native_page_text(&p.text_items);
                 let markdown = if markdown_out {
                     crate::markdown_layout::render_blocks(&blocks)
@@ -1052,8 +1105,8 @@ impl LiteParse {
                     figures: Vec::new(),
                     struct_nodes: Vec::new(),
                     image_refs: Vec::new(),
-                    complexity: None,
-                    annotations: None,
+                    complexity: stats,
+                    annotations: p.annotations,
                     form_fields: None,
                     structure_tree: None,
                 }

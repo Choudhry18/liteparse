@@ -23,7 +23,9 @@ use liteparse_docx::render::layout::draw_command::{DrawCommand, LayoutedPage, Ou
 use liteparse_docx::render::layout::fragment::FontProps;
 use liteparse_docx::render::layout::measurer::TextMeasurer;
 
-use crate::types::{ExtractedImage, OutlineTarget, Page, Rect, TextItem, WordBox};
+use crate::types::{
+    DocumentAnnotation, ExtractedImage, OutlineTarget, Page, Rect, TextItem, WordBox,
+};
 
 /// Everything the native pipeline taps out of a laid-out document.
 pub struct NativeLayout {
@@ -54,6 +56,7 @@ pub fn layout_to_pages(
     layouted: &[LayoutedPage],
     registry: &FontRegistry,
     emit_word_boxes: bool,
+    extract_annotations: bool,
 ) -> NativeLayout {
     let measurer = TextMeasurer::new(registry);
     let mut pages = Vec::with_capacity(layouted.len());
@@ -64,6 +67,11 @@ pub fn layout_to_pages(
         let page_height = lp.page_size.height.raw();
         let mut text_items: Vec<TextItem> = Vec::new();
         let mut links: Vec<(Rect, String)> = Vec::new();
+        // (target identity, uri, per-word rect) in stream order; one
+        // `w:hyperlink`'s words share one `Rc` target, so pointer identity
+        // groups the words of a hyperlink instance without comparing URLs
+        // (two links to the same URL stay two annotations).
+        let mut link_spans: Vec<(usize, Option<String>, Rect)> = Vec::new();
         // Indices into `outline` whose heading bracket is still open and has
         // no y yet — resolved by the first Text command inside the bracket.
         let mut open_headings: Vec<usize> = Vec::new();
@@ -154,14 +162,37 @@ pub fn layout_to_pages(
                     });
                 }
                 DrawCommand::LinkAnnotation { rect, url } => {
-                    links.push((
+                    let r = Rect {
+                        x: rect.origin.x.raw(),
+                        y: rect.origin.y.raw(),
+                        width: rect.size.width.raw(),
+                        height: rect.size.height.raw(),
+                    };
+                    if extract_annotations {
+                        link_spans.push((
+                            std::rc::Rc::as_ptr(url) as *const u8 as usize,
+                            Some(url.to_string()),
+                            r.clone(),
+                        ));
+                    }
+                    links.push((r, url.to_string()));
+                }
+                // Internal links (TOC entries, cross-refs to bookmarks) become
+                // uri-less `link` annotations — the same shape a GoTo link has
+                // on the PDF path, where the LibreOffice-converted document
+                // yields link annotations with no URI. They deliberately do
+                // NOT set `TextItem::link` or emit markdown links: bookmark
+                // anchors don't exist in the output document.
+                DrawCommand::InternalLink { rect, destination } if extract_annotations => {
+                    link_spans.push((
+                        std::rc::Rc::as_ptr(destination) as *const u8 as usize,
+                        None,
                         Rect {
                             x: rect.origin.x.raw(),
                             y: rect.origin.y.raw(),
                             width: rect.size.width.raw(),
                             height: rect.size.height.raw(),
                         },
-                        url.to_string(),
                     ));
                 }
                 DrawCommand::Outline(mark) => match mark {
@@ -182,6 +213,10 @@ pub fn layout_to_pages(
                 // never strikethrough; TextItem has no underline field and
                 // strike detection over border/separator lines would only
                 // false-positive. Images/paths/rects: deferred (module docs).
+                // NamedDestination is the bookmark *target* marker; nothing in
+                // the ParseResult contract can hold it (the PDF path drops
+                // GoTo destinations the same way — annotations carry only the
+                // source rects).
                 DrawCommand::Underline { .. }
                 | DrawCommand::Line { .. }
                 | DrawCommand::Rect { .. }
@@ -193,6 +228,7 @@ pub fn layout_to_pages(
         }
 
         assign_links(&mut text_items, &links);
+        let annotations = extract_annotations.then(|| merge_link_annotations(&link_spans));
 
         for &b in &lp.block_starts {
             block_pages
@@ -212,7 +248,7 @@ pub fn layout_to_pages(
             vector_graphics: None,
             struct_nodes: Vec::new(),
             image_refs: Vec::new(),
-            annotations: None,
+            annotations,
             form_fields: None,
             structure_tree: None,
         });
@@ -279,6 +315,75 @@ fn assign_links(items: &mut [TextItem], links: &[(Rect, String)]) {
             }
         }
     }
+}
+
+/// Fold per-word link rects into annotation-shaped [`DocumentAnnotation`]s.
+///
+/// Spans arrive in stream (reading) order; a run of consecutive spans sharing
+/// one target identity is one hyperlink instance and becomes ONE annotation —
+/// `rect` is the union, `quadpoint_rects` hold one merged rect per laid-out
+/// line, matching the PDF path's quadpoint convention for multi-line links.
+/// Word rects of one line share the line box (same top and height from
+/// `cursor_y`/`line_height`), so a new line is detected by the vertical seam.
+fn merge_link_annotations(spans: &[(usize, Option<String>, Rect)]) -> Vec<DocumentAnnotation> {
+    /// Two same-line rects never differ vertically; this only absorbs f32
+    /// noise, not layout differences.
+    const LINE_EPSILON: f32 = 0.01;
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < spans.len() {
+        let target = spans[i].0;
+        let mut j = i;
+        while j < spans.len() && spans[j].0 == target {
+            j += 1;
+        }
+
+        let mut quads: Vec<Rect> = Vec::new();
+        for (_, _, r) in &spans[i..j] {
+            match quads.last_mut() {
+                Some(q)
+                    if (q.y - r.y).abs() <= LINE_EPSILON
+                        && (q.height - r.height).abs() <= LINE_EPSILON =>
+                {
+                    let x0 = q.x.min(r.x);
+                    let x1 = (q.x + q.width).max(r.x + r.width);
+                    q.x = x0;
+                    q.width = x1 - x0;
+                }
+                _ => quads.push(r.clone()),
+            }
+        }
+        let rect = quads.iter().skip(1).fold(quads[0].clone(), |acc, r| {
+            let x0 = acc.x.min(r.x);
+            let y0 = acc.y.min(r.y);
+            let x1 = (acc.x + acc.width).max(r.x + r.width);
+            let y1 = (acc.y + acc.height).max(r.y + r.height);
+            Rect {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            }
+        });
+        // A single-line link needs no quadpoints beyond its rect — PDFium
+        // reports quadpoints there too, but one redundant rect adds noise for
+        // the consumer; multi-line is where quadpoints carry information.
+        let quadpoint_rects = if quads.len() > 1 { quads } else { Vec::new() };
+
+        out.push(DocumentAnnotation {
+            subtype: "link".to_string(),
+            contents: None,
+            created: None,
+            modified: None,
+            title: None,
+            rect: Some(rect),
+            quadpoint_rects,
+            uri: spans[i].1.clone(),
+        });
+        i = j;
+    }
+    out
 }
 
 /// Native images tapped from the draw-command stream.
@@ -422,6 +527,95 @@ pub fn collect_images(layouted: &[LayoutedPage]) -> NativeImages {
     NativeImages { images, figure_ids }
 }
 
+/// Placed-media rects per page, for the native complexity stats. Every
+/// `Image` command counts regardless of media format — EMF/SVG placements are
+/// visual content even though [`collect_images`] skips their bytes.
+pub fn image_rects_per_page(layouted: &[LayoutedPage]) -> Vec<Vec<Rect>> {
+    layouted
+        .iter()
+        .map(|lp| {
+            lp.commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCommand::Image { rect, .. } => Some(Rect {
+                        x: rect.origin.x.raw(),
+                        y: rect.origin.y.raw(),
+                        width: rect.size.width.raw(),
+                        height: rect.size.height.raw(),
+                    }),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Section-declared column count per physical page (§17.6.4 `w:cols`), for
+/// the native complexity stats.
+///
+/// The join reuses the `block_starts` channel: a flattened body-block index
+/// locates its section by cumulative section length (the same flattening
+/// `emit_with_sources` tags blocks with), and `block_pages` says which page
+/// each block started on. A page hosting blocks from several sections (a
+/// `Continuous` break) takes the max. Pages with no block start — pure
+/// continuation pages — inherit the previous page's count, and anything
+/// before the first anchored block falls back to 1.
+pub fn page_column_counts(
+    resolved: &liteparse_docx::render::resolve::ResolvedDocument,
+    block_pages: &HashMap<usize, usize>,
+    n_pages: usize,
+) -> Vec<usize> {
+    let sections: Vec<(usize, usize)> = resolved
+        .sections
+        .iter()
+        .map(|s| {
+            let cols = s
+                .properties
+                .columns
+                .as_ref()
+                .and_then(|c| c.count)
+                .unwrap_or(1)
+                .max(1) as usize;
+            (s.blocks.len(), cols)
+        })
+        .collect();
+    column_counts_from_sections(&sections, block_pages, n_pages)
+}
+
+/// Pure core of [`page_column_counts`]: `sections` is `(block count, column
+/// count)` per section, in document order.
+fn column_counts_from_sections(
+    sections: &[(usize, usize)],
+    block_pages: &HashMap<usize, usize>,
+    n_pages: usize,
+) -> Vec<usize> {
+    // Flat-index boundary each section ends at.
+    let mut sec_end = Vec::with_capacity(sections.len());
+    let mut cum = 0usize;
+    for (len, _) in sections {
+        cum += len;
+        sec_end.push(cum);
+    }
+    let section_of = |flat: usize| sec_end.partition_point(|&end| end <= flat);
+
+    let mut cols = vec![0usize; n_pages];
+    for (&flat, &page) in block_pages {
+        let s = section_of(flat);
+        if let (Some(slot), Some(&(_, c))) = (cols.get_mut(page), sections.get(s)) {
+            *slot = (*slot).max(c);
+        }
+    }
+    let mut prev = 1usize;
+    for c in &mut cols {
+        if *c == 0 {
+            *c = prev;
+        } else {
+            prev = *c;
+        }
+    }
+    cols
+}
+
 fn union_bounds(items: &[TextItem]) -> Option<Rect> {
     let mut it = items.iter();
     let first = it.next()?;
@@ -497,6 +691,7 @@ mod tests {
             &[page(vec![text_cmd(72.0, 100.0, "Hello", 12.0)])],
             &reg,
             true,
+            false,
         );
         let item = &out.pages[0].text_items[0];
         assert_eq!(item.x, 72.0);
@@ -510,6 +705,7 @@ mod tests {
             &[page(vec![text_cmd(0.0, 100.0, "ab cd", 12.0)])],
             &reg,
             true,
+            false,
         );
         let words = &out2.pages[0].text_items[0].words;
         assert_eq!(words.len(), 2);
@@ -553,6 +749,7 @@ mod tests {
             ])],
             &reg,
             false,
+            false,
         );
         let items = &out.pages[0].text_items;
         assert_eq!(items[0].link.as_deref(), Some("https://example.com"));
@@ -587,6 +784,7 @@ mod tests {
             ])],
             &reg,
             false,
+            false,
         );
         assert_eq!(out.outline.len(), 1);
         let t = &out.outline[0];
@@ -603,9 +801,144 @@ mod tests {
         p0.block_starts = vec![3, 4];
         let mut p1 = page(vec![]);
         p1.block_starts = vec![4, 5];
-        let out = layout_to_pages(&[p0, p1], &reg, false);
+        let out = layout_to_pages(&[p0, p1], &reg, false, false);
         assert_eq!(out.block_pages[&3], 0);
         assert_eq!(out.block_pages[&4], 0, "duplicate takes the earliest page");
         assert_eq!(out.block_pages[&5], 1);
+    }
+
+    fn link_rect(x: f32, y: f32, w: f32, h: f32) -> PtRect {
+        PtRect::from_xywh(Pt::new(x), Pt::new(y), Pt::new(w), Pt::new(h))
+    }
+
+    /// One two-line hyperlink (one shared `Rc` target, three word rects) must
+    /// become ONE annotation whose rect is the union and whose quadpoints
+    /// carry one merged rect per line.
+    #[test]
+    fn multi_line_hyperlink_merges_to_one_annotation() {
+        let reg = registry();
+        let url: Rc<str> = Rc::from("https://example.com");
+        let out = layout_to_pages(
+            &[page(vec![
+                DrawCommand::LinkAnnotation {
+                    rect: link_rect(72.0, 100.0, 30.0, 14.0),
+                    url: Rc::clone(&url),
+                },
+                DrawCommand::LinkAnnotation {
+                    rect: link_rect(105.0, 100.0, 40.0, 14.0),
+                    url: Rc::clone(&url),
+                },
+                DrawCommand::LinkAnnotation {
+                    rect: link_rect(72.0, 114.0, 25.0, 14.0),
+                    url: Rc::clone(&url),
+                },
+            ])],
+            &reg,
+            false,
+            true,
+        );
+        let anns = out.pages[0].annotations.as_ref().unwrap();
+        assert_eq!(anns.len(), 1);
+        let a = &anns[0];
+        assert_eq!(a.subtype, "link");
+        assert_eq!(a.uri.as_deref(), Some("https://example.com"));
+        let r = a.rect.clone().unwrap();
+        assert_eq!((r.x, r.y), (72.0, 100.0));
+        assert_eq!((r.width, r.height), (73.0, 28.0));
+        assert_eq!(a.quadpoint_rects.len(), 2, "one merged rect per line");
+        assert_eq!(a.quadpoint_rects[0].width, 73.0);
+        assert_eq!(a.quadpoint_rects[1].width, 25.0);
+    }
+
+    /// Two hyperlinks to the SAME url are distinct `Rc` targets and must stay
+    /// two annotations; a single-line link carries no redundant quadpoints.
+    #[test]
+    fn distinct_hyperlink_instances_stay_separate_annotations() {
+        let reg = registry();
+        let out = layout_to_pages(
+            &[page(vec![
+                DrawCommand::LinkAnnotation {
+                    rect: link_rect(72.0, 100.0, 30.0, 14.0),
+                    url: Rc::from("https://example.com"),
+                },
+                DrawCommand::LinkAnnotation {
+                    rect: link_rect(200.0, 100.0, 30.0, 14.0),
+                    url: Rc::from("https://example.com"),
+                },
+            ])],
+            &reg,
+            false,
+            true,
+        );
+        let anns = out.pages[0].annotations.as_ref().unwrap();
+        assert_eq!(anns.len(), 2);
+        assert!(anns.iter().all(|a| a.quadpoint_rects.is_empty()));
+    }
+
+    /// Internal links (TOC/cross-refs) become uri-less `link` annotations —
+    /// the GoTo shape — and never attach `TextItem::link`.
+    #[test]
+    fn internal_links_become_uriless_annotations() {
+        let reg = registry();
+        let out = layout_to_pages(
+            &[page(vec![
+                text_cmd(72.0, 100.0, "See chapter 3", 12.0),
+                DrawCommand::InternalLink {
+                    rect: link_rect(72.0, 88.0, 80.0, 14.0),
+                    destination: Rc::from("_Toc123"),
+                },
+            ])],
+            &reg,
+            false,
+            true,
+        );
+        let anns = out.pages[0].annotations.as_ref().unwrap();
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].subtype, "link");
+        assert_eq!(anns[0].uri, None);
+        assert_eq!(
+            out.pages[0].text_items[0].link, None,
+            "internal anchors must not become TextItem links"
+        );
+    }
+
+    /// Section columns land on the pages their blocks start on; a page hosting
+    /// two sections (Continuous break) takes the max; pure continuation pages
+    /// inherit the previous page's count; leading unanchored pages default 1.
+    #[test]
+    fn column_counts_join_sections_to_pages() {
+        // Section 0: 3 blocks, 2 columns. Section 1: 2 blocks, 1 column.
+        let sections = [(3usize, 2usize), (2, 1)];
+        let block_pages: HashMap<usize, usize> =
+            [(0, 0), (2, 1), (3, 1), (4, 2)].into_iter().collect();
+        assert_eq!(
+            column_counts_from_sections(&sections, &block_pages, 5),
+            vec![2, 2, 1, 1, 1],
+            "page 1 mixes both sections (max), pages 3-4 inherit"
+        );
+
+        // No block anchored before page 1: leading page falls back to 1.
+        let late: HashMap<usize, usize> = [(0, 1)].into_iter().collect();
+        assert_eq!(
+            column_counts_from_sections(&sections, &late, 3),
+            vec![1, 2, 2]
+        );
+    }
+
+    /// Flag off: `annotations` stays `None` (disabled ≠ enabled-but-empty),
+    /// and pages with the flag on but no links report `Some([])`.
+    #[test]
+    fn annotations_none_when_disabled_some_empty_when_enabled() {
+        let reg = registry();
+        let cmds = vec![text_cmd(72.0, 100.0, "plain", 12.0)];
+        let off = layout_to_pages(&[page(cmds.clone())], &reg, false, false);
+        assert!(off.pages[0].annotations.is_none());
+        let on = layout_to_pages(&[page(cmds)], &reg, false, true);
+        assert!(
+            on.pages[0]
+                .annotations
+                .as_ref()
+                .is_some_and(|v| v.is_empty())
+        );
     }
 }

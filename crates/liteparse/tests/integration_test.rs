@@ -424,3 +424,143 @@ async fn test_parse_docx_native_images_integration() {
         );
     }
 }
+
+/// Native annotation extraction: per-word hyperlink rects merge to one
+/// `link` annotation per hyperlink instance (uri set), and internal links
+/// (TOC/cross-refs) surface as uri-less `link` annotations — the GoTo shape
+/// the LibreOffice-converted path produces for the same documents.
+#[cfg(feature = "docx-native")]
+#[tokio::test]
+#[serial]
+async fn test_parse_docx_native_annotations_integration() {
+    let lit = LiteParse::new(LiteParseConfig {
+        extract_annotations: true,
+        quiet: true,
+        ..Default::default()
+    });
+
+    // External hyperlinks.
+    let parsed = lit
+        .parse("../../docx_files/legal/uk_parl_media_bill_ia.docx")
+        .await
+        .expect("native parse succeeds");
+    let anns: Vec<_> = parsed
+        .pages
+        .iter()
+        .flat_map(|p| p.annotations.as_deref().expect("enabled flag → Some"))
+        .collect();
+    assert!(!anns.is_empty(), "hyperlinks surface as annotations");
+    assert!(anns.iter().all(|a| a.subtype == "link"));
+    assert!(
+        anns.iter().all(|a| a.uri.is_some()),
+        "this doc has only external links"
+    );
+    for a in &anns {
+        let r = a.rect.as_ref().expect("every link has a rect");
+        assert!(r.width > 0.0 && r.height > 0.0);
+    }
+    // Word-grain rects must have been merged: fewer annotations than linked
+    // words (this doc has 83 per-word link rects).
+    assert!(
+        anns.len() < 40,
+        "per-word rects merged into per-hyperlink annotations, got {}",
+        anns.len()
+    );
+
+    // Internal links: uri-less `link` annotations.
+    let parsed = lit
+        .parse("../../docx_files/legal/courts_8th_civil_jury.docx")
+        .await
+        .expect("native parse succeeds");
+    let internal = parsed
+        .pages
+        .iter()
+        .flat_map(|p| p.annotations.as_deref().unwrap_or_default())
+        .filter(|a| a.uri.is_none())
+        .count();
+    assert!(
+        internal > 0,
+        "internal links surface as uri-less annotations"
+    );
+
+    // Flag off: `annotations` stays None on every page.
+    let lit_off = LiteParse::new(LiteParseConfig {
+        quiet: true,
+        ..Default::default()
+    });
+    let parsed = lit_off
+        .parse("../../docx_files/legal/uk_parl_media_bill_ia.docx")
+        .await
+        .expect("native parse succeeds");
+    assert!(parsed.pages.iter().all(|p| p.annotations.is_none()));
+}
+
+/// Native complexity: layout signals come from source facts — the
+/// section-declared column count and the page's actual table blocks — not
+/// from geometric detection.
+#[cfg(feature = "docx-native")]
+#[tokio::test]
+#[serial]
+async fn test_parse_docx_native_complexity_integration() {
+    let lit = LiteParse::new(LiteParseConfig {
+        include_complexity: true,
+        quiet: true,
+        ..Default::default()
+    });
+
+    // This doc's first page declares 2- and 3-column sections (§17.6.4).
+    let parsed = lit
+        .parse("../../docx_files/financial/cfpb_credit_dispute_letter.docx")
+        .await
+        .expect("native parse succeeds");
+    let stats: Vec<_> = parsed
+        .pages
+        .iter()
+        .map(|p| {
+            p.complexity
+                .as_ref()
+                .expect("flag on → stats on every page")
+        })
+        .collect();
+    let layouts: Vec<_> = stats
+        .iter()
+        .map(|c| c.layout.as_ref().expect("native stats carry layout"))
+        .collect();
+    assert!(
+        layouts.iter().any(|l| l.column_count >= 2),
+        "section-declared multi-column surfaces"
+    );
+    // Native text is never vector-outline text: the area is a known zero
+    // (or None when a cheaper predicate fired), never a positive value.
+    assert!(
+        stats
+            .iter()
+            .all(|c| c.uncovered_vector_area.unwrap_or(0.0) == 0.0)
+    );
+
+    // Table pages report TableLikely from actual table blocks.
+    let parsed = lit
+        .parse("../../docx_files/enterprise/nitaac_sow_template.docx")
+        .await
+        .expect("native parse succeeds");
+    assert!(
+        parsed.pages.iter().any(|p| {
+            p.complexity
+                .as_ref()
+                .and_then(|c| c.layout.as_ref())
+                .is_some_and(|l| l.ruled_table_count > 0)
+        }),
+        "table blocks drive the table-likely signal"
+    );
+
+    // Flag off: no complexity on any page.
+    let lit_off = LiteParse::new(LiteParseConfig {
+        quiet: true,
+        ..Default::default()
+    });
+    let parsed = lit_off
+        .parse("../../docx_files/financial/cfpb_credit_dispute_letter.docx")
+        .await
+        .expect("native parse succeeds");
+    assert!(parsed.pages.iter().all(|p| p.complexity.is_none()));
+}

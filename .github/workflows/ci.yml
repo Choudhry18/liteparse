@@ -49,7 +49,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libtesseract-dev libleptonica-dev
+          # Fonts: liteparse-docx layout tests need real font faces — 25 of
+          # them fail in a fontless environment (measurer, list_label,
+          # floating, build::block). Liberation + DejaVu is the set the musl
+          # test run validated; macOS/Windows runners ship system fonts.
+          sudo apt-get install -y libtesseract-dev libleptonica-dev \
+            fonts-liberation fonts-dejavu-core
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'

@@ -113,7 +113,7 @@ pages (0.16% at 615 pages — drift does not compound).
 
 **Upstream fails closed at every level. We fail open.** A single malformed
 value anywhere in a file must never cost the whole document — that is a
-standing requirement of this copy, not a one-off fix. Three distinct classes,
+standing requirement of this copy, not a one-off fix. Four distinct classes,
 all of which upstream treats as fatal:
 
 | class | upstream | here |
@@ -121,6 +121,24 @@ all of which upstream treats as fatal:
 | **unknown elements** (`commentReference`, …) | aborts document | `#[serde(other)]` catch-all, element skipped |
 | **unknown attribute *values*** (`w:jc val="bogus"`) | aborts document | `lenient::` deserializers → unspecified |
 | **malformed scalars** (colours, measurements, ids) | aborts document | dropped / spec default |
+| **namespace collisions** (`w:shadow` vs `w14:shadow`) | aborts document (`duplicate field`) | extension-namespace elements stripped pre-parse |
+
+### Namespace collisions (`serde_xml.rs`)
+
+quick-xml's serde layer matches fields on prefix-stripped local names, so a
+Word 2010+ extension element (`<w14:shadow>`, a DrawingML text effect) lands
+on the same field as its transitional namesake (`<w:shadow>`, the §17.3.2.31
+boolean). Non-adjacent in one parent → fatal `duplicate field`; alone → the
+extension element *silently deserializes into the transitional field* (an
+attribute-only `<w14:shadow …>` reads as toggle-ON — corruption, no error).
+
+`from_xml` therefore strips every element with a `w14`/`w15`/`w16*` prefix
+before deserialization (gated on a cheap `<w14:`-marker scan so clean parts
+pay nothing). Attributes (`w14:paraId`) are untouched. None of these
+namespaces are modeled, so nothing is lost. **Duplicate-tolerance/last-wins is
+deliberately NOT the fix** — it would let an unrelated extension element
+overwrite a real property, the same silent-corruption trap as inventing
+default colours.
 
 The mechanism lives in `docx/parse/primitives/lenient.rs`:
 

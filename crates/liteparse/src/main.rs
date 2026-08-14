@@ -137,7 +137,9 @@ struct ParseCommand {
     #[arg(long)]
     keep_headers_footers: bool,
 
-    /// Include all PDF annotations as page-scoped structured JSON/API data.
+    /// Include document annotations as page-scoped structured JSON/API data
+    /// (PDF annotations; on the native DOCX path, hyperlinks and internal
+    /// links as `link` annotations).
     #[arg(long)]
     extract_annotations: bool,
 
@@ -281,7 +283,9 @@ struct BatchParseCommand {
     #[arg(long)]
     extract_vector_graphics: bool,
 
-    /// Include all PDF annotations as page-scoped structured JSON/API data.
+    /// Include document annotations as page-scoped structured JSON/API data
+    /// (PDF annotations; on the native DOCX path, hyperlinks and internal
+    /// links as `link` annotations).
     #[arg(long)]
     extract_annotations: bool,
     /// Include AcroForm widget fields and values as page-scoped structured data.
