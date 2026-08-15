@@ -170,8 +170,8 @@ dropped as a numbering id, but must still never be coerced to `1`).
 ### Verifying
 
 ```
-cargo test -p liteparse-docx
-cargo build -p liteparse-docx --example parse_probe
+cargo test -p liteparse-ooxml
+cargo build -p liteparse-ooxml --example parse_probe
 python3 bench/docx_native_spike/fuzz_attribute_values.py --mode all
 ```
 

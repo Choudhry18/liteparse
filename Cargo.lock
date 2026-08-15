@@ -2047,7 +2047,7 @@ dependencies = [
  "file-format",
  "flate2",
  "image",
- "liteparse-docx",
+ "liteparse-ooxml",
  "liteparse-pdfium",
  "liteparse-pdfium-sys",
  "lopdf",
@@ -2071,7 +2071,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "liteparse-docx"
+name = "liteparse-napi"
+version = "2.11.0"
+dependencies = [
+ "image",
+ "liteparse",
+ "liteparse-pdfium",
+ "liteparse-pdfium-sys",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "liteparse-ooxml"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
@@ -2089,22 +2105,6 @@ dependencies = [
  "unicode-properties",
  "unicode-segmentation",
  "zip",
-]
-
-[[package]]
-name = "liteparse-napi"
-version = "2.11.0"
-dependencies = [
- "image",
- "liteparse",
- "liteparse-pdfium",
- "liteparse-pdfium-sys",
- "napi",
- "napi-build",
- "napi-derive",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

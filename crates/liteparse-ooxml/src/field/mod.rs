@@ -6,7 +6,7 @@
 //! # Examples
 //!
 //! ```
-//! use liteparse_docx::field::{parse, evaluate, FieldContext};
+//! use liteparse_ooxml::field::{parse, evaluate, FieldContext};
 //!
 //! // Parse a PAGE field
 //! let instr = parse(" PAGE ").unwrap();

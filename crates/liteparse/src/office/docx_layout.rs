@@ -18,10 +18,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use liteparse_docx::render::fonts::FontRegistry;
-use liteparse_docx::render::layout::draw_command::{DrawCommand, LayoutedPage, OutlineMark};
-use liteparse_docx::render::layout::fragment::FontProps;
-use liteparse_docx::render::layout::measurer::TextMeasurer;
+use liteparse_ooxml::render::fonts::FontRegistry;
+use liteparse_ooxml::render::layout::draw_command::{DrawCommand, LayoutedPage, OutlineMark};
+use liteparse_ooxml::render::layout::fragment::FontProps;
+use liteparse_ooxml::render::layout::measurer::TextMeasurer;
 
 use crate::types::{
     DocumentAnnotation, ExtractedImage, OutlineTarget, Page, Rect, TextItem, WordBox,
@@ -97,8 +97,8 @@ pub fn layout_to_pages(
                         underline: false,
                         char_spacing: *char_spacing,
                         text_scale: *text_scale,
-                        underline_position: liteparse_docx::render::dimension::Pt::ZERO,
-                        underline_thickness: liteparse_docx::render::dimension::Pt::ZERO,
+                        underline_position: liteparse_ooxml::render::dimension::Pt::ZERO,
+                        underline_thickness: liteparse_ooxml::render::dimension::Pt::ZERO,
                     };
                     let (advance, metrics) = measurer.measure(text, &props);
                     let ascent = metrics.ascent.raw();
@@ -406,8 +406,8 @@ pub struct NativeImages {
 /// everything), so surfacing bytes most consumers cannot decode would be a
 /// worse contract than omitting them. Word's SVG embeds normally carry a PNG
 /// fallback blip, which is the one the layout draws.
-fn media_extension(format: liteparse_docx::model::ImageFormat) -> Option<&'static str> {
-    use liteparse_docx::model::ImageFormat as F;
+fn media_extension(format: liteparse_ooxml::model::ImageFormat) -> Option<&'static str> {
+    use liteparse_ooxml::model::ImageFormat as F;
     match format {
         F::Png => Some("png"),
         F::Jpeg => Some("jpg"),
@@ -561,7 +561,7 @@ pub fn image_rects_per_page(layouted: &[LayoutedPage]) -> Vec<Vec<Rect>> {
 /// continuation pages — inherit the previous page's count, and anything
 /// before the first anchored block falls back to 1.
 pub fn page_column_counts(
-    resolved: &liteparse_docx::render::resolve::ResolvedDocument,
+    resolved: &liteparse_ooxml::render::resolve::ResolvedDocument,
     block_pages: &HashMap<usize, usize>,
     n_pages: usize,
 ) -> Vec<usize> {
@@ -638,10 +638,10 @@ fn union_bounds(items: &[TextItem]) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use liteparse_docx::render::dimension::Pt;
-    use liteparse_docx::render::geometry::{PtOffset, PtRect, PtSize};
-    use liteparse_docx::render::layout::draw_command::OutlineHeading;
-    use liteparse_docx::render::resolve::color::RgbColor;
+    use liteparse_ooxml::render::dimension::Pt;
+    use liteparse_ooxml::render::geometry::{PtOffset, PtRect, PtSize};
+    use liteparse_ooxml::render::layout::draw_command::OutlineHeading;
+    use liteparse_ooxml::render::resolve::color::RgbColor;
     use std::rc::Rc;
 
     fn registry() -> FontRegistry {
@@ -776,7 +776,7 @@ mod tests {
             &[page(vec![
                 DrawCommand::Outline(OutlineMark::Begin(OutlineHeading {
                     node_id: 1,
-                    level: liteparse_docx::model::OutlineLevel::new(2),
+                    level: liteparse_ooxml::model::OutlineLevel::new(2),
                     title: Rc::from("Title"),
                 })),
                 text_cmd(72.0, 100.0, "Title", 12.0),

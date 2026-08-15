@@ -816,18 +816,18 @@ impl LiteParse {
     fn parse_docx_native_inner(&self, data: &[u8]) -> Result<Option<ParseResult>, LiteParseError> {
         use crate::office::{docx, docx_layout};
 
-        let parsed = liteparse_docx::docx::parse(data)
+        let parsed = liteparse_ooxml::docx::parse(data)
             .map_err(|e| LiteParseError::Conversion(format!("docx parse failed: {e}")))?;
-        let resolved = liteparse_docx::render::resolve::resolve(parsed);
+        let resolved = liteparse_ooxml::render::resolve::resolve(parsed);
         // Build the registry directly rather than via `resolve_and_layout`,
         // whose `.expect` panics on a font-less host; here that is a clean
         // fallback to the conversion path instead.
-        let registry = liteparse_docx::render::fonts::FontRegistry::build(
+        let registry = liteparse_ooxml::render::fonts::FontRegistry::build(
             &resolved.embedded_fonts,
             &resolved.font_families,
         )
         .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
-        let layouted = liteparse_docx::render::layout_document(&resolved, &registry);
+        let layouted = liteparse_ooxml::render::layout_document(&resolved, &registry);
         let native = docx_layout::layout_to_pages(
             &layouted,
             &registry,
@@ -994,15 +994,15 @@ impl LiteParse {
         data: &[u8],
         page_numbers: Option<&[u32]>,
     ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
-        let parsed = liteparse_docx::docx::parse(data)
+        let parsed = liteparse_ooxml::docx::parse(data)
             .map_err(|e| LiteParseError::Conversion(format!("docx parse failed: {e}")))?;
-        let resolved = liteparse_docx::render::resolve::resolve(parsed);
-        let registry = liteparse_docx::render::fonts::FontRegistry::build(
+        let resolved = liteparse_ooxml::render::resolve::resolve(parsed);
+        let registry = liteparse_ooxml::render::fonts::FontRegistry::build(
             &resolved.embedded_fonts,
             &resolved.font_families,
         )
         .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
-        let layouted = liteparse_docx::render::layout_document(&resolved, &registry);
+        let layouted = liteparse_ooxml::render::layout_document(&resolved, &registry);
 
         let page_count = layouted.len() as u32;
         let pages: Vec<u32> = match page_numbers {
@@ -1017,7 +1017,7 @@ impl LiteParse {
                     "page {page_num} out of range (document has {page_count} pages)"
                 )));
             }
-            let raster = liteparse_docx::render::raster::rasterize_page(
+            let raster = liteparse_ooxml::render::raster::rasterize_page(
                 &layouted[(page_num - 1) as usize],
                 &registry,
                 scale,

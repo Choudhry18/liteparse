@@ -61,6 +61,18 @@ pub enum RelationshipType {
     StylesWithEffects,
     /// §11.3.8: glossary/building blocks document.
     GlossaryDocument,
+    /// §13.3.8: a slide (PresentationML).
+    Slide,
+    /// §13.3.9: a slide layout (PresentationML).
+    SlideLayout,
+    /// §13.3.10: a slide master (PresentationML).
+    SlideMaster,
+    /// §13.3.5: a notes slide (PresentationML).
+    NotesSlide,
+    /// §13.3.4: the notes master (PresentationML).
+    NotesMaster,
+    /// §13.3.3: the handout master (PresentationML).
+    HandoutMaster,
     /// Any relationship type not listed above.
     Unknown(String),
 }
@@ -110,6 +122,22 @@ impl RelationshipType {
             Self::StylesWithEffects
         } else if uri.ends_with("/glossaryDocument") {
             Self::GlossaryDocument
+        // PresentationML (§13.3). Order is not load-bearing here — no PPTX
+        // type is a `/`-suffix of another (`/notesSlide` does not end with
+        // `/slide`, `/slideLayout` does not end with `/slide`) — but keep the
+        // longer names first anyway so a future addition cannot shadow.
+        } else if uri.ends_with("/slideLayout") {
+            Self::SlideLayout
+        } else if uri.ends_with("/slideMaster") {
+            Self::SlideMaster
+        } else if uri.ends_with("/notesSlide") {
+            Self::NotesSlide
+        } else if uri.ends_with("/notesMaster") {
+            Self::NotesMaster
+        } else if uri.ends_with("/handoutMaster") {
+            Self::HandoutMaster
+        } else if uri.ends_with("/slide") {
+            Self::Slide
         } else {
             warn!("unknown relationship type: {}", uri);
             Self::Unknown(uri.to_string())

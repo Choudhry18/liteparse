@@ -1,4 +1,4 @@
-//! DOCX → [`Block`] using only `liteparse-docx`'s `parse` + `resolve` stages.
+//! DOCX → [`Block`] using only `liteparse-ooxml`'s `parse` + `resolve` stages.
 //!
 //! Deliberately avoids the vendored crate's `render::layout` stage: structure
 //! alone — headings, lists, emphasis, merged cells, notes — is recoverable
@@ -12,13 +12,13 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use liteparse_docx::field::FieldInstruction;
-use liteparse_docx::model::{
+use liteparse_ooxml::field::FieldInstruction;
+use liteparse_ooxml::model::{
     Block as DocxBlock, HyperlinkTarget, Inline, NoteId, NumId, NumberFormat, OutlineLevel,
     Paragraph, ParagraphProperties, RunElement, RunProperties, StrikeStyle, StyleId, Table,
     VerticalMerge,
 };
-use liteparse_docx::render::resolve::ResolvedDocument;
+use liteparse_ooxml::render::resolve::ResolvedDocument;
 
 use crate::error::LiteParseError;
 use crate::markdown_layout::{Block, Cell, apply_link, escape_inline};
@@ -51,9 +51,9 @@ pub struct EmitOptions {
 /// fail-open on unknown elements, unknown attribute values and malformed
 /// scalars, so a document with unmodeled markup still yields blocks.
 pub fn docx_to_blocks(data: &[u8], extract_links: bool) -> Result<Vec<Block>, LiteParseError> {
-    let parsed = liteparse_docx::docx::parse(data)
+    let parsed = liteparse_ooxml::docx::parse(data)
         .map_err(|e| LiteParseError::Conversion(format!("docx parse failed: {e}")))?;
-    let resolved = liteparse_docx::render::resolve::resolve(parsed);
+    let resolved = liteparse_ooxml::render::resolve::resolve(parsed);
     Ok(emit(&resolved, extract_links))
 }
 
@@ -347,7 +347,7 @@ impl<'a> Emitter<'a> {
                     // than a dangling reference.
                     if let Some(queues) = self.figures.as_mut()
                         && let Some(rel) =
-                            liteparse_docx::render::resolve::images::extract_image_rel_id(img)
+                            liteparse_ooxml::render::resolve::images::extract_image_rel_id(img)
                         && let Some(media) = self.doc.media.get(rel)
                         && let Some(fig) = queues
                             .get_mut(&(media.data.as_ptr() as usize))
@@ -818,8 +818,8 @@ mod tests {
             "/../../docx_files/legal/courts_3rd_circuit_ch4.docx"
         ))
         .expect("corpus fixture");
-        let parsed = liteparse_docx::docx::parse(&data).expect("fixture parses");
-        let doc = liteparse_docx::render::resolve::resolve(parsed);
+        let parsed = liteparse_ooxml::docx::parse(&data).expect("fixture parses");
+        let doc = liteparse_ooxml::render::resolve::resolve(parsed);
 
         let tagged = emit_with_sources(
             &doc,

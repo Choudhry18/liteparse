@@ -1,6 +1,6 @@
 //! Layout probe — the vendored (fontdb + skrifa) twin of spike 2's harness.
 //!
-//! Taps `liteparse_docx::render::resolve_and_layout` and emits the same JSON
+//! Taps `liteparse_ooxml::render::resolve_and_layout` and emits the same JSON
 //! Lines shape as `bench/docx_layout_spike` (which runs upstream dxpdf with
 //! Skia), so the two joins directly: same document in, page counts and
 //! command censuses out, one row per file. Divergence between the two is the
@@ -8,13 +8,13 @@
 //! ~0 where the host has the fonts.
 //!
 //! ```text
-//! cargo run --release -p liteparse-docx --example layout_probe -- <file.docx>...
+//! cargo run --release -p liteparse-ooxml --example layout_probe -- <file.docx>...
 //! ```
 
 use std::time::Instant;
 
-use liteparse_docx::render::layout::draw_command::DrawCommand;
-use liteparse_docx::render::resolve_and_layout;
+use liteparse_ooxml::render::layout::draw_command::DrawCommand;
+use liteparse_ooxml::render::resolve_and_layout;
 use serde_json::json;
 
 /// Running min/max over text positions, so we can check the coordinate
@@ -80,7 +80,7 @@ fn run_one(path: &str) -> serde_json::Value {
     // The vendored parser is fail-open (unknown elements, attribute values
     // and namespace collisions degrade instead of aborting), so parse
     // failures here are unexpected — report them loudly.
-    let doc = match liteparse_docx::docx::parse(&data) {
+    let doc = match liteparse_ooxml::docx::parse(&data) {
         Ok(d) => d,
         Err(e) => {
             return json!({ "path": path, "ok": false, "stage": "parse", "error": e.to_string() });

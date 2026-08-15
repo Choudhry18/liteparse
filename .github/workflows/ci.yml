@@ -49,7 +49,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # Fonts: liteparse-docx layout tests need real font faces — 25 of
+          # Fonts: liteparse-ooxml layout tests need real font faces — 25 of
           # them fail in a fontless environment (measurer, list_label,
           # floating, build::block). Liberation + DejaVu is the set the musl
           # test run validated; macOS/Windows runners ship system fonts.
