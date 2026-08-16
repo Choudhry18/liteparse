@@ -11,5 +11,10 @@
 //! from its master, and the match rule differs at each rung.
 
 pub mod package;
+pub mod text;
 
 pub use package::{EMU_PER_POINT, Part, PresentationInfo, PresentationPackage, SlideParts, walk};
+pub use text::{
+    AutoNumberScheme, Bullet, ListStyle, Spacing, TextBody, TextParagraph, TextParagraphProperties,
+    parse_text_body,
+};

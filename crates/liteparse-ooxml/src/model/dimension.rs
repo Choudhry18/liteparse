@@ -139,6 +139,16 @@ impl Unit for Points {
     const NAME: &'static str = "pt";
 }
 
+/// §20.1.10.72 ST_TextFontSize / §20.1.10.74 ST_TextPoint — hundredths of a
+/// point. DrawingML's font-size unit, distinct from WordprocessingML's
+/// half-points: `sz="1800"` is 18pt in a slide but would be 900pt in a
+/// `w:rPr`, so the two must never be conflated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HundredthPoints;
+impl Unit for HundredthPoints {
+    const NAME: &'static str = "hpt100";
+}
+
 /// Percentage in 1/1000th of a percent (OOXML ST_DecimalNumberOrPercent).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ThousandthPercent;
@@ -190,6 +200,19 @@ impl Dimension<Emu> {
 
     pub fn to_points_f32(self) -> f32 {
         self.raw as f32 / 12700.0
+    }
+}
+
+impl Dimension<HundredthPoints> {
+    /// 100ths → 50ths. Truncating: an odd quarter-point (`sz="1825"`) floors to
+    /// the nearest half-point rather than rounding up, matching how every other
+    /// conversion here narrows.
+    pub fn to_half_points(self) -> Dimension<HalfPoints> {
+        Dimension::new(self.raw / 50)
+    }
+
+    pub fn to_points_f32(self) -> f32 {
+        self.raw as f32 / 100.0
     }
 }
 
