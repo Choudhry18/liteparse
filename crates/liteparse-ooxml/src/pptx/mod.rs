@@ -11,9 +11,14 @@
 //! from its master, and the match rule differs at each rung.
 
 pub mod package;
+pub mod shapes;
 pub mod text;
 
 pub use package::{EMU_PER_POINT, Part, PresentationInfo, PresentationPackage, SlideParts, walk};
+pub use shapes::{
+    AutoShape, Connector, GraphicFrame, GraphicFramePayload, Group, Placeholder, PlaceholderKind,
+    Shape, ShapeKind, Table, TableCell, TableRow, parse_shape_tree, visit_all,
+};
 pub use text::{
     AutoNumberScheme, Bullet, ListStyle, Spacing, TextBody, TextParagraph, TextParagraphProperties,
     parse_text_body,
