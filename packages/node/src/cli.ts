@@ -2,6 +2,7 @@
 
 import { program } from "commander";
 import { LiteParse, type LiteParseConfig } from "./lib.js";
+import { parseResultToCliJson } from "./cli-json.js";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join, relative, parse as parsePath } from "node:path";
 
@@ -9,6 +10,27 @@ program
   .name("liteparse")
   .description("Fast, lightweight PDF and document parsing")
   .version("2.0.0");
+
+/**
+ * Resolve a CLI `<file>` argument into a parser input. `-` means read the
+ * document from stdin (e.g. `curl -sL … | liteparse parse -`); anything else is
+ * passed through as a path. Streaming stdin (rather than `readFileSync(0)`)
+ * avoids EAGAIN on non-blocking pipes.
+ */
+async function resolveInput(file: string): Promise<string | Buffer> {
+  if (file !== "-") return file;
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk as Buffer);
+  }
+  const bytes = Buffer.concat(chunks);
+  if (bytes.length === 0) {
+    throw new Error(
+      "no data on stdin (input `-` expects a document piped in, e.g. `curl … | liteparse parse -`)",
+    );
+  }
+  return bytes;
+}
 
 /** Collect repeated `--ocr-server-header "Name: Value"` flags into an object. */
 function collectHeader(
@@ -41,7 +63,27 @@ program
     "--image-output-dir <dir>",
     "Directory to write embedded images to when --image-mode embed is set",
   )
+  .option("--extract-images", "Extract embedded image bytes and metadata")
   .option("--no-links", "Disable hyperlink extraction (emit plain anchor text)")
+  .option(
+    "--keep-headers-footers",
+    "Keep running headers/footers in markdown output instead of stripping them",
+  )
+  .option("--extract-annotations", "Include all PDF annotations in page output")
+  .option("--extract-form-fields", "Include AcroForm widget fields and values")
+  .option("--extract-structure-tree", "Include the tagged-PDF logical structure tree")
+  .option(
+    "--extract-blocks",
+    "Include each page's classified layout blocks with bounding boxes",
+  )
+  .option(
+    "--extract-xfa-packets",
+    "Include raw XFA packets (name + XML content) in JSON output",
+  )
+  .option(
+    "--extract-content-bounds",
+    "Include each page's content_bounds in JSON output",
+  )
   .option("--ocr-server-url <url>", "HTTP OCR server URL")
   .option(
     "--ocr-server-header <header>",
@@ -55,8 +97,16 @@ program
     "--target-pages <pages>",
     'Pages to parse (e.g., "1-5,10,15-20")',
   )
+  .option(
+    "--continue-on-page-error",
+    "Continue after page-level extraction errors and report them in JSON",
+  )
   .option("--dpi <dpi>", "Rendering DPI", parseFloat)
   .option("--preserve-small-text", "Keep very small text")
+  .option(
+    "--extract-text-metadata",
+    "Include rich PDF text metadata in text items and JSON output",
+  )
   .option("--password <password>", "Password for encrypted documents")
   .option("--config <file>", "JSON config file path")
   .option("-q, --quiet", "Suppress progress output")
@@ -64,6 +114,10 @@ program
   .option(
     "--complexity",
     "Include per-page complexity signals in JSON output",
+  )
+  .option(
+    "--extract-vector-graphics",
+    "Include page-scoped vector shapes and merged horizontal/vertical lines",
   )
   .action(async (file: string, opts: Record<string, unknown>) => {
     try {
@@ -81,7 +135,17 @@ program
       if (opts.format) config.outputFormat = opts.format as "json" | "text" | "markdown";
       if (opts.imageMode)
         config.imageMode = opts.imageMode as "off" | "placeholder" | "embed";
+      if (opts.imageOutputDir)
+        config.imageOutputDir = opts.imageOutputDir as string;
+      if (opts.extractImages) config.extractImages = true;
       if (opts.links === false) config.extractLinks = false;
+      if (opts.keepHeadersFooters) config.keepHeadersFooters = true;
+      if (opts.extractAnnotations) config.extractAnnotations = true;
+      if (opts.extractFormFields) config.extractFormFields = true;
+      if (opts.extractStructureTree) config.extractStructureTree = true;
+      if (opts.extractBlocks) config.extractBlocks = true;
+      if (opts.extractXfaPackets) config.extractXfaPackets = true;
+      if (opts.extractContentBounds) config.extractContentBounds = true;
       if (opts.ocrServerUrl)
         config.ocrServerUrl = opts.ocrServerUrl as string;
       if (opts.ocrServerHeader)
@@ -90,48 +154,41 @@ program
       if (opts.ocrLanguage) config.ocrLanguage = opts.ocrLanguage as string;
       if (opts.maxPages) config.maxPages = opts.maxPages as number;
       if (opts.targetPages) config.targetPages = opts.targetPages as string;
+      if (opts.continueOnPageError) config.continueOnPageError = true;
       if (opts.dpi) config.dpi = opts.dpi as number;
       if (opts.preserveSmallText) config.preserveVerySmallText = true;
+      if (opts.extractTextMetadata) config.extractTextMetadata = true;
       if (opts.password) config.password = opts.password as string;
       if (opts.quiet) config.quiet = true;
       if (opts.numWorkers) config.numWorkers = opts.numWorkers as number;
       if (opts.complexity) config.includeComplexity = true;
+      if (opts.extractVectorGraphics) config.extractVectorGraphics = true;
 
       // Default CLI output to text (library defaults to json)
       if (!config.outputFormat) config.outputFormat = "text";
 
       const parser = new LiteParse(config);
-      const result = await parser.parse(file);
+      const result = await parser.parse(await resolveInput(file));
+
+      // JSON output carries pageErrors itself; text/markdown would silently
+      // omit the failed pages, so always surface them on stderr.
+      for (const error of result.pageErrors) {
+        console.error(
+          `[liteparse] page ${error.pageNum} failed to extract and was skipped: ${error.message}`,
+        );
+      }
 
       const output =
         config.outputFormat === "json"
           ? JSON.stringify(
-              {
-                pages: result.pages.map((p) => ({
-                  page: p.pageNum,
-                  width: p.width,
-                  height: p.height,
-                  text: p.text,
-                  textItems: p.textItems,
-                })),
-              },
+              parseResultToCliJson(result, {
+                extractTextMetadata: config.extractTextMetadata,
+              }),
               null,
               2,
             )
           : result.text;
 
-      if (opts.imageOutputDir && result.images.length > 0) {
-        const dir = opts.imageOutputDir as string;
-        mkdirSync(dir, { recursive: true });
-        for (const img of result.images) {
-          writeFileSync(join(dir, `image_${img.id}.${img.format}`), img.bytes);
-        }
-        if (!opts.quiet) {
-          console.error(
-            `[liteparse] wrote ${result.images.length} image(s) to ${dir}`,
-          );
-        }
-      }
 
       if (opts.output) {
         writeFileSync(opts.output as string, output, "utf-8");
@@ -169,7 +226,7 @@ program
       if (opts.quiet) config.quiet = true;
 
       const parser = new LiteParse(config);
-      const stats = await parser.isComplex(file);
+      const stats = await parser.isComplex(await resolveInput(file));
 
       const complexPages = stats.filter((s) => s.needsOcr).length;
 
@@ -187,8 +244,13 @@ program
       // the exit code below carries the same signal for scripts.
       if (!opts.quiet) {
         const verdict = complexPages > 0 ? "COMPLEX" : "SIMPLE";
+        const layoutCount = (reason: string) =>
+          stats.filter((s) => s.layout?.reasons.includes(reason)).length;
         console.error(
-          `${verdict} — ${complexPages}/${stats.length} page(s) need OCR`,
+          `${verdict} — ${complexPages}/${stats.length} page(s) need OCR; ` +
+            `layout: ${layoutCount("multi-column")} multi-column, ` +
+            `${layoutCount("table-likely")} table, ` +
+            `${layoutCount("dense-graphics")} graphics-dense`,
         );
       }
 
@@ -287,6 +349,30 @@ program
   .option("--password <password>", "Password for encrypted documents")
   .option("-q, --quiet", "Suppress progress output")
   .option("--num-workers <n>", "Number of concurrent OCR workers", parseInt)
+  .option(
+    "--extract-text-metadata",
+    "Include rich PDF text metadata in text items and JSON output",
+  )
+  .option("--extract-images", "Extract embedded image bytes and metadata")
+  .option("--extract-annotations", "Include all PDF annotations in page output")
+  .option("--extract-form-fields", "Include AcroForm widget fields and values")
+  .option("--extract-structure-tree", "Include the tagged-PDF logical structure tree")
+  .option(
+    "--extract-blocks",
+    "Include each page's classified layout blocks with bounding boxes",
+  )
+  .option(
+    "--extract-xfa-packets",
+    "Include raw XFA packets (name + XML content) in JSON output",
+  )
+  .option(
+    "--extract-content-bounds",
+    "Include each page's content_bounds in JSON output",
+  )
+  .option(
+    "--extract-vector-graphics",
+    "Include page-scoped vector shapes and merged horizontal/vertical lines",
+  )
   .action(
     async (
       inputDir: string,
@@ -308,6 +394,18 @@ program
         if (opts.password) config.password = opts.password as string;
         if (opts.quiet) config.quiet = true;
         if (opts.numWorkers) config.numWorkers = opts.numWorkers as number;
+        if (opts.extractTextMetadata) config.extractTextMetadata = true;
+        if (opts.extractImages) config.extractImages = true;
+        if (opts.extractAnnotations) config.extractAnnotations = true;
+        if (opts.extractFormFields) config.extractFormFields = true;
+        if (opts.extractStructureTree) config.extractStructureTree = true;
+        if (opts.extractBlocks) config.extractBlocks = true;
+        if (opts.extractXfaPackets) config.extractXfaPackets = true;
+        if (opts.extractContentBounds) config.extractContentBounds = true;
+      if (opts.extractContentBounds) config.extractContentBounds = true;
+      if (opts.extractXfaPackets) config.extractXfaPackets = true;
+      if (opts.extractContentBounds) config.extractContentBounds = true;
+        if (opts.extractVectorGraphics) config.extractVectorGraphics = true;
 
         const parser = new LiteParse(config);
         const outExt = format === "json" ? ".json" : format === "markdown" ? ".md" : ".txt";
@@ -357,15 +455,9 @@ program
             const output =
               format === "json"
                 ? JSON.stringify(
-                    {
-                      pages: result.pages.map((p) => ({
-                        page: p.pageNum,
-                        width: p.width,
-                        height: p.height,
-                        text: p.text,
-                        textItems: p.textItems,
-                      })),
-                    },
+                    parseResultToCliJson(result, {
+                      extractTextMetadata: config.extractTextMetadata,
+                    }),
                     null,
                     2,
                   )

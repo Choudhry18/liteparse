@@ -19,6 +19,16 @@ const HEADER_FOOTER_MIN_FRACTION: f32 = 0.5;
 /// weak to act on.
 const HEADER_FOOTER_MIN_PAGES: usize = 2;
 
+/// Maximum number of distinct repeated lines a band may contain before the
+/// repetition is treated as a content-bearing letterhead rather than running
+/// chrome. Real running headers/footers are 1–3 short lines (running title,
+/// classification mark, page number); ERP/accounting letterheads repeat an
+/// entire block of labeled fields (`Invoice No`, `Terms`, …) at the top of
+/// every page, and stripping those deletes document data from every page.
+/// Lines matching a chrome pattern (`Page N of M`, URLs, © marks) are exempt
+/// from the cap — they strip regardless of how crowded the band is.
+const MAX_REPEATED_LINES_PER_BAND: usize = 3;
+
 /// Normalize a line for cross-page header/footer matching. Lowercases,
 /// collapses whitespace, and replaces every run of ASCII digits with `#` so
 /// `Page 1 of 6` and `Page 2 of 6` collapse to the same key.
@@ -50,14 +60,25 @@ pub(super) fn normalize_for_repetition(s: &str) -> String {
 /// page bottom (footer). Header and footer bands are tracked separately so a
 /// company name that appears as both a header and a body-section title on
 /// different pages isn't stripped from the body.
+///
+/// Letterhead guard: repetition alone is not a license to delete content. If
+/// a band accumulates more than `MAX_REPEATED_LINES_PER_BAND` distinct
+/// repeated lines that *don't* match a chrome pattern, the block is a
+/// content-bearing letterhead (ERP invoices repeat `Invoice No …` on every
+/// page) and those lines are kept everywhere. Pattern-matched lines still
+/// strip.
 pub fn compute_header_footer_set(pages: &[ParsedPage]) -> std::collections::HashSet<String> {
     use std::collections::{HashMap, HashSet};
     let mut set: HashSet<String> = HashSet::new();
     if pages.len() < HEADER_FOOTER_MIN_PAGES {
         return set;
     }
+    struct KeyStats {
+        pages_seen: std::collections::HashSet<usize>,
+        is_chrome_pattern: bool,
+    }
     // Two counters keyed by `(band, normalized_text)` — band is `'h'` or `'f'`.
-    let mut counts: HashMap<(char, String), HashSet<usize>> = HashMap::new();
+    let mut counts: HashMap<(char, String), KeyStats> = HashMap::new();
     for page in pages {
         let header_cutoff = page.page_height * HEADER_BAND_FRACTION;
         let footer_cutoff = page.page_height * (1.0 - FOOTER_BAND_FRACTION);
@@ -70,29 +91,46 @@ pub fn compute_header_footer_set(pages: &[ParsedPage]) -> std::collections::Hash
             if norm.is_empty() {
                 continue;
             }
-            // Header band: top of line within the top band.
-            if line.bbox.y <= header_cutoff {
-                counts
-                    .entry(('h', norm.clone()))
-                    .or_default()
-                    .insert(page.page_number);
-            }
-            // Footer band: bottom of line at or below the footer cutoff.
+            let is_pattern = matches_chrome_pattern(text);
             let line_bottom = line.bbox.y + line.bbox.height;
-            if line_bottom >= footer_cutoff {
-                counts
-                    .entry(('f', norm))
-                    .or_default()
-                    .insert(page.page_number);
+            for (band, in_band) in [
+                // Header band: top of line within the top band.
+                ('h', line.bbox.y <= header_cutoff),
+                // Footer band: bottom of line at or below the footer cutoff.
+                ('f', line_bottom >= footer_cutoff),
+            ] {
+                if !in_band {
+                    continue;
+                }
+                let stats = counts.entry((band, norm.clone())).or_insert(KeyStats {
+                    pages_seen: HashSet::new(),
+                    is_chrome_pattern: false,
+                });
+                stats.pages_seen.insert(page.page_number);
+                stats.is_chrome_pattern |= is_pattern;
             }
         }
     }
     let threshold = (pages.len() as f32 * HEADER_FOOTER_MIN_FRACTION)
         .ceil()
         .max(HEADER_FOOTER_MIN_PAGES as f32) as usize;
-    for ((_, norm), pages_seen) in counts {
-        if pages_seen.len() >= threshold {
-            set.insert(norm);
+    // Qualify keys per band, then apply the letterhead guard per band.
+    let mut qualified: HashMap<char, Vec<(String, bool)>> = HashMap::new();
+    for ((band, norm), stats) in counts {
+        if stats.pages_seen.len() >= threshold {
+            qualified
+                .entry(band)
+                .or_default()
+                .push((norm, stats.is_chrome_pattern));
+        }
+    }
+    for keys in qualified.into_values() {
+        let non_pattern = keys.iter().filter(|(_, pat)| !pat).count();
+        let letterhead = non_pattern > MAX_REPEATED_LINES_PER_BAND;
+        for (norm, is_pattern) in keys {
+            if is_pattern || !letterhead {
+                set.insert(norm);
+            }
         }
     }
     set
@@ -440,9 +478,73 @@ mod tests {
         assert!(!set.contains("shared body text"));
     }
 
-    // ----- single-page chrome detector tests -----
-
     use super::super::test_helpers::{line, page};
+
+    /// Build a page (height 792, header band ≤95pt) whose header band holds
+    /// `header_lines` and whose body holds one unique line per page.
+    fn letterhead_page(n: usize, header_lines: &[&str]) -> ParsedPage {
+        let mut lines: Vec<ProjectedLine> = header_lines
+            .iter()
+            .enumerate()
+            .map(|(i, t)| line(t, 50.0, 10.0 + i as f32 * 12.0, 10.0, 10.0))
+            .collect();
+        lines.push(line(&format!("Body text {n}"), 50.0, 300.0, 10.0, 10.0));
+        let mut p = page(lines);
+        p.page_number = n;
+        p
+    }
+
+    #[test]
+    fn letterhead_block_is_kept_not_stripped() {
+        // Five distinct content-bearing lines repeating in the header band —
+        // an ERP invoice letterhead, not running chrome. None may be stripped.
+        let head = [
+            "ACME SUPPLY CO",
+            "Invoice No ACME-00042",
+            "Invoice Date 2026-07-21",
+            "Terms Net 30",
+            "Please Pay From Invoice And Remit To:",
+        ];
+        let pages = vec![letterhead_page(1, &head), letterhead_page(2, &head)];
+        let set = compute_header_footer_set(&pages);
+        assert!(
+            set.is_empty(),
+            "letterhead lines must survive, got {:?}",
+            set
+        );
+    }
+
+    #[test]
+    fn page_number_still_stripped_inside_letterhead() {
+        // A chrome-pattern line rides along with the letterhead: the guard
+        // exempts it, so it strips while the content lines survive.
+        let head = [
+            "ACME SUPPLY CO",
+            "Invoice No ACME-00042",
+            "Invoice Date 2026-07-21",
+            "Terms Net 30",
+            "Page 1 of 2",
+        ];
+        let pages = vec![letterhead_page(1, &head), letterhead_page(2, &head)];
+        let set = compute_header_footer_set(&pages);
+        assert!(set.contains("page # of #"));
+        assert!(!set.contains("acme supply co"));
+        assert!(!set.contains("terms net #"));
+    }
+
+    #[test]
+    fn small_repeated_header_at_cap_still_strips() {
+        // Exactly MAX_REPEATED_LINES_PER_BAND non-pattern lines — normal
+        // running-header territory, still stripped.
+        let head = ["Acme Corp", "Quarterly Report", "Confidential"];
+        let pages = vec![letterhead_page(1, &head), letterhead_page(2, &head)];
+        let set = compute_header_footer_set(&pages);
+        assert!(set.contains("acme corp"));
+        assert!(set.contains("quarterly report"));
+        assert!(set.contains("confidential"));
+    }
+
+    // ----- single-page chrome detector tests -----
 
     #[test]
     fn chrome_pattern_recognizes_common_signatures() {

@@ -56,7 +56,10 @@ let config = LiteParseConfig {
     target_pages: Some("1-5,10".into()),  // Specific pages (optional)
     dpi: 150.0,                           // Rendering DPI
     output_format: OutputFormat::Json,    // Json | Text | Markdown
+    extract_annotations: false,           // Include page annotations in output
+    extract_structure_tree: false,        // Include tagged-PDF logical structure
     preserve_very_small_text: false,      // Keep tiny text
+    extract_text_metadata: false,         // Opt in to rich PDF text metadata
     password: None,                       // Password for protected documents
     quiet: false,                         // Suppress progress output
     ..Default::default()
@@ -64,6 +67,17 @@ let config = LiteParseConfig {
 
 let parser = LiteParse::new(config);
 ```
+
+Set `extract_annotations: true` to populate `ParsedPage::annotations` with
+annotation subtype, contents, author/title, PDF date strings, viewport-space
+rectangle and quadpoint rectangles, and external link URI. It is independent
+of `extract_links`, which controls Markdown link rendering. The field is
+`None` when extraction is disabled.
+
+Set `extract_structure_tree: true` to populate `ParsedPage::structure_tree` with
+the complete tagged-PDF hierarchy: all roots, element type/ID, actual and alternate
+text, title, typed scalar attributes, MCIDs, recursive children, and referenced link
+annotations. Disabled pages use `None`; enabled untagged pages have no roots.
 
 ## Markdown Output
 
@@ -74,6 +88,11 @@ images, and links reconstructed from the spatial layout. Set
 
 - `image_mode` (`ImageMode::Placeholder` default | `Off` | `Embed`) — how raster
   images are surfaced in the output.
+- `extract_images` (default `false`) — return embedded image bytes and metadata
+  without changing Markdown image handling. This is the only option that enables
+  extraction.
+- `image_output_dir` — write extracted image files and return their names/paths;
+  requires `extract_images: true`. Duplicate image resources reuse the same file.
 - `extract_links` (default `true`) — render hyperlink annotations as
   `[text](url)`; set `false` for plain anchor text.
 
@@ -83,6 +102,8 @@ use liteparse::config::{ImageMode, LiteParseConfig, OutputFormat};
 let config = LiteParseConfig {
     output_format: OutputFormat::Markdown,
     image_mode: ImageMode::Placeholder,
+    extract_images: true,
+    image_output_dir: Some("./images".into()),
     extract_links: true,
     ..Default::default()
 };
@@ -125,7 +146,7 @@ if pages.iter().any(|p| p.needs_ocr) {
 ```
 
 `reasons` is a `Vec<ComplexityReason>` (`Scanned`, `NoText`, `SparseText`,
-`EmbeddedImages`, `Garbled`, `VectorText`); new variants may be added over time, so match
+`EmbeddedImages`, `Garbled`, `VectorText`, `AnnotationText`); new variants may be added over time, so match
 leniently.
 
 ## Custom OCR Engine
@@ -140,16 +161,89 @@ let parser = LiteParse::new(LiteParseConfig::default())
     .with_ocr_engine(Arc::new(my_engine));
 ```
 
+For a native ONNX backend, enable `oar-ocr` and supply a detection model,
+recognition model, and matching character dictionary:
+
+```rust,no_run
+use liteparse::ocr::oar::OarOcrEngine;
+use liteparse::{LiteParse, LiteParseConfig};
+use std::path::Path;
+use std::sync::Arc;
+
+let models = Path::new("models");
+let engine = OarOcrEngine::from_models(
+    models.join("pp-ocrv6_small_det.onnx"),
+    models.join("pp-ocrv6_small_rec.onnx"),
+    models.join("ppocrv6_dict.txt"),
+)?;
+
+let parser = LiteParse::new(LiteParseConfig::default())
+    .with_ocr_engine(Arc::new(engine));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+For opt-in model downloads, enable `oar-ocr-auto-download` and use a preset. On
+first use, `oar-ocr` downloads the detection model, recognition model, and
+matching dictionary from ModelScope, verifies their SHA-256 digests, and caches
+them under `$OAR_HOME` (default `~/.oar`):
+
+```rust,no_run
+use liteparse::ocr::oar::OarOcrEngine;
+
+// Smallest / fastest PP-OCRv6 configuration.
+let engine = OarOcrEngine::ppocr_v6_tiny()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Presets cover the current and previous PP-OCR generations, from fastest to most
+accurate: `ppocr_v6_tiny`, `ppocr_v6_small`, and `ppocr_v6_medium`. Each wires the correct
+detector/recognizer/dictionary trio. For PP-OCRv4, a language-specific
+recognizer, or a custom mix, use `from_models` with a matching dictionary.
+
+To mix a detector, recognizer, and dictionary yourself, pass registered bare
+file names to `from_models`. Pair the recognizer with its matching dictionary —
+the tiny recognizer needs `ppocrv6_tiny_dict.txt`, while the larger models use
+`ppocrv6_dict.txt`; a mismatched dictionary silently produces garbled text:
+
+```rust,no_run
+use liteparse::ocr::oar::OarOcrEngine;
+
+let engine = OarOcrEngine::from_models(
+    "pp-ocrv6_small_det.onnx",
+    "pp-ocrv6_small_rec.onnx",
+    "ppocrv6_dict.txt",
+)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+All three artifacts also accept in-memory bytes, so the whole pipeline can be
+embedded with `include_bytes!` rather than shipped as files. Use `OAROCRBuilder`
+with `OarOcrEngine::from_builder` for model-specific settings or optional
+orientation and rectification models. The fallible constructors return
+`liteparse::LiteParseError`. All constructors use conservative batch sizes and
+serialize page inference to avoid multiplying inference memory across
+concurrently scheduled pages.
+`OcrOptions::language` is not interpreted: the recognition model and character
+dictionary define the supported languages, and a configured `ocr_language`
+triggers a one-time warning to make that explicit.
+
 ## Features
 
 - **`tesseract`** (default) — Built-in Tesseract OCR via `tesseract-rs`. Disable with `default-features = false` if you don't need OCR or want to use an HTTP OCR server instead.
+- **`oar-ocr`** — Optional native ONNX backend via `oar-ocr`. Local or in-memory models; non-WASM Rust API only.
+- **`oar-ocr-auto-download`** — Enables SHA-256-verified download and caching of registered model file names through `oar-ocr`.
+- **`oar-ocr-cuda`**, **`oar-ocr-tensorrt`**, **`oar-ocr-directml`**, **`oar-ocr-coreml`**, **`oar-ocr-webgpu`**, **`oar-ocr-openvino`** — Forward the selected ONNX Runtime execution provider to `oar-ocr`.
+
+The Node.js, Python, and WASM bindings build LiteParse with default features
+disabled and do not expose these OAR features, so their published binaries do
+not inherit the OAR model or runtime dependency footprint.
 
 ## Supported Formats
 
 - PDF (`.pdf`)
 - Microsoft Office (`.docx`, `.xlsx`, `.pptx`, etc.) — requires LibreOffice
 - OpenDocument (`.odt`, `.ods`, `.odp`) — requires LibreOffice
-- Images (`.png`, `.jpg`, `.tiff`, etc.) — requires ImageMagick
+- Images (`.png`, `.jpg`, `.tiff`, etc.)
 
 ## CLI
 

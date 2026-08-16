@@ -1,6 +1,81 @@
 use super::inline::escape_inline;
 use super::paragraphs::{ParaAccum, is_soft_hyphen_break};
 use super::tables::escape_table_cell;
+use crate::types::Rect;
+
+/// One table cell: rendered text plus, when the cell came from real page
+/// content, the region it occupied. `bbox` is `None` for cells that exist only
+/// to square off a ragged grid (padding inserted when rows disagree on column
+/// count) — those occupy no ink on the page, and reporting a rect for them
+/// would invent geometry the classifier never saw.
+#[derive(Debug, Clone, Default)]
+pub struct Cell {
+    pub text: String,
+    pub bbox: Option<Rect>,
+}
+
+impl Cell {
+    /// Cell carrying text and the region it was read from.
+    pub fn located(text: impl Into<String>, bbox: Rect) -> Self {
+        Cell {
+            text: text.into(),
+            bbox: Some(bbox),
+        }
+    }
+
+    /// Borrow the cell's text. Lets call sites that only care about content
+    /// read a `Cell` about as tersely as the `String` it replaced.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+// Text-only construction (`"a".into()`, `s.to_string().into()`)
+impl From<&str> for Cell {
+    fn from(text: &str) -> Self {
+        Cell {
+            text: text.to_string(),
+            bbox: None,
+        }
+    }
+}
+
+impl From<String> for Cell {
+    fn from(text: String) -> Self {
+        Cell { text, bbox: None }
+    }
+}
+
+// Cells compare by content alone. A cell's box is derived metadata describing
+// where the text was read from, not part of its identity — two cells holding
+// the same text are the same table content whether or not either one knows its
+// coordinates. This is also what lets assertions compare a detected grid
+// against a plain literal of expected strings.
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for Cell {}
+
+impl PartialEq<str> for Cell {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for Cell {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for Cell {
+    fn eq(&self, other: &String) -> bool {
+        self.text == *other
+    }
+}
 
 /// Coarse block representation: the output of page classification, consumed by
 /// `render_blocks` to produce the final markdown string.
@@ -36,8 +111,8 @@ pub enum Block {
     /// when the first row didn't qualify (e.g. wasn't bold and the table mode
     /// can't otherwise distinguish it).
     Table {
-        header: Option<Vec<String>>,
-        rows: Vec<Vec<String>>,
+        header: Option<Vec<Cell>>,
+        rows: Vec<Vec<Cell>>,
     },
     /// Tabular-looking region we couldn't classify confidently — rendered
     /// verbatim inside a fenced block to preserve visual structure for the
@@ -49,9 +124,10 @@ pub enum Block {
     /// page's vector graphics (e.g. divider line between sections).
     HorizontalRule,
     /// Reference to a raster image on the page. Rendered as
-    /// `![](image_{id}.png)`. Suppressed entirely when `ImageMode::Off`.
+    /// `![](img_{id}.{format})`. Suppressed entirely when `ImageMode::Off`.
     Figure {
         id: String,
+        format: String,
     },
 }
 
@@ -95,40 +171,94 @@ fn wrap_emphasis(text: &str, bold: bool, italic: bool) -> String {
     }
 }
 
-/// Render a list of blocks to a markdown string.
-pub fn render_blocks(blocks: &[Block]) -> String {
-    let mut out = String::new();
-    for (i, block) in blocks.iter().enumerate() {
-        if i > 0 {
-            // A word hyphenated across a soft line wrap sometimes lands in two
-            // *separate* paragraph blocks (the classifier mis-split mid-word):
-            // `…they dis-` ‖ `lodged…`. When the previous block ends with
-            // `<letter>-` and this block is a plain paragraph beginning with a
-            // lowercase letter, splice them: drop the hyphen and join with no
-            // separator, healing both the word and the spurious break. The
-            // lowercase + plain-text gates keep real compounds (`well-` then a
-            // capitalized `Known`) and emphasised/heading/table starts intact.
-            if let (
-                Block::Paragraph { .. },
+/// A classified block plus the region of the page it was read from.
+///
+/// `bbox` is the union of the boxes of every source line that fed the block, so
+/// a wrapped heading or a multi-line paragraph reports the whole band it
+/// occupies. It is `None` only for blocks with no page geometry behind them —
+/// synthesized content, or sources that never carried coordinates.
+#[derive(Debug, Clone)]
+pub struct PositionedBlock {
+    pub block: Block,
+    pub bbox: Option<Rect>,
+}
+
+impl PositionedBlock {
+    pub fn new(block: Block, bbox: Option<Rect>) -> Self {
+        PositionedBlock { block, bbox }
+    }
+
+    /// A block with no known geometry.
+    pub fn unlocated(block: Block) -> Self {
+        PositionedBlock { block, bbox: None }
+    }
+
+    /// Grow this block's box to also cover `other`.
+    fn absorb(&mut self, other: &Option<Rect>) {
+        if let Some(r) = other {
+            Rect::extend(&mut self.bbox, r);
+        }
+    }
+}
+
+/// Heal words hyphenated across a soft line wrap that the classifier split into
+/// two *separate* paragraph blocks: `…they dis-` ‖ `lodged…`. When a plain
+/// paragraph ends with `<letter>-` and the next is a plain paragraph starting
+/// lowercase, fuse them — dropping the hyphen and joining with no separator —
+/// and union their boxes, since the result spans both source regions.
+///
+/// This runs as a pass over the block list rather than inside the renderer so
+/// that the blocks callers receive are the same ones that produced the
+/// markdown. The lowercase and plain-text gates keep real compounds (`well-`
+/// then a capitalized `Known`) and emphasised/heading/table starts intact.
+pub fn splice_soft_hyphens(blocks: Vec<PositionedBlock>) -> Vec<PositionedBlock> {
+    let mut out: Vec<PositionedBlock> = Vec::with_capacity(blocks.len());
+    for pb in blocks {
+        // Both sides must be unemphasised: an emphasised predecessor renders
+        // with a trailing `**`/`*`, so its final character was never the
+        // hyphen this splice keys off.
+        let joinable = match (out.last().map(|p| &p.block), &pb.block) {
+            (
+                Some(Block::Paragraph {
+                    text: prev,
+                    bold: false,
+                    italic: false,
+                }),
                 Block::Paragraph {
                     text,
                     bold: false,
                     italic: false,
                 },
-            ) = (&blocks[i - 1], block)
-                && is_soft_hyphen_break(&out, text)
-            {
-                while out.ends_with(|c: char| c.is_whitespace()) {
-                    out.pop();
+            ) => is_soft_hyphen_break(prev, text).then(|| text.clone()),
+            _ => None,
+        };
+        if let Some(tail) = joinable {
+            let prev = out.last_mut().expect("gate matched on a previous block");
+            if let Block::Paragraph { text, .. } = &mut prev.block {
+                while text.ends_with(|c: char| c.is_whitespace()) {
+                    text.pop();
                 }
-                out.pop(); // the soft hyphen
-                out.push_str(text);
-                continue;
+                text.pop(); // the soft hyphen
+                text.push_str(&tail);
             }
+            prev.absorb(&pb.bbox);
+            continue;
+        }
+        out.push(pb);
+    }
+    out
+}
+
+/// Render a list of blocks to a markdown string.
+pub fn render_blocks(blocks: &[PositionedBlock]) -> String {
+    let mut out = String::new();
+    for (i, positioned) in blocks.iter().enumerate() {
+        let block = &positioned.block;
+        if i > 0 {
             // Consecutive list items render as a tight list (single newline).
             // Everything else gets a blank line between blocks.
             let tight = matches!(block, Block::ListItem { .. })
-                && matches!(blocks[i - 1], Block::ListItem { .. });
+                && matches!(blocks[i - 1].block, Block::ListItem { .. });
             if tight {
                 out.push('\n');
             } else {
@@ -173,7 +303,7 @@ pub fn render_blocks(blocks: &[Block]) -> String {
                 // detector found no header, promote the first body row instead
                 // of synthesizing a blank `|   |   |` header — a visible empty
                 // row reads as sloppy output and carries no information.
-                let (head, body): (Option<&[String]>, &[Vec<String>]) = match header {
+                let (head, body): (Option<&[Cell]>, &[Vec<Cell>]) = match header {
                     Some(h) => (Some(h.as_slice()), rows.as_slice()),
                     None => match rows.split_first() {
                         Some((first, rest)) => (Some(first.as_slice()), rest),
@@ -189,7 +319,7 @@ pub fn render_blocks(blocks: &[Block]) -> String {
                     if i > 0 {
                         out.push_str(" | ");
                     }
-                    out.push_str(&escape_table_cell(cell));
+                    out.push_str(&escape_table_cell(&cell.text));
                 }
                 out.push_str(" |\n");
                 out.push('|');
@@ -202,7 +332,7 @@ pub fn render_blocks(blocks: &[Block]) -> String {
                         if i > 0 {
                             out.push_str(" | ");
                         }
-                        out.push_str(&escape_table_cell(cell));
+                        out.push_str(&escape_table_cell(&cell.text));
                     }
                     out.push_str(" |");
                 }
@@ -238,10 +368,12 @@ pub fn render_blocks(blocks: &[Block]) -> String {
             Block::HorizontalRule => {
                 out.push_str("---");
             }
-            Block::Figure { id, .. } => {
-                out.push_str("![](image_");
+            Block::Figure { id, format } => {
+                out.push_str("![](img_");
                 out.push_str(id);
-                out.push_str(".png)");
+                out.push('.');
+                out.push_str(format);
+                out.push(')');
             }
         }
     }
@@ -251,6 +383,14 @@ pub fn render_blocks(blocks: &[Block]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render content blocks that carry no geometry — the shape almost every
+    /// rendering assertion below cares about.
+    fn render(blocks: Vec<Block>) -> String {
+        let positioned: Vec<PositionedBlock> =
+            blocks.into_iter().map(PositionedBlock::unlocated).collect();
+        render_blocks(&positioned)
+    }
 
     #[test]
     fn render_blocks_formats_markdown() {
@@ -269,8 +409,19 @@ mod tests {
                 text: "Sub".into(),
             },
         ];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert_eq!(s, "# Title\n\nA paragraph.\n\n## Sub");
+    }
+
+    #[test]
+    fn render_figure_uses_extracted_format() {
+        assert_eq!(
+            render(vec![Block::Figure {
+                id: "p1_1".into(),
+                format: "jpg".into(),
+            }]),
+            "![](img_p1_1.jpg)"
+        );
     }
 
     #[test]
@@ -303,11 +454,11 @@ mod tests {
                 italic: false,
             },
         ];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert_eq!(s, "Intro.\n\n- a\n- b\n\nOutro.");
 
         // Ordered: original marker preserved
-        let s = render_blocks(&[
+        let s = render(vec![
             Block::ListItem {
                 ordered: true,
                 marker: "138.".into(),
@@ -342,7 +493,7 @@ mod tests {
             lines: vec!["body containing ``` backticks".into()],
             lang: None,
         }];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert!(s.starts_with("~~~\n"));
         assert!(s.ends_with("~~~"));
     }
@@ -353,7 +504,7 @@ mod tests {
             header: Some(vec!["a".into(), "b".into()]),
             rows: vec![vec!["1".into(), "2".into()], vec!["3".into(), "4".into()]],
         }];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert_eq!(s, "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |");
     }
 
@@ -364,15 +515,40 @@ mod tests {
             bold: false,
             italic: false,
         };
+        let spliced = |a: &str, b: &str| {
+            splice_soft_hyphens(vec![
+                PositionedBlock::unlocated(p(a)),
+                PositionedBlock::unlocated(p(b)),
+            ])
+        };
+        let rendered = |a: &str, b: &str| render_blocks(&spliced(a, b));
         // Mid-word hyphen split into two paragraphs heals into one.
-        let s = render_blocks(&[p("they dis-"), p("lodged the part")]);
-        assert_eq!(s, "they dislodged the part");
+        assert_eq!(
+            rendered("they dis-", "lodged the part"),
+            "they dislodged the part"
+        );
         // Capitalized continuation is a real compound break — left intact.
-        let s = render_blocks(&[p("the well-"), p("Known fact")]);
-        assert_eq!(s, "the well-\n\nKnown fact");
+        assert_eq!(
+            rendered("the well-", "Known fact"),
+            "the well-\n\nKnown fact"
+        );
         // Trailing dash not preceded by a letter doesn't splice.
-        let s = render_blocks(&[p("a -"), p("dash line")]);
-        assert_eq!(s, "a -\n\ndash line");
+        assert_eq!(rendered("a -", "dash line"), "a -\n\ndash line");
+        // A spliced block covers both source regions; an unspliced pair stays
+        // as two blocks with their own boxes.
+        let r = |y: f32| Rect {
+            x: 10.0,
+            y,
+            width: 100.0,
+            height: 12.0,
+        };
+        let joined = splice_soft_hyphens(vec![
+            PositionedBlock::new(p("they dis-"), Some(r(50.0))),
+            PositionedBlock::new(p("lodged the part"), Some(r(70.0))),
+        ]);
+        assert_eq!(joined.len(), 1);
+        let bbox = joined[0].bbox.clone().expect("merged block keeps geometry");
+        assert_eq!((bbox.y, bbox.height), (50.0, 32.0));
     }
 
     #[test]
@@ -381,7 +557,7 @@ mod tests {
             header: None,
             rows: vec![vec!["h1".into(), "h2".into()], vec!["1".into(), "2".into()]],
         }];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         // No blank `|   |   |` header: the first row becomes the header.
         assert_eq!(s, "| h1 | h2 |\n|---|---|\n| 1 | 2 |");
     }

@@ -15,6 +15,30 @@
 use crate::ffi;
 use crate::page::{Page, ViewportTransform};
 use crate::types::RectF;
+use std::collections::BTreeMap;
+
+/// A scalar value from a structure element's PDF `/A` attribute dictionary.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StructureAttributeValue {
+    Boolean(bool),
+    Number(f32),
+    String(String),
+}
+
+/// One element in the page-scoped tagged-PDF structure tree.
+#[derive(Debug, Clone)]
+pub struct StructureElement {
+    pub element_type: String,
+    pub id: Option<String>,
+    pub actual_text: Option<String>,
+    pub alt_text: Option<String>,
+    pub title: Option<String>,
+    pub attributes: BTreeMap<String, StructureAttributeValue>,
+    pub marked_content_ids: Vec<i32>,
+    pub children: Vec<StructureElement>,
+    /// PDF object numbers for link annotations referenced by non-element children.
+    pub annotation_object_numbers: Vec<i32>,
+}
 
 /// One node in the structure tree, flattened for downstream use.
 #[derive(Debug, Clone)]
@@ -32,6 +56,25 @@ pub struct StructNode {
 }
 
 impl Page<'_, '_> {
+    /// Extract the complete tagged-PDF structure tree for public output.
+    /// Returns an empty vector for untagged pages and preserves multiple roots.
+    pub fn structure_tree(&self) -> Vec<StructureElement> {
+        let tree = unsafe { ffi!(FPDF_StructTree_GetForPage(self.handle)) };
+        if tree.is_null() {
+            return Vec::new();
+        }
+        let count = unsafe { ffi!(FPDF_StructTree_CountChildren(tree)) };
+        let mut roots = Vec::with_capacity(count.max(0) as usize);
+        for index in 0..count {
+            let element = unsafe { ffi!(FPDF_StructTree_GetChildAtIndex(tree, index)) };
+            if !element.is_null() {
+                roots.push(read_structure_element(element));
+            }
+        }
+        unsafe { ffi!(FPDF_StructTree_Close(tree)) };
+        roots
+    }
+
     /// Walk this page's structure tree (tagged-PDF tree). Returns an empty
     /// vec when the page is untagged or the document has no struct tree.
     /// Nodes are returned in pre-order (parent before children).
@@ -56,6 +99,184 @@ impl Page<'_, '_> {
 
         out
     }
+}
+
+fn read_structure_element(elem: pdfium_sys::FPDF_STRUCTELEMENT) -> StructureElement {
+    let element_type = read_element_type(elem);
+    let id = read_optional_widestring(|buf, len| unsafe {
+        ffi!(FPDF_StructElement_GetID(elem, buf, len))
+    });
+    let actual_text = read_optional_widestring(|buf, len| unsafe {
+        ffi!(FPDF_StructElement_GetActualText(elem, buf, len))
+    });
+    let alt_text = read_alt_text(elem);
+    let title = read_optional_widestring(|buf, len| unsafe {
+        ffi!(FPDF_StructElement_GetTitle(elem, buf, len))
+    });
+    let attributes = read_attributes(elem);
+    let marked_content_ids = read_marked_content_ids(elem);
+    let count = unsafe { ffi!(FPDF_StructElement_CountChildren(elem)) };
+    let mut children = Vec::new();
+    let mut annotation_object_numbers = Vec::new();
+    for index in 0..count {
+        let child = unsafe { ffi!(FPDF_StructElement_GetChildAtIndex(elem, index)) };
+        if child.is_null() {
+            let object_number = unsafe { ffi!(FPDF_StructElement_GetChildObjNum(elem, index)) };
+            if object_number >= 0 {
+                annotation_object_numbers.push(object_number);
+            }
+        } else {
+            children.push(read_structure_element(child));
+        }
+    }
+    StructureElement {
+        element_type,
+        id,
+        actual_text,
+        alt_text,
+        title,
+        attributes,
+        marked_content_ids,
+        children,
+        annotation_object_numbers,
+    }
+}
+
+fn read_marked_content_ids(elem: pdfium_sys::FPDF_STRUCTELEMENT) -> Vec<i32> {
+    let count = unsafe { ffi!(FPDF_StructElement_GetMarkedContentIdCount(elem)) };
+    let mut ids = Vec::with_capacity(count.max(0) as usize);
+    for index in 0..count {
+        let id = unsafe { ffi!(FPDF_StructElement_GetMarkedContentIdAtIndex(elem, index)) };
+        if id >= 0 {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn read_attributes(
+    elem: pdfium_sys::FPDF_STRUCTELEMENT,
+) -> BTreeMap<String, StructureAttributeValue> {
+    let mut out = BTreeMap::new();
+    let attr_count = unsafe { ffi!(FPDF_StructElement_GetAttributeCount(elem)) };
+    for attr_index in 0..attr_count {
+        let attr = unsafe { ffi!(FPDF_StructElement_GetAttributeAtIndex(elem, attr_index)) };
+        if attr.is_null() {
+            continue;
+        }
+        let value_count = unsafe { ffi!(FPDF_StructElement_Attr_GetCount(attr)) };
+        for value_index in 0..value_count {
+            let Some(name) = read_attribute_name(attr, value_index) else {
+                continue;
+            };
+            let mut name_bytes = name.as_bytes().to_vec();
+            name_bytes.push(0);
+            let value = unsafe {
+                ffi!(FPDF_StructElement_Attr_GetValue(
+                    attr,
+                    name_bytes.as_ptr().cast()
+                ))
+            };
+            if value.is_null() {
+                continue;
+            }
+            let value_type = unsafe { ffi!(FPDF_StructElement_Attr_GetType(value)) };
+            let parsed = if value_type == pdfium_sys::FPDF_OBJECT_BOOLEAN as i32 {
+                let mut boolean = 0;
+                (unsafe { ffi!(FPDF_StructElement_Attr_GetBooleanValue(value, &mut boolean)) } != 0)
+                    .then_some(StructureAttributeValue::Boolean(boolean != 0))
+            } else if value_type == pdfium_sys::FPDF_OBJECT_NUMBER as i32 {
+                let mut number = 0.0;
+                (unsafe { ffi!(FPDF_StructElement_Attr_GetNumberValue(value, &mut number)) } != 0)
+                    .then_some(StructureAttributeValue::Number(number))
+            } else if value_type == pdfium_sys::FPDF_OBJECT_STRING as i32
+                || value_type == pdfium_sys::FPDF_OBJECT_NAME as i32
+            {
+                read_attribute_string(value).map(StructureAttributeValue::String)
+            } else {
+                None
+            };
+            if let Some(parsed) = parsed {
+                out.insert(name, parsed);
+            }
+        }
+    }
+    out
+}
+
+fn read_attribute_name(attr: pdfium_sys::FPDF_STRUCTELEMENT_ATTR, index: i32) -> Option<String> {
+    let mut needed = 0;
+    unsafe {
+        ffi!(FPDF_StructElement_Attr_GetName(
+            attr,
+            index,
+            std::ptr::null_mut(),
+            0,
+            &mut needed
+        ));
+    }
+    if needed == 0 || needed > usize::MAX as std::os::raw::c_ulong {
+        return None;
+    }
+    let mut bytes = vec![0u8; needed as usize];
+    let ok = unsafe {
+        ffi!(FPDF_StructElement_Attr_GetName(
+            attr,
+            index,
+            bytes.as_mut_ptr().cast(),
+            needed,
+            &mut needed
+        ))
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8(bytes[..end].to_vec()).ok()
+}
+
+fn read_attribute_string(value: pdfium_sys::FPDF_STRUCTELEMENT_ATTR_VALUE) -> Option<String> {
+    let mut needed = 0;
+    unsafe {
+        ffi!(FPDF_StructElement_Attr_GetStringValue(
+            value,
+            std::ptr::null_mut(),
+            0,
+            &mut needed
+        ));
+    }
+    if needed < 2 || needed > usize::MAX as std::os::raw::c_ulong {
+        return None;
+    }
+    let mut buffer = vec![0u16; needed as usize / 2];
+    let ok = unsafe {
+        ffi!(FPDF_StructElement_Attr_GetStringValue(
+            value,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed
+        ))
+    };
+    if ok == 0 {
+        return None;
+    }
+    let chars = needed as usize / 2;
+    let mut end = chars.min(buffer.len());
+    while end > 0 && buffer[end - 1] == 0 {
+        end -= 1;
+    }
+    Some(String::from_utf16_lossy(&buffer[..end]))
+}
+
+fn read_optional_widestring<F>(getter: F) -> Option<String>
+where
+    F: Fn(*mut std::os::raw::c_void, std::os::raw::c_ulong) -> std::os::raw::c_ulong,
+{
+    let value = read_widestring(getter);
+    (!value.is_empty()).then_some(value)
 }
 
 /// Pre-scan all page objects on the page, building `mcid → union(bbox)` in
@@ -216,10 +437,9 @@ where
         return String::new();
     }
     let chars = written / 2;
-    let end = if buf.get(chars - 1) == Some(&0) {
-        chars - 1
-    } else {
-        chars
-    };
+    let mut end = chars.min(buf.len());
+    while end > 0 && buf[end - 1] == 0 {
+        end -= 1;
+    }
     String::from_utf16_lossy(&buf[..end])
 }

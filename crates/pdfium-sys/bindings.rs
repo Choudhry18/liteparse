@@ -99,6 +99,11 @@ pub const FPDF_FORMFIELD_LISTBOX: u32 = 5;
 pub const FPDF_FORMFIELD_TEXTFIELD: u32 = 6;
 pub const FPDF_FORMFIELD_SIGNATURE: u32 = 7;
 pub const FPDF_FORMFIELD_COUNT: u32 = 8;
+pub const FLATTEN_FAIL: u32 = 0;
+pub const FLATTEN_SUCCESS: u32 = 1;
+pub const FLATTEN_NOTHINGTODO: u32 = 2;
+pub const FLAT_NORMALDISPLAY: u32 = 0;
+pub const FLAT_PRINT: u32 = 1;
 pub const FPDF_ANNOT_UNKNOWN: u32 = 0;
 pub const FPDF_ANNOT_TEXT: u32 = 1;
 pub const FPDF_ANNOT_LINK: u32 = 2;
@@ -562,6 +567,22 @@ unsafe extern "C" {
         doc: FPDF_DOCUMENT,
         fileVersion: *mut ::std::os::raw::c_int,
     ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FPDF_GetSignatureCount(document: FPDF_DOCUMENT) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn FPDF_GetSignatureObject(
+        document: FPDF_DOCUMENT,
+        index: ::std::os::raw::c_int,
+    ) -> FPDF_SIGNATURE;
+}
+unsafe extern "C" {
+    pub fn FPDFSignatureObj_GetByteRange(
+        signature: FPDF_SIGNATURE,
+        buffer: *mut ::std::os::raw::c_int,
+        length: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
 }
 unsafe extern "C" {
     pub fn FPDF_GetLastError() -> ::std::os::raw::c_ulong;
@@ -1038,6 +1059,12 @@ pub struct FPDF_IMAGEOBJ_METADATA {
     pub bits_per_pixel: ::std::os::raw::c_uint,
     pub colorspace: ::std::os::raw::c_int,
     pub marked_content_id: ::std::os::raw::c_int,
+}
+unsafe extern "C" {
+    pub fn FPDFPage_Flatten(
+        page: FPDF_PAGE,
+        nFlag: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn FPDF_CreateNewDocument() -> FPDF_DOCUMENT;
@@ -2969,4 +2996,23 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn FPDFPage_InsertClipPath(page: FPDF_PAGE, clipPath: FPDF_CLIPPATH);
+}
+unsafe extern "C" {
+    pub fn FORM_OnAfterLoadPage(page: FPDF_PAGE, hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_OnBeforeClosePage(page: FPDF_PAGE, hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_DoDocumentJSAction(hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_DoDocumentOpenAction(hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_DoPageAAction(
+        page: FPDF_PAGE,
+        hHandle: FPDF_FORMHANDLE,
+        aaType: ::std::os::raw::c_int,
+    );
 }

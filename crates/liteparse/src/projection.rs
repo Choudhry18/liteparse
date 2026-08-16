@@ -549,7 +549,7 @@ fn form_lines(
     let merge_h_tolerance = 0.1;
 
     let mut merged_items: Vec<ProjectedTextItem> = Vec::with_capacity(items.len());
-    for cur in items.drain(..) {
+    for mut cur in items.drain(..) {
         let should_merge = merged_items
             .last()
             .map(|prev| can_merge(prev, &cur, merge_y_tolerance, merge_h_tolerance))
@@ -559,6 +559,7 @@ fn form_lines(
             if let Some(prev) = merged_items.last_mut() {
                 let merged = merge_bbox(prev, &cur);
                 prev.item.text.push_str(&cur.item.text);
+                prev.item.words.append(&mut cur.item.words);
                 prev.item.x = merged.0;
                 prev.item.y = merged.1;
                 prev.item.width = merged.2;
@@ -725,7 +726,7 @@ fn form_lines(
 
     for line in lines.iter_mut() {
         let mut merged_line: Vec<ProjectedTextItem> = Vec::with_capacity(line.len());
-        for item in line.drain(..) {
+        for mut item in line.drain(..) {
             if let Some(prev) = merged_line.last_mut() {
                 let both_are_numbers = looks_like_table_number(&prev.item.text)
                     && looks_like_table_number(&item.item.text);
@@ -760,6 +761,7 @@ fn form_lines(
                 if is_decimal_continuation {
                     prev.item.width = item.item.x + item.item.width - prev.item.x;
                     prev.item.text.push_str(&item.item.text);
+                    prev.item.words.append(&mut item.item.words);
                     merge_orig_bbox(prev, &item);
                     continue;
                 }
@@ -793,6 +795,7 @@ fn form_lines(
                 {
                     prev.item.width = item.item.x + item.item.width - prev.item.x;
                     prev.item.text.push_str(&item.item.text);
+                    prev.item.words.append(&mut item.item.words);
                     merge_orig_bbox(prev, &item);
                     continue;
                 }
@@ -805,6 +808,7 @@ fn form_lines(
                         prev.item.text.push(' ');
                     }
                     prev.item.text.push_str(&item.item.text);
+                    prev.item.words.append(&mut item.item.words);
                     merge_orig_bbox(prev, &item);
                     continue;
                 }
@@ -2890,6 +2894,7 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 page_number: page.page_number,
                 page_width: page.page_width,
                 page_height: page.page_height,
+                content_bounds: page.content_bounds,
                 text,
                 markdown: String::new(),
                 text_items: projected_items
@@ -2906,10 +2911,17 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 projected_lines,
                 regions,
                 graphics: page.graphics,
+                vector_graphics: page.vector_graphics,
                 figures,
                 struct_nodes: page.struct_nodes,
                 image_refs: page.image_refs,
                 complexity: None,
+                annotations: page.annotations,
+                form_fields: page.form_fields,
+                structure_tree: page.structure_tree,
+                // Filled in after classification, which needs the finished
+                // page (and whole-document signals) to run.
+                blocks: None,
             }
         })
         .collect()
@@ -4728,11 +4740,15 @@ fn build_one_line(
     figures: &[Rect],
 ) -> ProjectedLine {
     // Sort by x so concatenation reads left→right even if reading order had
-    // rotated insertions.
+    // rotated insertions. `spans` stays in this x-ascending order — the table
+    // cell splitter and the inline emphasis renderer both read geometry off it
+    // — while `text` below is joined in *reading* order, which for a
+    // right-to-left line runs the other way across the page.
     let mut sorted: Vec<usize> = idxs.to_vec();
     sorted.sort_by(|a, b| items[*a].item.x.total_cmp(&items[*b].item.x));
 
-    let mut text = String::new();
+    // Item texts in x order; joined once the line's base direction is known.
+    let mut piece_texts: Vec<&str> = Vec::with_capacity(sorted.len());
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -4761,7 +4777,7 @@ fn build_one_line(
     let mut mcid: Option<i32> = None;
     let mut spans: Vec<TextItem> = Vec::with_capacity(sorted.len());
 
-    for (pos, &i) in sorted.iter().enumerate() {
+    for &i in sorted.iter() {
         let proj = &items[i];
         let it = &proj.item;
         // `handle_rotation_reading_order` zeroes `item.rotation` after it
@@ -4774,13 +4790,10 @@ fn build_one_line(
         span.rotation = proj.orig_rotation;
         spans.push(span);
 
-        // Concatenate item text. Use existing num_spaces from projection only as
+        // Collect item text. Use existing num_spaces from projection only as
         // a hint — the markdown emitter re-collapses whitespace, so we just
         // ensure there's *some* separation between adjacent items.
-        if pos > 0 && !text.ends_with(' ') {
-            text.push(' ');
-        }
-        text.push_str(&it.text);
+        piece_texts.push(it.text.as_str());
 
         min_x = min_x.min(it.x);
         min_y = min_y.min(it.y);
@@ -4838,6 +4851,25 @@ fn build_one_line(
         if mcid.is_none() {
             mcid = it.mcid;
         }
+    }
+
+    // Join the line in reading order. PDFium already hands back each item's
+    // characters in logical order, so a right-to-left line only needs its
+    // *items* walked right-to-left across the page — otherwise an invoice line
+    // like "المجموع الفرعي: 75.00 SAR" comes out as "SAR 75.00 المجموع الفرعي:",
+    // detaching every label from its value. Direction is decided from the
+    // assembled line, so a neutral-only line (pure digits) stays LTR and every
+    // left-to-right document takes exactly the path it took before.
+    let rtl = crate::bidi::is_rtl_pieces(piece_texts.iter().copied());
+    if rtl {
+        piece_texts.reverse();
+    }
+    let mut text = String::new();
+    for piece in &piece_texts {
+        if !text.is_empty() && !text.ends_with(' ') {
+            text.push(' ');
+        }
+        text.push_str(piece);
     }
 
     // NOTE on tie-breaks: `max_by_key` over a HashMap returns the *last* max it
@@ -4938,6 +4970,7 @@ fn build_one_line(
 
     ProjectedLine {
         text,
+        rtl,
         bbox: bbox.clone(),
         anchor,
         // Real column detection is deferred (carry-forward in MARKDOWN_PROGRESS).
@@ -4996,10 +5029,15 @@ mod tests {
             page_number: 1,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             graphics: Vec::new(),
+            vector_graphics: None,
             text_items: Vec::new(),
             struct_nodes: Vec::new(),
             image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         };
         let projection_boxes = vec![
             projected_item("", 10.0, 0.0, 10.0),
@@ -5297,10 +5335,15 @@ mod tests {
             page_number: 1,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             text_items: Vec::new(),
             graphics: Vec::new(),
+            vector_graphics: None,
             struct_nodes: Vec::new(),
             image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         }];
 
         let parsed = project_pages_to_grid(pages);
@@ -5317,6 +5360,7 @@ mod tests {
             page_number: 1,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             text_items: vec![
                 TextItem {
                     text: "A".to_string(),
@@ -5336,8 +5380,12 @@ mod tests {
                 },
             ],
             graphics: Vec::new(),
+            vector_graphics: None,
             struct_nodes: Vec::new(),
             image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         }];
 
         let parsed = project_pages_to_grid(pages);
@@ -5354,11 +5402,75 @@ mod tests {
     }
 
     #[test]
+    fn project_pages_to_grid_concatenates_word_boxes_when_items_merge() {
+        // Regression for #361: two items that merge into one must carry both
+        // items' per-word sub-boxes. The item text was concatenated but the
+        // second item's `words` were silently dropped, truncating `words`.
+        let y = 50.25;
+        let pages = vec![Page {
+            page_number: 1,
+            page_width: 612.0,
+            page_height: 792.0,
+            content_bounds: None,
+            text_items: vec![
+                TextItem {
+                    text: "A".to_string(),
+                    x: 10.0,
+                    y,
+                    width: 10.0,
+                    height: 8.0,
+                    words: vec![WordBox {
+                        text: "A".to_string(),
+                        x: 10.0,
+                        y,
+                        width: 10.0,
+                        height: 8.0,
+                    }],
+                    ..Default::default()
+                },
+                TextItem {
+                    text: "B".to_string(),
+                    x: 24.0,
+                    y: y + 0.01,
+                    width: 8.0,
+                    height: 7.5,
+                    words: vec![WordBox {
+                        text: "B".to_string(),
+                        x: 24.0,
+                        y: y + 0.01,
+                        width: 8.0,
+                        height: 7.5,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            graphics: Vec::new(),
+            vector_graphics: None,
+            struct_nodes: Vec::new(),
+            image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+        }];
+
+        let parsed = project_pages_to_grid(pages);
+        let item = parsed[0]
+            .text_items
+            .iter()
+            .find(|item| item.text == "A B")
+            .expect("merged text item");
+
+        let word_texts: Vec<&str> = item.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(word_texts, vec!["A", "B"]);
+    }
+
+    #[test]
     fn project_pages_to_grid_unions_original_bbox_when_continuous_items_merge() {
         let pages = vec![Page {
             page_number: 1,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             text_items: vec![
                 TextItem {
                     text: "ab".to_string(),
@@ -5378,8 +5490,12 @@ mod tests {
                 },
             ],
             graphics: Vec::new(),
+            vector_graphics: None,
             struct_nodes: Vec::new(),
             image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         }];
 
         let parsed = project_pages_to_grid(pages);

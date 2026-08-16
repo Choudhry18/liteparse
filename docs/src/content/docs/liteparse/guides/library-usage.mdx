@@ -83,6 +83,8 @@ const parser = new LiteParse({
 });
 ```
 
+Images, vector graphics, annotations, form fields, structure trees, and per-item typography are all off by default and enabled with their own options. See [Extraction options](/liteparse/guides/extraction/).
+
 ### Buffer / Uint8Array input
 
 You can pass raw bytes directly instead of a file path:
@@ -108,7 +110,7 @@ Generate page images as buffers — useful for sending to LLMs or saving to disk
 
 ```typescript
 const parser = new LiteParse();
-const screenshots = parser.screenshot("document.pdf");
+const screenshots = await parser.screenshot("document.pdf");
 
 for (const shot of screenshots) {
   console.log(`Page ${shot.pageNum}: ${shot.width}x${shot.height}`);
@@ -116,7 +118,7 @@ for (const shot of screenshots) {
 }
 
 // Screenshot specific pages
-const shots = parser.screenshot("document.pdf", [1, 2, 3]);
+const shots = await parser.screenshot("document.pdf", [1, 2, 3]);
 ```
 
 ### Environment variables
@@ -167,6 +169,8 @@ parser = LiteParse(
 )
 result = parser.parse("document.pdf")
 ```
+
+All options are keyword-only. Images, vector graphics, annotations, form fields, structure trees, and per-item typography are off by default and enabled with their own options — see [Extraction options](/liteparse/guides/extraction/).
 
 ### Markdown output
 
@@ -274,6 +278,8 @@ let config = LiteParseConfig {
 let parser = LiteParse::new(config);
 ```
 
+`LiteParseConfig` is a plain struct, so `..Default::default()` is the idiomatic way to set only what you need. Images, vector graphics, annotations, form fields, structure trees, and per-item typography are off by default — see [Extraction options](/liteparse/guides/extraction/).
+
 ### Markdown output
 
 Render the document to Markdown — headings, tables, lists, images, and links. The rendered Markdown comes back on `result.text`:
@@ -322,11 +328,21 @@ let parser = LiteParse::new(Default::default())
     .with_ocr_engine(Arc::new(my_engine));
 ```
 
+For native ONNX OCR, enable LiteParse's `oar-ocr` feature and pass local model
+paths to `OarOcrEngine::from_models`. Enabling `oar-ocr-auto-download` also lets
+the same constructor accept registered bare file names; `oar-ocr` downloads
+them from ModelScope, verifies their SHA-256 digests, and caches them under
+`$OAR_HOME` (default `~/.oar`). The OAR backend is intentionally Rust-only and
+is not included in the Node.js, Python, or WASM binding binaries.
+
 ### Features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `tesseract` | Yes | Built-in Tesseract OCR via `tesseract-rs`. Disable with `default-features = false` if you only use HTTP OCR or no OCR. |
+| `oar-ocr` | No | Native ONNX OCR via `oar-ocr`, using local or in-memory models. Available through the non-WASM Rust API. |
+| `oar-ocr-auto-download` | No | Enables verified download and caching of registered OAR model file names. |
+| `oar-ocr-{cuda,tensorrt,directml,coreml,webgpu,openvino}` | No | Forwards the selected ONNX Runtime execution provider to `oar-ocr`. |
 
 </TabItem>
 <TabItem label="Browser (WASM)" value="wasm">

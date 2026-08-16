@@ -1,7 +1,7 @@
 use crate::config::ImageMode;
 use crate::markdown_layout::{
-    build_heading_map, classify_page_with_filters, compute_body_size, compute_header_footer_set,
-    detect_single_page_chrome, render_blocks,
+    PositionedBlock, build_heading_map, classify_page_with_filters, compute_body_size,
+    compute_header_footer_set, detect_single_page_chrome, render_blocks, splice_soft_hyphens,
 };
 use crate::types::{OutlineTarget, ParsedPage};
 
@@ -22,7 +22,7 @@ pub fn format_markdown(
     outline: &[OutlineTarget],
     image_mode: ImageMode,
 ) -> String {
-    format_markdown_pages(pages, outline, image_mode).join("\n\n-----\n\n")
+    format_markdown_pages(pages, outline, image_mode, false).join("\n\n-----\n\n")
 }
 
 /// Render each page to its own markdown string, returning one entry per input
@@ -32,32 +32,54 @@ pub fn format_markdown(
 /// (body size, heading map, header/footer set) is still computed across all
 /// pages so a single page renders identically whether requested alone or as
 /// part of the document.
+///
+/// `keep_headers_footers` disables running-chrome suppression entirely (both
+/// the cross-page repetition set and the single-page chrome detector), so
+/// repeated headers/footers and page markers stay in the output.
 pub fn format_markdown_pages(
     pages: &[ParsedPage],
     outline: &[OutlineTarget],
     image_mode: ImageMode,
+    keep_headers_footers: bool,
 ) -> Vec<String> {
+    let classified = classify_document(pages, outline, image_mode, keep_headers_footers);
+    render_classified(pages, &classified)
+}
+
+/// Classify every page into its final block sequence — the same decomposition
+/// [`format_markdown_pages`] renders, after chrome suppression, rule dedup, and
+/// soft-hyphen splicing.
+///
+/// A page yields `None` when it has no projected lines (blank, or fully-OCR
+/// without font metadata): there is no structural decomposition to report, and
+/// rendering falls back to fenced projection text.
+///
+/// Split out from rendering so callers that want the blocks *and* the markdown
+/// pay for classification once, and so blocks are available in JSON and text
+/// output modes, which never render markdown at all.
+pub fn classify_document(
+    pages: &[ParsedPage],
+    outline: &[OutlineTarget],
+    image_mode: ImageMode,
+    keep_headers_footers: bool,
+) -> Vec<Option<Vec<PositionedBlock>>> {
     if pages.is_empty() {
         return Vec::new();
     }
 
     let body_size = compute_body_size(pages);
     let heading_map = build_heading_map(pages, body_size);
-    let header_footer = compute_header_footer_set(pages);
+    let header_footer = if keep_headers_footers {
+        Default::default()
+    } else {
+        compute_header_footer_set(pages)
+    };
 
     pages
         .iter()
         .map(|page| {
             if page.projected_lines.is_empty() {
-                // No structural metadata for this page — fall back to the
-                // projection text inside a fence so nothing is dropped.
-                let mut out = String::from("```text\n");
-                out.push_str(&page.text);
-                if !page.text.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push_str("```");
-                return out;
+                return None;
             }
 
             // Filter outline entries to this page so the classifier's y/title
@@ -68,7 +90,11 @@ pub fn format_markdown_pages(
                 .filter(|e| e.page_index == target_index)
                 .cloned()
                 .collect();
-            let chrome_indices = detect_single_page_chrome(page, body_size);
+            let chrome_indices = if keep_headers_footers {
+                Default::default()
+            } else {
+                detect_single_page_chrome(page, body_size)
+            };
             let mut blocks = classify_page_with_filters(
                 page,
                 &heading_map,
@@ -82,16 +108,42 @@ pub fn format_markdown_pages(
             // of bare `---` separators.
             let has_content = blocks.iter().any(|b| {
                 !matches!(
-                    b,
+                    b.block,
                     crate::markdown_layout::Block::HorizontalRule
                         | crate::markdown_layout::Block::Figure { .. }
                 )
             });
             if !has_content {
-                blocks.retain(|b| !matches!(b, crate::markdown_layout::Block::HorizontalRule));
+                blocks
+                    .retain(|b| !matches!(b.block, crate::markdown_layout::Block::HorizontalRule));
             }
             dedupe_rules(&mut blocks);
-            render_blocks(&blocks)
+            Some(splice_soft_hyphens(blocks))
+        })
+        .collect()
+}
+
+/// Render pre-classified pages to one markdown string per page. Pages that
+/// classified to `None` fall back to their projection text inside a fence so
+/// nothing is silently dropped.
+pub fn render_classified(
+    pages: &[ParsedPage],
+    classified: &[Option<Vec<PositionedBlock>>],
+) -> Vec<String> {
+    pages
+        .iter()
+        .zip(classified)
+        .map(|(page, blocks)| match blocks {
+            Some(blocks) => render_blocks(blocks),
+            None => {
+                let mut out = String::from("```text\n");
+                out.push_str(&page.text);
+                if !page.text.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("```");
+                out
+            }
         })
         .collect()
 }
@@ -102,15 +154,15 @@ pub fn format_markdown_pages(
 /// two sources — vector-graphics detection and decorative divider text — and
 /// doubling up reads as sloppy output to a human, while carrying no extra
 /// structure for an LLM.
-fn dedupe_rules(blocks: &mut Vec<crate::markdown_layout::Block>) {
+fn dedupe_rules(blocks: &mut Vec<crate::markdown_layout::PositionedBlock>) {
     use crate::markdown_layout::Block::HorizontalRule;
-    while matches!(blocks.first(), Some(HorizontalRule)) {
+    while matches!(blocks.first().map(|b| &b.block), Some(HorizontalRule)) {
         blocks.remove(0);
     }
-    while matches!(blocks.last(), Some(HorizontalRule)) {
+    while matches!(blocks.last().map(|b| &b.block), Some(HorizontalRule)) {
         blocks.pop();
     }
-    blocks.dedup_by(|a, b| matches!((a, b), (HorizontalRule, HorizontalRule)));
+    blocks.dedup_by(|a, b| matches!((&a.block, &b.block), (HorizontalRule, HorizontalRule)));
 }
 
 #[cfg(test)]
@@ -121,6 +173,7 @@ mod tests {
     fn line(text: &str, x: f32, y: f32, h: f32, size: f32) -> ProjectedLine {
         ProjectedLine {
             text: text.into(),
+            rtl: crate::bidi::is_rtl_text(text),
             bbox: Rect {
                 x,
                 y,
@@ -149,16 +202,22 @@ mod tests {
             page_number: n,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             text: "fallback".into(),
             markdown: String::new(),
             text_items: vec![],
             projected_lines: lines,
             regions: crate::types::Region::default(),
             graphics: vec![],
+            vector_graphics: None,
             figures: vec![],
             struct_nodes: vec![],
             image_refs: vec![],
             complexity: None,
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+            blocks: None,
         }
     }
 
@@ -175,18 +234,21 @@ mod tests {
             bold: false,
             italic: false,
         };
-        let mut blocks = vec![
+        let mut blocks: Vec<crate::markdown_layout::PositionedBlock> = [
             HorizontalRule,
             p("a"),
             HorizontalRule,
             HorizontalRule,
             p("b"),
             HorizontalRule,
-        ];
+        ]
+        .into_iter()
+        .map(crate::markdown_layout::PositionedBlock::unlocated)
+        .collect();
         dedupe_rules(&mut blocks);
         let kinds: Vec<bool> = blocks
             .iter()
-            .map(|b| matches!(b, Block::HorizontalRule))
+            .map(|b| matches!(b.block, Block::HorizontalRule))
             .collect();
         // Leading + trailing rules gone; the doubled interior run collapsed to one.
         assert_eq!(kinds, vec![false, true, false]);
@@ -198,16 +260,22 @@ mod tests {
             page_number: 1,
             page_width: 0.0,
             page_height: 0.0,
+            content_bounds: None,
             text: "hello".into(),
             markdown: String::new(),
             text_items: vec![],
             projected_lines: vec![],
             regions: crate::types::Region::default(),
             graphics: vec![],
+            vector_graphics: None,
             figures: vec![],
             struct_nodes: vec![],
             image_refs: vec![],
             complexity: None,
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+            blocks: None,
         };
         let out = format_markdown(&[p], &[], ImageMode::Placeholder);
         assert!(out.contains("```text"));
@@ -258,7 +326,7 @@ mod tests {
         let a = page_with(1, vec![line("A page.", 50.0, 80.0, 10.0, 10.0)]);
         let b = page_with(2, vec![line("B page.", 50.0, 80.0, 10.0, 10.0)]);
         let pages = [a, b];
-        let per_page = format_markdown_pages(&pages, &[], ImageMode::Placeholder);
+        let per_page = format_markdown_pages(&pages, &[], ImageMode::Placeholder, false);
         assert_eq!(per_page.len(), 2);
         assert!(per_page[0].contains("A page."));
         assert!(per_page[1].contains("B page."));

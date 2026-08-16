@@ -18,11 +18,12 @@ mod paragraphs;
 mod repetition;
 mod tables;
 
-pub use blocks::{Block, render_blocks};
+pub use blocks::{Block, Cell, PositionedBlock, render_blocks, splice_soft_hyphens};
 pub use classify::classify_page_with_filters;
 pub use headings::{build_heading_map, compute_body_size};
 pub use repetition::{compute_header_footer_set, detect_single_page_chrome};
 pub use tables::detect_table_rects;
+pub(crate) use tables::{count_text_table_runs, validated_ruled_table_rects};
 
 /// Minimum plausible text-row height in points. Floors a `bbox.height` before
 /// it is multiplied into a band / tolerance window, so a degenerate near-zero

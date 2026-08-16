@@ -150,10 +150,10 @@ fn marker_interpretations(body: &str) -> Vec<(MarkerKind, u32)> {
         if let Some(v) = roman_value(body) {
             out.push((MarkerKind::RomanLower, v));
         }
-    } else if chars.iter().all(|c| c.is_ascii_uppercase()) {
-        if let Some(v) = roman_value(&body.to_ascii_lowercase()) {
-            out.push((MarkerKind::RomanUpper, v));
-        }
+    } else if chars.iter().all(|c| c.is_ascii_uppercase())
+        && let Some(v) = roman_value(&body.to_ascii_lowercase())
+    {
+        out.push((MarkerKind::RomanUpper, v));
     }
     out
 }

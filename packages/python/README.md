@@ -18,6 +18,7 @@ from liteparse import LiteParse
 parser = LiteParse()
 result = parser.parse("document.pdf")
 print(result.text)
+print(f"Source document pages: {result.total_pages}")
 
 # Access structured data
 for page in result.pages:
@@ -54,16 +55,54 @@ parser = LiteParse(
     tessdata_path=None,            # Path to tessdata directory (optional)
     max_pages=1000,                # Max pages to parse
     target_pages="1-5,10",         # Specific pages (optional)
+    extract_screenshots=False,      # Return parsed pages as PNG bytes
+    continue_on_page_error=False,   # Skip broken pages and return page_errors
     dpi=150,                       # Rendering DPI
     output_format="json",          # "json" | "text" | "markdown"
     image_mode="placeholder",      # Markdown image handling: "placeholder" | "off" | "embed"
+    extract_images=True,           # Extract image bytes + metadata (default: False)
+    image_output_dir="./images",   # Write images and return name/path metadata (optional)
     extract_links=True,            # Render [text](url) links in markdown output
+    keep_headers_footers=False,    # Keep running headers/footers in markdown output
+    extract_vector_graphics=False, # Opt-in shapes + merged H/V lines per page
+    extract_annotations=False,     # Include page annotations in structured output
+    extract_form_fields=False,      # Include AcroForm widget fields and values
+    extract_structure_tree=False,   # Include tagged-PDF logical structure
     preserve_very_small_text=False, # Keep tiny text
+    extract_text_metadata=False,    # Opt in to MCID, font metrics, colors, char codes, and trailing_space_generated
     password=None,                 # Password for protected documents
     quiet=False,                   # Suppress progress output
     num_workers=4,                 # Concurrent OCR workers
 )
 ```
+
+When ``extract_images=True``, image extraction is enabled. ``image_output_dir``
+requires that explicit opt-in and writes the extracted bytes to disk. Each
+``result.images`` entry includes its page bbox, intrinsic pixel dimensions, rotation,
+format, ``name``, and ``path``. Valid source JPEGs are preserved, exact duplicates
+reuse one file, and JSON CLI output contains metadata only (no base64 image data).
+``image_mode`` controls Markdown presentation only and does not imply extraction.
+With ``extract_images=False``, lightweight Markdown placement refs are still collected
+and ``result.images`` stays empty.
+
+When `extract_annotations` is enabled, each parsed page has an `annotations`
+list containing the subtype, contents, author/title, PDF date strings,
+viewport-space rectangle and quadpoint rectangles, and URI for external link
+annotations. It is independent of `extract_links`, which controls Markdown
+link rendering. The field is `None` when extraction is disabled.
+
+When ``extract_structure_tree=True``, each page has a ``structure_tree`` containing
+all tagged-PDF roots and recursive elements with type, ID, actual/alternate text,
+title, typed attributes, MCIDs, children, and referenced link annotations. Untagged
+pages have an empty ``roots`` list; the field is ``None`` when disabled.
+
+Every result also carries ``creator``/``producer`` from the PDF ``/Info``
+dictionary. With ``extract_document_metadata=True``, ``result.doc_meta`` adds a
+provenance object with dates, PDF version/security, signature state,
+incremental-save markers, trailer ID comparison, the catalog's XMP packet
+(capped at 64 KiB; skipped for sources over 16 MiB), and source size. It is off by default because it streams the whole source file,
+and it is ``None`` for inputs converted from a non-PDF format. These document
+fields are API-only and do not alter default CLI JSON.
 
 ## Parsing from Bytes
 
@@ -112,14 +151,14 @@ for page in pages:
 ```
 
 `reasons` is one of `"scanned"`, `"no-text"`, `"sparse-text"`, `"embedded-images"`,
-`"garbled"`, or `"vector-text"`. Raw bytes work here too.
+`"garbled"`, `"vector-text"`, or `"annotation-text"`. Raw bytes work here too.
 
 ## Supported Formats
 
 - PDF (`.pdf`)
 - Microsoft Office (`.docx`, `.xlsx`, `.pptx`, etc.) — requires LibreOffice
 - OpenDocument (`.odt`, `.ods`, `.odp`) — requires LibreOffice
-- Images (`.png`, `.jpg`, `.tiff`, etc.) — requires ImageMagick
+- Images (`.png`, `.jpg`, `.tiff`, etc.)
 - And more!
 
 ## CLI
@@ -129,6 +168,8 @@ The Python package includes the `lit` CLI:
 ```bash
 lit parse document.pdf
 lit parse document.pdf --format json -o output.json
+lit parse document.pdf --format json --extract-annotations
+lit parse document.pdf --format json --extract-form-fields
 lit screenshot document.pdf -o ./screenshots
 lit batch-parse ./input ./output
 lit is-complex document.pdf

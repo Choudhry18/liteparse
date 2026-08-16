@@ -5,6 +5,7 @@ use crate::types::{Anchor, GraphicPrimitive, ParsedPage, ProjectedLine, Rect, Te
 pub(crate) fn line(text: &str, x: f32, y: f32, h: f32, size: f32) -> ProjectedLine {
     ProjectedLine {
         text: text.into(),
+        rtl: crate::bidi::is_rtl_text(text),
         bbox: Rect {
             x,
             y,
@@ -33,16 +34,22 @@ pub(crate) fn page(lines: Vec<ProjectedLine>) -> ParsedPage {
         page_number: 1,
         page_width: 612.0,
         page_height: 792.0,
+        content_bounds: None,
         text: String::new(),
         markdown: String::new(),
         text_items: vec![],
         projected_lines: lines,
         regions: crate::types::Region::default(),
         graphics: vec![],
+        vector_graphics: None,
         figures: vec![],
         struct_nodes: vec![],
         image_refs: vec![],
         complexity: None,
+        annotations: None,
+        form_fields: None,
+        structure_tree: None,
+        blocks: None,
     }
 }
 
@@ -79,6 +86,7 @@ pub(crate) fn line_with_spans(cells: &[(&str, f32)], y: f32, size: f32) -> Proje
             .map(|(t, _)| *t)
             .collect::<Vec<_>>()
             .join("   "),
+        rtl: false,
         bbox: Rect {
             x: min_x,
             y,
@@ -129,6 +137,7 @@ pub(crate) fn styled_line(spans: &[(&str, f32, Option<&str>)], y: f32, size: f32
         .map(|s| s.x + s.width)
         .fold(f32::NEG_INFINITY, f32::max);
     ProjectedLine {
+        rtl: crate::bidi::is_rtl_text(&joined),
         text: joined,
         bbox: Rect {
             x: min_x,
@@ -184,16 +193,22 @@ pub(crate) fn header_footer_page(n: usize, header: &str, footer: &str, body: &st
         page_number: n,
         page_width: 612.0,
         page_height: 100.0,
+        content_bounds: None,
         text: String::new(),
         markdown: String::new(),
         text_items: vec![],
         projected_lines: lines,
         regions: crate::types::Region::default(),
         graphics: vec![],
+        vector_graphics: None,
         figures: vec![],
         struct_nodes: vec![],
         image_refs: vec![],
         complexity: None,
+        annotations: None,
+        form_fields: None,
+        structure_tree: None,
+        blocks: None,
     }
 }
 

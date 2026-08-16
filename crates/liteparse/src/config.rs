@@ -19,6 +19,16 @@ pub struct LiteParseConfig {
     pub max_pages: usize,
     /// Specific pages to parse (e.g., "1-5,10,15-20"). None means all pages.
     pub target_pages: Option<String>,
+    /// Render parsed pages to PNG and return them in `ParseResult.screenshots`.
+    /// Default `false`; PNG payloads can be large.
+    #[serde(default)]
+    pub extract_screenshots: bool,
+    /// Continue parsing after a page-level PDFium extraction failure and
+    /// report it in `ParseResult.page_errors`. Default `false` preserves the
+    /// fail-fast behavior. Document-open and document-level failures remain
+    /// fatal regardless of this setting.
+    #[serde(default)]
+    pub continue_on_page_error: bool,
     /// DPI for rendering pages (used for OCR and screenshots).
     pub dpi: f32,
     /// Output format.
@@ -31,13 +41,78 @@ pub struct LiteParseConfig {
     pub quiet: bool,
     /// Number of concurrent OCR workers. Defaults to (number of CPU cores - 1), minimum 1.
     pub num_workers: usize,
-    /// Controls how raster images are surfaced in markdown output. Has no
-    /// effect on JSON / text outputs.
+    /// Controls how raster image references are surfaced in markdown output.
+    /// This does not enable embedded-image extraction.
     pub image_mode: ImageMode,
+    /// Extract embedded image bytes and metadata into `ParseResult.images`.
+    /// Defaults to false. `ImageMode::Embed` also enables extraction for
+    /// backwards compatibility (see [`LiteParseConfig::effective_extract_images`]).
+    pub extract_images: bool,
+    /// Directory where extracted embedded images are written. Requires
+    /// `extract_images` to be true.
+    pub image_output_dir: Option<String>,
     /// Extract hyperlink annotations and render them as `[text](url)` in
     /// markdown output. Default on. Disable for benchmark parity with
     /// plain-text ground truth (the GT corpora never use link syntax).
     pub extract_links: bool,
+    /// Keep running header/footer chrome in markdown output instead of
+    /// stripping it. By default the markdown renderer removes lines that
+    /// repeat in the top/bottom page bands across pages (and single-page
+    /// chrome like `Page N of M`). Set `true` to retain everything —
+    /// useful for extraction pipelines that would rather deduplicate
+    /// downstream than risk losing content. Only affects Markdown output.
+    #[serde(default)]
+    pub keep_headers_footers: bool,
+    /// Extract all PDF annotations into each parsed page. Default `false`.
+    /// This is independent of `extract_links`, which only controls Markdown
+    /// link reconstruction.
+    pub extract_annotations: bool,
+    /// Extract AcroForm widget fields and values. Default `false`.
+    #[serde(default)]
+    pub extract_form_fields: bool,
+    /// Extract the tagged-PDF logical structure tree. Default `false`.
+    #[serde(default)]
+    pub extract_structure_tree: bool,
+    /// Emit each page's classified layout blocks (headings, paragraphs, list
+    /// items, tables with per-cell boxes, code, rules, figures) with bounding
+    /// boxes. Default `false`.
+    ///
+    /// This is the same decomposition the Markdown renderer consumes, exposed
+    /// as data. It is independent of `output_format`: blocks are available in
+    /// JSON and text modes too, and enabling it never changes the rendered
+    /// Markdown.
+    #[serde(default)]
+    pub extract_blocks: bool,
+    /// Emit each page's `content_bounds`: the union bbox of its top-level
+    /// content objects in viewport coords (visible content extent). Default
+    /// `false` to keep the default output shape unchanged. Content bounds are
+    /// still computed internally for the white-fill heuristic whenever
+    /// `extract_vector_graphics` is on.
+    #[serde(default)]
+    pub extract_content_bounds: bool,
+    /// Extract raw XFA packets (name + XML content) from XFA form documents
+    /// into `ParseResult.xfa_packets`. Default `false`. Non-XFA documents
+    /// yield an empty list.
+    #[serde(default)]
+    pub extract_xfa_packets: bool,
+    /// Collect document-level provenance metadata into `ParseResult.doc_meta`.
+    /// Default `false`: `None` for inputs converted from a non-PDF format,
+    /// since the facts would describe the intermediate PDF rather than the caller's file.
+    #[serde(default)]
+    pub extract_document_metadata: bool,
+    /// Detect solid rectangles and thick lines in rendered page screenshots
+    /// and attach them to each `ScreenshotResult.rects`. Works on the raster,
+    /// so it also finds structure in scanned/flattened pages that have no
+    /// vector paths. Default `false` (adds a full-bitmap scan per page).
+    #[serde(default)]
+    pub detect_screenshot_rects: bool,
+    /// Draw AcroForm field appearances (filled values, checkbox states) into
+    /// rendered rasters (screenshots and OCR inputs). This initializes a
+    /// PDFium form-fill environment and runs the document's open/JS actions,
+    /// so it is off by default: plain parses should neither execute document
+    /// scripts nor change raster bytes for form-bearing PDFs.
+    #[serde(default)]
+    pub render_form_fields: bool,
     /// Whether a systemic OCR failure (every OCR task failed *and* at least one
     /// was a text-sparse page whose primary text source was OCR) aborts the
     /// whole parse. Default `true`: surface the root cause instead of silently
@@ -60,6 +135,14 @@ pub struct LiteParseConfig {
     /// `false`, `TextItem.words` is always empty and the per-word tracking is
     /// skipped entirely (zero allocation).
     pub emit_word_boxes: bool,
+    /// Include rich PDF text metadata on public text items: MCID, glyph width,
+    /// font metrics/weight/buggy state, fill/stroke colors, raw character
+    /// codes, and generated-trailing-space state. Default `false` to preserve
+    /// LiteParse's lightweight response shape. Layout-required metrics remain
+    /// available internally; source character codes and generated-space state
+    /// are not computed unless this is enabled.
+    #[serde(default)]
+    pub extract_text_metadata: bool,
     /// Restrict output to a sub-region of every page. Each field is the
     /// fraction of the page to crop away from that side (e.g. `left = 0.5`
     /// discards the left half). A text item is kept only when it lies
@@ -76,6 +159,10 @@ pub struct LiteParseConfig {
     /// These are the same signals the standalone `is_complex` API returns.
     /// Default `false`.
     pub include_complexity: bool,
+    /// Expose page-scoped vector path data (`shapes` and merged horizontal /
+    /// vertical `lines`) in parse results. Default `false`; path objects are
+    /// still inspected internally for layout detection when disabled.
+    pub extract_vector_graphics: bool,
 }
 
 /// A page sub-region expressed as the fraction cropped from each side.
@@ -92,14 +179,13 @@ pub struct CropBox {
 /// Image handling for the markdown emitter.
 ///
 /// * `Off` — strip image references entirely.
-/// * `Placeholder` (default) — emit `![](image_pN_K.png)` references in
+/// * `Placeholder` (default) — emit `![](img_pN_K.png)` references in
 ///   reading order at each image's y position, but do **not** extract or
 ///   return pixel bytes. Keeps response size small while letting the LLM see
 ///   where figures live in the document.
-/// * `Embed` — same references, plus bytes returned via `ParseResult.images`.
-///   Opt-in because pixel bytes can dwarf the text payload on image-heavy
-///   PDFs. (Bytes plumbing lands in stage 11b — current variant is parsed but
-///   behaves like `Placeholder` until then.)
+/// * `Embed` — emit the same references as `Placeholder`, and extract the
+///   embedded pixel bytes into `ParseResult.images` (equivalent to setting
+///   `LiteParseConfig::extract_images`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageMode {
@@ -115,6 +201,16 @@ pub enum OutputFormat {
     Json,
     Text,
     Markdown,
+}
+
+impl LiteParseConfig {
+    /// Whether embedded-image extraction should run. True when
+    /// `extract_images` is set, or when the legacy `ImageMode::Embed` is
+    /// configured (`Embed` implies byte extraction for backwards
+    /// compatibility).
+    pub fn effective_extract_images(&self) -> bool {
+        self.extract_images || self.image_mode == ImageMode::Embed
+    }
 }
 
 impl Default for LiteParseConfig {
@@ -137,6 +233,8 @@ impl Default for LiteParseConfig {
             tessdata_path: None,
             max_pages: 1000,
             target_pages: None,
+            extract_screenshots: false,
+            continue_on_page_error: false,
             dpi: 150.0,
             output_format: OutputFormat::Json,
             preserve_very_small_text: false,
@@ -144,13 +242,27 @@ impl Default for LiteParseConfig {
             quiet: false,
             num_workers: default_num_workers(),
             image_mode: ImageMode::Placeholder,
+            extract_images: false,
+            image_output_dir: None,
             extract_links: true,
+            keep_headers_footers: false,
+            extract_annotations: false,
+            extract_form_fields: false,
+            extract_structure_tree: false,
+            extract_blocks: false,
+            extract_content_bounds: false,
+            extract_xfa_packets: false,
+            extract_document_metadata: false,
+            detect_screenshot_rects: false,
+            render_form_fields: false,
             ocr_failure_fatal: true,
             ocr_hedge_delays_ms: Vec::new(),
             emit_word_boxes: false,
+            extract_text_metadata: false,
             crop_box: None,
             skip_diagonal_text: false,
             include_complexity: false,
+            extract_vector_graphics: false,
         }
     }
 }
@@ -169,6 +281,13 @@ fn default_num_workers() -> usize {
 /// document approaches this many pages, so the cap only ever rejects nonsense
 /// input.
 const MAX_TARGET_PAGES: u64 = 100_000;
+
+/// Pages per batch when a caller of
+/// [`crate::parser::LiteParse::open_batch_session`] does
+/// not pick a size. Small enough to keep the materialized result bounded;
+/// large enough that the per-batch document reopen stays modest (it costs
+/// roughly 13% at this size on a 457-page document, ~4% at 50).
+pub const DEFAULT_PAGE_BATCH_SIZE: usize = 25;
 
 #[doc(hidden)]
 pub fn parse_target_pages(s: &str) -> Result<Vec<u32>, String> {
@@ -264,11 +383,16 @@ mod tests {
         // OCR defaults on only when a built-in engine is compiled in.
         assert_eq!(c.ocr_enabled, cfg!(feature = "tesseract"));
         assert_eq!(c.max_pages, 1000);
+        assert!(!c.extract_screenshots);
+        assert!(!c.continue_on_page_error);
         assert_eq!(c.dpi, 150.0);
         assert_eq!(c.output_format, OutputFormat::Json);
         assert!(!c.preserve_very_small_text);
         assert!(!c.quiet);
+        assert!(!c.extract_text_metadata);
         assert!(c.password.is_none());
+        assert!(!c.extract_images);
+        assert!(!c.extract_structure_tree);
     }
 
     #[test]

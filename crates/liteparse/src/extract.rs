@@ -1,12 +1,16 @@
+use crate::bidi::is_rtl_char;
 use crate::error::LiteParseError;
 use crate::glyph_names::resolve_glyph_name;
 use crate::types::{
-    ExtractedImage, GraphicPrimitive, ImageRef, OutlineTarget, Page as LitePage, PdfInput, Rect,
-    StructNode, TextItem, WordBox,
+    DocumentAnnotation, ExtractedImage, FormField, GraphicPrimitive, ImageRef, OutlineTarget,
+    Page as LitePage, PageError, PdfInput, Rect, StructNode, StructureAttributeValue,
+    StructureTree, StructureTreeElement, TextItem, VectorGraphics, VectorLine, VectorShape,
+    WordBox,
 };
 use image::ImageEncoder;
 use pdfium::{
-    Document, Font, FontType, Library, Page, PathObject, PdfLink, RectF, SegmentKind, TextPage,
+    Document, Font, FontType, FormEnvironment, Library, Page, PathObject, PdfLink, RectF,
+    SegmentKind, TextPage,
 };
 
 /// Open a PDF from path or bytes with an optional password.
@@ -49,26 +53,56 @@ pub(crate) fn extract_pages_from_document(
     target_pages: Option<&[u32]>,
     max_pages: usize,
 ) -> Result<Vec<LitePage>, LiteParseError> {
-    Ok(extract_pages_and_images(document, target_pages, max_pages, false, false, None, false)?.0)
+    Ok(extract_pages_and_images(
+        document,
+        target_pages,
+        max_pages,
+        false,
+        None,
+        ExtractionOutputOptions::default(),
+    )?
+    .pages)
+}
+
+/// Output of [`extract_pages_and_images`].
+pub(crate) struct ExtractedPages {
+    pub pages: Vec<LitePage>,
+    pub page_errors: Vec<PageError>,
+    /// Empty unless `output_options.extract_images` was set.
+    pub images: Vec<ExtractedImage>,
+    pub image_error_count: u32,
+    /// Whether any page was flattened to recover form-widget text. Flattening
+    /// mutates the open PDFium document, so a caller that still needs the
+    /// original widget annotations must reopen the input.
+    pub flattened_form_widgets: bool,
 }
 
 /// Same as `extract_pages_from_document` but optionally also renders every
-/// raster image object to PNG bytes (when `render_images = true`). Returned
+/// raster image object to bytes (when `output_options.extract_images` is true). Returned
 /// `ExtractedImage`s carry the same ids the markdown emitter will reference,
-/// so callers can match them up by id. When `render_images = false` the
-/// returned image vec is always empty.
+/// so callers can match them up by id.
 pub(crate) fn extract_pages_and_images(
     document: &Document,
     target_pages: Option<&[u32]>,
     max_pages: usize,
-    render_images: bool,
     extract_links: bool,
     glyph_resolver: Option<&dyn crate::GlyphResolver>,
-    emit_word_boxes: bool,
-) -> Result<(Vec<LitePage>, Vec<ExtractedImage>), LiteParseError> {
+    output_options: ExtractionOutputOptions,
+) -> Result<ExtractedPages, LiteParseError> {
     let page_count = document.page_count();
     let mut pages = Vec::new();
+    let mut page_errors = Vec::new();
     let mut images: Vec<ExtractedImage> = Vec::new();
+    let mut image_cache = ImageCache::default();
+    let mut image_error_count = 0u32;
+    let mut flattened_form_widgets = false;
+    // One FFI call keeps the per-page annotation walk off the hot path for
+    // every document without an AcroForm catalog, which is nearly all of them.
+    let document_has_form = document.form_type() != 0;
+    let form_environment = output_options
+        .extract_form_fields
+        .then(|| document.form_environment())
+        .flatten();
 
     for page_index in 0..page_count {
         let page_number = page_index as u32 + 1;
@@ -79,49 +113,396 @@ pub(crate) fn extract_pages_and_images(
             continue;
         }
 
-        if pages.len() >= max_pages {
+        if pages.len() + page_errors.len() >= max_pages {
             break;
         }
 
-        let page = document.page(page_index)?;
+        let page_result = extract_single_page(
+            document,
+            page_index,
+            page_number,
+            extract_links,
+            glyph_resolver,
+            &output_options,
+            form_environment.as_ref(),
+            document_has_form,
+            &mut image_cache,
+        );
+
+        match resolve_page_result(
+            page_number,
+            page_result,
+            output_options.continue_on_page_error,
+            &mut page_errors,
+        )? {
+            Some(extraction) => {
+                pages.push(extraction.page);
+                images.extend(extraction.images);
+                image_error_count += extraction.image_error_count;
+                flattened_form_widgets |= extraction.flattened_form_widgets;
+            }
+            // A failed page's cached renders must not seed dedup for later
+            // pages: a hit would emit `duplicate_of` pointing at an image id
+            // that never made it into the output.
+            None => image_cache.remove_page(page_number),
+        }
+    }
+
+    Ok(ExtractedPages {
+        pages,
+        page_errors,
+        images,
+        image_error_count,
+        flattened_form_widgets,
+    })
+}
+
+/// Everything one successfully extracted page contributes to the document
+/// output. Accumulated page-locally so a failed page is rolled back by
+/// dropping this value (plus [`ImageCache::remove_page`] for its cache
+/// inserts) instead of undoing shared-state mutations.
+struct PageExtraction {
+    page: LitePage,
+    /// Rendered image bytes; empty unless `extract_images` was set.
+    images: Vec<ExtractedImage>,
+    image_error_count: u32,
+    /// Whether this page was flattened to recover form-widget text.
+    flattened_form_widgets: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_single_page(
+    document: &Document,
+    page_index: i32,
+    page_number: u32,
+    extract_links: bool,
+    glyph_resolver: Option<&dyn crate::GlyphResolver>,
+    output_options: &ExtractionOutputOptions,
+    form_environment: Option<&FormEnvironment<'_, '_>>,
+    document_has_form: bool,
+    image_cache: &mut ImageCache,
+) -> Result<PageExtraction, LiteParseError> {
+    let mut images = Vec::new();
+    let mut image_error_count = 0u32;
+    let mut flattened_form_widgets = false;
+    let page = document.page(page_index)?;
+    let raw_page_width = page.width();
+    let raw_page_height = page.height();
+    let view_box = page.view_box().unwrap_or(RectF {
+        left: 0.0,
+        top: raw_page_height,
+        right: raw_page_width,
+        bottom: 0.0,
+    });
+    // All extracted geometry is converted to the rotation-adjusted
+    // viewport coordinate space. Keep the page dimensions in that same
+    // space so projection, filtering, and consumers do not clip content
+    // at the unrotated MediaBox width on /Rotate 90 or /Rotate 270 pages.
+    let (page_width, page_height) = page.viewport_size(&view_box);
+    // Once a qualifying widget is found, PDFium flattens every visible
+    // annotation on the page. Collect every annotation-backed output first.
+    let links = if extract_links {
+        page.links(&view_box)
+    } else {
+        Vec::new()
+    };
+    // Computed when emitted (`extract_content_bounds`) or needed
+    // internally by the white-fill heuristic (`extract_vector_graphics`).
+    let content_bounds = (output_options.extract_content_bounds
+        || output_options.extract_vector_graphics)
+        .then(|| {
+            page.content_bounds()
+                .map(|bounds| rect_from_pdfium(page.bounds_to_viewport(&view_box, &bounds)))
+        })
+        .flatten();
+    let paths = page.path_objects(&view_box);
+    let graphics = extract_layout_graphics(&paths);
+    let vector_graphics = output_options
+        .extract_vector_graphics
+        .then(|| build_vector_graphics(&paths, content_bounds.as_ref()));
+    let struct_nodes = extract_page_struct_nodes(&page, &view_box);
+    let extracted_refs = extract_page_image_refs(&page, page_number, output_options.extract_images);
+    let mut image_refs = extracted_refs.refs;
+    image_error_count += extracted_refs.error_count;
+    let pdf_annotations = (output_options.extract_annotations
+        || output_options.extract_structure_tree)
+        .then(|| page.annotations(&view_box))
+        .unwrap_or_default();
+    let annotations = output_options
+        .extract_annotations
+        .then(|| pdf_annotations.iter().map(document_annotation).collect());
+    let structure_tree = output_options.extract_structure_tree.then(|| {
+        let annotations_by_object = pdf_annotations
+            .iter()
+            .filter(|annotation| annotation.subtype == "link")
+            .filter_map(|annotation| annotation.object_number.map(|n| (n, annotation)))
+            .collect::<std::collections::HashMap<_, _>>();
+        StructureTree {
+            roots: page
+                .structure_tree()
+                .into_iter()
+                .map(|element| structure_tree_element(element, &annotations_by_object))
+                .collect(),
+        }
+    });
+    let form_fields = output_options.extract_form_fields.then(|| {
+        form_environment.map_or_else(Vec::new, |form| {
+            page.form_fields(form, &view_box, page_number)
+                .into_iter()
+                .map(|field| FormField {
+                    id: field.id,
+                    field_type: field.field_type,
+                    page: field.page,
+                    annotation_index: field.annotation_index,
+                    widget_index: field.widget_index,
+                    object_number: field.object_number,
+                    name: field.name,
+                    alternate_name: field.alternate_name,
+                    value: field.value,
+                    export_value: field.export_value,
+                    field_flags: field.field_flags,
+                    control_count: field.control_count,
+                    control_index: field.control_index,
+                    checked: field.checked,
+                    rect: field.rect.map(rect_from_pdfium),
+                    options: field.options,
+                    selected_options: field.selected_options,
+                })
+                .collect()
+        })
+    });
+
+    if output_options.extract_images && !image_refs.is_empty() {
+        let rendered = render_page_images(&page, page_number, &image_refs, image_cache);
+        image_error_count += rendered.error_count;
+        images.extend(rendered.images);
+        for image_ref in &mut image_refs {
+            image_ref.jpeg_bytes = None;
+            image_ref.raw_bytes = None;
+        }
+    }
+
+    // PDFium's text API reads only the page content stream. Filled form
+    // values commonly live in widget appearance streams, so promote only
+    // those widget appearances into page content and reload before text
+    // extraction. Non-widget annotations are excluded, and this does not
+    // initialize the form environment or execute document JS.
+    //
+    // `widget_text_rects` is empty for the overwhelming majority of pages —
+    // documents with no AcroForm catalog never even reach the annotation
+    // walk — so the whole path costs one `form_type()` call for most files.
+    let extract_text = |page: &Page| -> Result<Vec<TextItem>, LiteParseError> {
         let text_page = page.text()?;
-        let view_box = page.view_box().unwrap_or(RectF {
-            left: 0.0,
-            top: page.height(),
-            right: page.width(),
-            bottom: 0.0,
-        });
-        let mut text_items = extract_page_text_items(
-            &page,
+        extract_page_text_items(
+            page,
             &text_page,
             &view_box,
             glyph_resolver,
-            emit_word_boxes,
-        )?;
-        if extract_links {
-            assign_links(&mut text_items, &page.links(&view_box));
+            output_options.emit_word_boxes,
+            output_options.extract_text_metadata,
+        )
+    };
+    let widget_text_rects = if document_has_form {
+        page.form_widget_text_rects(&view_box)
+    } else {
+        Vec::new()
+    };
+    let mut text_items = if widget_text_rects.is_empty() {
+        extract_text(&page)?
+    } else {
+        // PDFium's text layer keeps only one of two runs that start at
+        // essentially the same point, so a flattened appearance can
+        // suppress page text it lands on. Usually widget rects sit over
+        // blank space, and this bounds-only probe says so without touching
+        // the text API; only when a widget really does cover existing text
+        // do we extract twice and put back what was suppressed.
+        let overlaps_existing_text = page.text_objects_overlap(&view_box, &widget_text_rects);
+        let before = overlaps_existing_text
+            .then(|| extract_text(&page))
+            .transpose()?;
+        drop(page);
+        match document.flatten_form_widgets(page_index)? {
+            Some(flattened_page) => {
+                flattened_form_widgets = true;
+                let mut items = extract_text(&flattened_page)?;
+                if let Some(before) = before {
+                    restore_flattened_over_text(&mut items, before, &widget_text_rects);
+                }
+                items
+            }
+            None => extract_text(&document.page(page_index)?)?,
         }
-        let graphics = extract_page_graphics(&page, &view_box);
-        assign_strikethrough(&mut text_items, &graphics);
-        let struct_nodes = extract_page_struct_nodes(&page, &view_box);
-        let image_refs = extract_page_image_refs(&page, page_number);
+    };
+    assign_links(&mut text_items, &links);
+    assign_strikethrough(&mut text_items, &graphics);
 
-        if render_images && !image_refs.is_empty() {
-            images.extend(render_page_images(&page, page_number, &image_refs));
-        }
-
-        pages.push(LitePage {
+    Ok(PageExtraction {
+        page: LitePage {
             page_number: page_number as usize,
-            page_width: page.width(),
-            page_height: page.height(),
+            page_width,
+            page_height,
+            content_bounds: output_options
+                .extract_content_bounds
+                .then_some(content_bounds)
+                .flatten(),
             text_items,
             graphics,
+            vector_graphics,
             struct_nodes,
             image_refs,
-        });
-    }
+            annotations,
+            form_fields,
+            structure_tree,
+        },
+        images,
+        image_error_count,
+        flattened_form_widgets,
+    })
+}
 
-    Ok((pages, images))
+fn resolve_page_result<T>(
+    page_number: u32,
+    result: Result<T, LiteParseError>,
+    continue_on_page_error: bool,
+    page_errors: &mut Vec<PageError>,
+) -> Result<Option<T>, LiteParseError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if continue_on_page_error => {
+            page_errors.push(PageError {
+                page_number,
+                message: error.to_string(),
+            });
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Put back page text that flattening suppressed.
+///
+/// PDFium's text layer emits only one of two text runs that start at
+/// essentially the same point, so a flattened widget appearance can knock out
+/// page text it lands on. When the two carry the *same* string — a producer
+/// that wrote the value into both the content stream and the appearance — that
+/// is precisely the dedup a partially flattened file needs, and matching on
+/// trimmed text leaves it alone. When they differ, such as a pre-printed label
+/// sitting where the value is typed, dropping one is pure data loss, so the
+/// pre-flatten copy is restored.
+///
+/// Only called for the page where a widget rect actually covers existing text;
+/// `before` is the pre-flatten extraction of the same page.
+///
+/// Note this recovers one direction only. If the collision goes the other way
+/// PDFium can suppress the *appearance* text instead, and the field value is
+/// lost with no pre-flatten copy to restore it from.
+fn restore_flattened_over_text(
+    items: &mut Vec<TextItem>,
+    before: Vec<TextItem>,
+    widget_rects: &[RectF],
+) {
+    let surviving: std::collections::HashSet<&str> = items
+        .iter()
+        .map(|item| item.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect();
+    let mut restored: Vec<TextItem> = before
+        .iter()
+        .filter(|item| {
+            let text = item.text.trim();
+            !text.is_empty()
+                && !surviving.contains(text)
+                && widget_rects
+                    .iter()
+                    .any(|rect| rect_contains_center(rect, item))
+        })
+        .cloned()
+        .collect();
+    items.append(&mut restored);
+}
+
+fn rect_contains_center(rect: &RectF, item: &TextItem) -> bool {
+    let cx = item.x + item.width / 2.0;
+    let cy = item.y + item.height / 2.0;
+    cx >= rect.left && cx <= rect.right && cy >= rect.top && cy <= rect.bottom
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExtractionOutputOptions {
+    pub continue_on_page_error: bool,
+    pub extract_content_bounds: bool,
+    pub extract_text_metadata: bool,
+    pub extract_images: bool,
+    pub extract_vector_graphics: bool,
+    pub extract_annotations: bool,
+    pub extract_form_fields: bool,
+    pub extract_structure_tree: bool,
+    pub emit_word_boxes: bool,
+}
+
+fn document_annotation(annotation: &pdfium::PdfAnnotation) -> DocumentAnnotation {
+    DocumentAnnotation {
+        subtype: annotation.subtype.clone(),
+        contents: annotation.contents.clone(),
+        created: annotation.created.clone(),
+        modified: annotation.modified.clone(),
+        title: annotation.title.clone(),
+        rect: annotation.rect.map(rect_from_pdfium),
+        quadpoint_rects: annotation
+            .quadpoint_rects
+            .iter()
+            .copied()
+            .map(rect_from_pdfium)
+            .collect(),
+        uri: annotation.uri.clone(),
+    }
+}
+
+fn structure_tree_element(
+    element: pdfium::StructureElement,
+    annotations_by_object: &std::collections::HashMap<i32, &pdfium::PdfAnnotation>,
+) -> StructureTreeElement {
+    let attributes = element
+        .attributes
+        .into_iter()
+        .map(|(name, value)| {
+            let value = match value {
+                pdfium::StructureAttributeValue::Boolean(v) => StructureAttributeValue::Boolean(v),
+                pdfium::StructureAttributeValue::Number(v) => StructureAttributeValue::Number(v),
+                pdfium::StructureAttributeValue::String(v) => StructureAttributeValue::String(v),
+            };
+            (name, value)
+        })
+        .collect();
+    StructureTreeElement {
+        element_type: element.element_type,
+        id: element.id,
+        actual_text: element.actual_text,
+        alt_text: element.alt_text,
+        title: element.title,
+        attributes,
+        marked_content_ids: element.marked_content_ids,
+        children: element
+            .children
+            .into_iter()
+            .map(|child| structure_tree_element(child, annotations_by_object))
+            .collect(),
+        annotations: element
+            .annotation_object_numbers
+            .into_iter()
+            .filter_map(|number| annotations_by_object.get(&number))
+            .map(|annotation| document_annotation(annotation))
+            .collect(),
+    }
+}
+
+fn rect_from_pdfium(rect: RectF) -> Rect {
+    Rect {
+        x: rect.left,
+        y: rect.top,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    }
 }
 
 /// Assign hyperlink URIs to text items whose bbox center falls inside a link
@@ -345,47 +726,170 @@ const IMAGE_MIN_SIZE_PT: f32 = 25.0;
 /// images (scanned pages, watermarks).
 const IMAGE_MAX_COVERAGE: f32 = 0.9;
 
-/// Render every image referenced in `refs` to PNG bytes using
-/// `Page::render_image_object`. Returns one `ExtractedImage` per ref. Used by
-/// the parser only when `ImageMode::Embed` is configured — otherwise the
-/// extraction loop skips this entirely. Failures for individual images are
-/// silently dropped (a malformed embedded image shouldn't fail the whole
-/// parse).
-pub(crate) fn render_page_images(
+/// Extract every image referenced in `refs`, preserving valid JPEG streams and
+/// rendering other images to PNG. Returns one `ExtractedImage` per ref. Used
+/// when embedded-image extraction is explicitly enabled. Failures for
+/// individual images are counted but do not fail the whole parse.
+struct CachedImage {
+    raw_bytes: Vec<u8>,
+    id: String,
+    /// Source page of the canonical render; lets a failed page's inserts be
+    /// rolled back so later duplicates never reference a dropped image id.
+    page: u32,
+    format: String,
+    bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// Dedup key: hash of the source stream plus the metadata that affects
+/// decoding. The hash only prefilters; the full raw bytes are still compared
+/// on lookup within the matching bucket.
+#[derive(PartialEq, Eq, Hash)]
+struct CacheKey {
+    raw_hash: u64,
+    width: u32,
+    height: u32,
+    bits_per_pixel: u32,
+    colorspace: i32,
+}
+
+#[derive(Default)]
+pub(crate) struct ImageCache {
+    entries: std::collections::HashMap<CacheKey, Vec<CachedImage>>,
+}
+
+impl ImageCache {
+    fn key(r: &ImageRef, raw_bytes: &[u8]) -> CacheKey {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw_bytes.hash(&mut hasher);
+        CacheKey {
+            raw_hash: hasher.finish(),
+            width: r.pixel_width,
+            height: r.pixel_height,
+            bits_per_pixel: r.bits_per_pixel,
+            colorspace: r.colorspace,
+        }
+    }
+
+    fn get(&self, r: &ImageRef, raw_bytes: &[u8]) -> Option<&CachedImage> {
+        self.entries
+            .get(&Self::key(r, raw_bytes))?
+            .iter()
+            .find(|entry| entry.raw_bytes == *raw_bytes)
+    }
+
+    fn insert(&mut self, r: &ImageRef, entry: CachedImage) {
+        self.entries
+            .entry(Self::key(r, &entry.raw_bytes))
+            .or_default()
+            .push(entry);
+    }
+
+    /// Drop every entry rendered from `page_number`. Called when that page
+    /// fails after its images were cached, so a later duplicate can't resolve
+    /// to a canonical image that was rolled back out of the output.
+    fn remove_page(&mut self, page_number: u32) {
+        self.entries.retain(|_, bucket| {
+            bucket.retain(|entry| entry.page != page_number);
+            !bucket.is_empty()
+        });
+    }
+}
+
+pub(crate) struct RenderedImages {
+    pub images: Vec<ExtractedImage>,
+    pub error_count: u32,
+}
+
+fn render_page_images(
     page: &Page,
     page_number: u32,
     refs: &[ImageRef],
-) -> Vec<ExtractedImage> {
+    cache: &mut ImageCache,
+) -> RenderedImages {
     let mut out = Vec::with_capacity(refs.len());
+    let mut error_count = 0;
     for r in refs {
-        let bmp = match page.render_image_object(r.obj_index) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let w = bmp.width().max(0) as u32;
-        let h = bmp.height().max(0) as u32;
-        if w == 0 || h == 0 {
+        if let Some(raw_bytes) = r.raw_bytes.as_ref()
+            && let Some(cached) = cache.get(r, raw_bytes)
+        {
+            out.push(ExtractedImage {
+                id: r.id.clone(),
+                name: format!("img_{}.{}", r.id, cached.format),
+                path: None,
+                page: page_number,
+                bbox: r.bbox.clone(),
+                width: r.pixel_width,
+                height: r.pixel_height,
+                rotation: r.rotation,
+                format: cached.format.clone(),
+                duplicate_of: Some(cached.id.clone()),
+                bytes: std::sync::Arc::clone(&cached.bytes),
+            });
             continue;
         }
-        let rgba = bmp.to_rgba();
-        let png = match encode_png(&rgba, w, h) {
-            Ok(p) => p,
-            Err(_) => continue,
+
+        let encoded = if let Some(jpeg) = r.jpeg_bytes.clone() {
+            Ok(("jpg".to_string(), jpeg))
+        } else {
+            let bmp = match page.render_image_object(r.obj_index) {
+                Ok(b) => b,
+                Err(_) => {
+                    error_count += 1;
+                    continue;
+                }
+            };
+            let w = bmp.width().max(0) as u32;
+            let h = bmp.height().max(0) as u32;
+            if w == 0 || h == 0 {
+                error_count += 1;
+                continue;
+            }
+            let rgba = bmp.to_rgba();
+            encode_png(&rgba, w, h).map(|png| ("png".to_string(), png))
         };
+        let (format, bytes) = match encoded {
+            Ok(value) => value,
+            Err(_) => {
+                error_count += 1;
+                continue;
+            }
+        };
+        let bytes = std::sync::Arc::new(bytes);
         out.push(ExtractedImage {
             id: r.id.clone(),
+            name: format!("img_{}.{}", r.id, format),
+            path: None,
             page: page_number,
             bbox: r.bbox.clone(),
-            format: "png".into(),
-            bytes: png,
+            width: r.pixel_width,
+            height: r.pixel_height,
+            rotation: r.rotation,
+            format: format.clone(),
+            duplicate_of: None,
+            bytes: std::sync::Arc::clone(&bytes),
         });
+        if let Some(raw_bytes) = r.raw_bytes.clone() {
+            cache.insert(
+                r,
+                CachedImage {
+                    raw_bytes,
+                    id: r.id.clone(),
+                    page: page_number,
+                    format,
+                    bytes,
+                },
+            );
+        }
     }
-    out
+    RenderedImages {
+        images: out,
+        error_count,
+    }
 }
 
-/// Encode RGBA pixel bytes to PNG. Lives here (always-compiled) rather than in
-/// `render` so the image-embed path is available on wasm, where the `render`
-/// module (page rasterization / screenshots) is compiled out.
+/// Encode RGBA pixel bytes to PNG. Used by both the image-embed path and the
+/// `render` module (page rasterization / screenshots).
 pub(crate) fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, LiteParseError> {
     let mut png_buf = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
@@ -398,21 +902,50 @@ pub(crate) fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>
 /// page objects), so a later embed pass can pull pixel bytes via
 /// `Page::render_image_object`. IDs are scoped to the page number so they
 /// remain stable across runs.
-fn extract_page_image_refs(page: &Page, page_number: u32) -> Vec<ImageRef> {
-    page.image_bounds(IMAGE_MIN_SIZE_PT, IMAGE_MAX_COVERAGE)
+struct ExtractedImageRefs {
+    refs: Vec<ImageRef>,
+    error_count: u32,
+}
+
+fn extract_page_image_refs(
+    page: &Page,
+    page_number: u32,
+    include_data: bool,
+) -> ExtractedImageRefs {
+    let extracted = page.image_objects(IMAGE_MIN_SIZE_PT, IMAGE_MAX_COVERAGE, include_data);
+    let refs = extracted
+        .images
         .into_iter()
         .enumerate()
-        .map(|(i, b)| ImageRef {
-            id: format!("p{}_{}", page_number, i),
+        .map(|(i, image)| ImageRef {
+            // 1-based image number to match the platform extractor's
+            // `img_p%d_%d` naming (C `imageNum` starts at 1).
+            id: format!("p{}_{}", page_number, i + 1),
             bbox: Rect {
-                x: b.x,
-                y: b.y,
-                width: b.width,
-                height: b.height,
+                x: image.bounds.x,
+                y: image.bounds.y,
+                width: image.bounds.width,
+                height: image.bounds.height,
             },
-            obj_index: i,
+            obj_index: image.object_index,
+            format: if image.jpeg_bytes.is_some() {
+                "jpg".to_string()
+            } else {
+                "png".to_string()
+            },
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            rotation: image.rotation,
+            jpeg_bytes: image.jpeg_bytes,
+            raw_bytes: image.raw_bytes,
+            bits_per_pixel: image.bits_per_pixel,
+            colorspace: image.colorspace,
         })
-        .collect()
+        .collect();
+    ExtractedImageRefs {
+        refs,
+        error_count: extracted.error_count,
+    }
 }
 
 /// Extract simplified vector graphics from a page. We keep only what the
@@ -424,11 +957,10 @@ fn extract_page_image_refs(page: &Page, page_number: u32) -> Vec<ImageRef> {
 ///
 /// BezierTo segments don't emit strokes (we just advance the current point so
 /// later LineTos start from the right place).
-fn extract_page_graphics(page: &Page, view_box: &RectF) -> Vec<GraphicPrimitive> {
-    let paths: Vec<PathObject> = page.path_objects(view_box);
+fn extract_layout_graphics(paths: &[PathObject]) -> Vec<GraphicPrimitive> {
     let mut out = Vec::new();
 
-    for path in &paths {
+    for path in paths {
         // Filled paths: emit one Rect for the full bbox. Cheap signal for
         // cell backgrounds / figure clusters / code-block fills.
         if path.is_filled {
@@ -491,6 +1023,325 @@ fn extract_page_graphics(page: &Page, view_box: &RectF) -> Vec<GraphicPrimitive>
     out
 }
 
+const PATH_EPSILON: f32 = 0.001;
+const LINE_AXIS_TOLERANCE: f32 = 1.0;
+
+#[derive(Clone)]
+struct LineCandidate {
+    line: VectorLine,
+    shape_index: usize,
+}
+
+fn build_vector_graphics(paths: &[PathObject], content_bounds: Option<&Rect>) -> VectorGraphics {
+    let painted: Vec<(usize, &PathObject)> = paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| path.is_stroked || path.is_filled)
+        .collect();
+    let white_fill = compute_white_fill_flags(&painted, content_bounds);
+    let raw_shapes: Vec<VectorShape> = painted
+        .iter()
+        .map(|(_, path)| VectorShape {
+            bbox: rectf_to_rect(&path.bbox),
+            stroke: path.is_stroked,
+            stroke_color: path
+                .is_stroked
+                .then(|| path.stroke_color.as_ref().map(color_to_argb_hex))
+                .flatten(),
+            fill: path.is_filled,
+            fill_color: path
+                .is_filled
+                .then(|| path.fill_color.as_ref().map(color_to_argb_hex))
+                .flatten(),
+            has_curve: path
+                .segments
+                .iter()
+                .any(|s| s.kind == SegmentKind::BezierTo),
+        })
+        .collect();
+
+    // LlamaParse collapses consecutively drawn, same-color solid fills when
+    // one contains the other. Preserve order: an intervening paint operation
+    // stops merging.
+    let mut keep = vec![true; raw_shapes.len()];
+    for i in 0..raw_shapes.len().saturating_sub(1) {
+        if !keep[i] || !mergeable_shape(&raw_shapes[i]) {
+            continue;
+        }
+        for j in i + 1..raw_shapes.len() {
+            if !keep[j] {
+                continue;
+            }
+            if !mergeable_shape(&raw_shapes[j])
+                || raw_shapes[i].fill_color != raw_shapes[j].fill_color
+            {
+                break;
+            }
+            if rect_contains(&raw_shapes[i].bbox, &raw_shapes[j].bbox) {
+                keep[j] = false;
+            } else if rect_contains(&raw_shapes[j].bbox, &raw_shapes[i].bbox) {
+                keep[i] = false;
+            } else {
+                break;
+            }
+        }
+    }
+    let shapes = raw_shapes
+        .iter()
+        .cloned()
+        .zip(keep.iter().copied())
+        .filter_map(|(shape, retained)| retained.then_some(shape))
+        .collect();
+
+    let mut horizontal = Vec::new();
+    let mut vertical = Vec::new();
+    for (shape_index, (_, path)) in painted.iter().enumerate() {
+        if white_fill[shape_index] {
+            continue;
+        }
+        let mut current = None;
+        for segment in &path.segments {
+            match segment.kind {
+                SegmentKind::MoveTo => current = Some((segment.x, segment.y)),
+                SegmentKind::BezierTo => current = Some((segment.x, segment.y)),
+                SegmentKind::LineTo => {
+                    if let Some(from) = current {
+                        push_axis_line(
+                            path,
+                            shape_index,
+                            from,
+                            (segment.x, segment.y),
+                            &mut horizontal,
+                            &mut vertical,
+                        );
+                    }
+                    current = Some((segment.x, segment.y));
+                }
+            }
+        }
+    }
+    horizontal.sort_by(|a: &LineCandidate, b| {
+        a.line
+            .y1
+            .total_cmp(&b.line.y1)
+            .then(a.line.x1.total_cmp(&b.line.x1))
+    });
+    vertical.sort_by(|a: &LineCandidate, b| {
+        a.line
+            .x1
+            .total_cmp(&b.line.x1)
+            .then(a.line.y1.total_cmp(&b.line.y1))
+    });
+    let mut lines = merge_axis_lines(horizontal, true, &raw_shapes, &keep);
+    lines.extend(merge_axis_lines(vertical, false, &raw_shapes, &keep));
+    VectorGraphics { shapes, lines }
+}
+
+/// Port of the LlamaParse extract binary's `PATH_FLAGS_WHITE_FILL` heuristic.
+/// An unstroked solid-white fill is background paint when it is aligned to
+/// the page's content margin, or when it is drawn immediately after and
+/// overlapping another white-filled area (pdf writers often paint the
+/// background left-to-right, top-to-bottom as a run of adjacent fills).
+/// Flagged shapes keep their bbox in `shapes` (still useful for chart /
+/// spreadsheet layout detection) but contribute no line segments, which
+/// would otherwise create false positives in outlined-table detection.
+fn compute_white_fill_flags(
+    painted: &[(usize, &PathObject)],
+    content_bounds: Option<&Rect>,
+) -> Vec<bool> {
+    const LINE_DELTA_THRESHOLD: f32 = 1.0;
+    let mut flags = vec![false; painted.len()];
+    let Some(content) = content_bounds else {
+        return flags;
+    };
+    for i in 0..painted.len() {
+        let (path_index, path) = painted[i];
+        if path.is_stroked || !path.is_filled {
+            continue;
+        }
+        let Some(fill) = path.fill_color.as_ref() else {
+            continue;
+        };
+        if fill.r != 0xff || fill.g != 0xff || fill.b != 0xff {
+            continue;
+        }
+        let bounds = &path.bbox;
+        let margin_aligned = (bounds.left - content.x).abs() < LINE_DELTA_THRESHOLD
+            || (bounds.top - content.y).abs() < LINE_DELTA_THRESHOLD
+            || (bounds.right - (content.x + content.width)).abs() < LINE_DELTA_THRESHOLD
+            || (bounds.bottom - (content.y + content.height)).abs() < LINE_DELTA_THRESHOLD;
+        if margin_aligned {
+            flags[i] = true;
+        } else if i > 0 {
+            // Consecutively drawn (adjacent path-object indices; the C
+            // implementation additionally requires the same parent object,
+            // which the flattened path list approximates) and overlapping a
+            // white area extends the blank space.
+            let (prev_index, prev) = painted[i - 1];
+            if flags[i - 1] && path_index == prev_index + 1 && rects_overlap(&prev.bbox, bounds) {
+                flags[i] = true;
+            }
+        }
+    }
+    flags
+}
+
+/// Bbox overlap with the extract binary's `PDF_POINT_EQUAL_THRESHOLD`
+/// slack, in y-down viewport coords (`top <= bottom`).
+fn rects_overlap(a: &pdfium::RectF, b: &pdfium::RectF) -> bool {
+    !(a.left - PATH_EPSILON > b.right
+        || a.right + PATH_EPSILON < b.left
+        || a.top - PATH_EPSILON > b.bottom
+        || a.bottom + PATH_EPSILON < b.top)
+}
+
+fn mergeable_shape(s: &VectorShape) -> bool {
+    s.fill && !s.stroke && s.fill_color.is_some()
+}
+fn rect_contains(a: &Rect, b: &Rect) -> bool {
+    a.x - PATH_EPSILON <= b.x + PATH_EPSILON
+        && a.y - PATH_EPSILON <= b.y + PATH_EPSILON
+        && a.x + a.width + PATH_EPSILON >= b.x + b.width - PATH_EPSILON
+        && a.y + a.height + PATH_EPSILON >= b.y + b.height - PATH_EPSILON
+}
+
+fn push_axis_line(
+    path: &PathObject,
+    shape_index: usize,
+    a: (f32, f32),
+    b: (f32, f32),
+    h: &mut Vec<LineCandidate>,
+    v: &mut Vec<LineCandidate>,
+) {
+    let (mut x1, mut y1, mut x2, mut y2) = (a.0, a.1, b.0, b.1);
+    let target = if (y2 - y1).abs() < LINE_AXIS_TOLERANCE {
+        if x2 < x1 {
+            std::mem::swap(&mut x1, &mut x2);
+        }
+        &mut *h
+    } else if (x2 - x1).abs() < LINE_AXIS_TOLERANCE {
+        if y2 < y1 {
+            std::mem::swap(&mut y1, &mut y2);
+        }
+        &mut *v
+    } else {
+        return;
+    };
+    target.push(LineCandidate {
+        shape_index,
+        line: VectorLine {
+            x1,
+            y1,
+            x2,
+            y2,
+            stroke: path.is_stroked,
+            stroke_width: path.is_stroked.then_some(path.stroke_width),
+            stroke_color: path
+                .is_stroked
+                .then(|| path.stroke_color.as_ref().map(color_to_argb_hex))
+                .flatten(),
+            fill: path.is_filled,
+            fill_color: path
+                .is_filled
+                .then(|| path.fill_color.as_ref().map(color_to_argb_hex))
+                .flatten(),
+        },
+    });
+}
+
+fn merge_axis_lines(
+    mut candidates: Vec<LineCandidate>,
+    horizontal: bool,
+    shapes: &[VectorShape],
+    shape_retained: &[bool],
+) -> Vec<VectorLine> {
+    let mut retained = vec![true; candidates.len()];
+    for i in 0..candidates.len() {
+        if !retained[i]
+            || is_merged_shape_boundary(&candidates[i], horizontal, shapes, shape_retained)
+        {
+            retained[i] = false;
+            continue;
+        }
+        for j in i + 1..candidates.len() {
+            let same_axis = if horizontal {
+                (candidates[i].line.y1 - candidates[j].line.y1).abs() < PATH_EPSILON
+            } else {
+                (candidates[i].line.x1 - candidates[j].line.x1).abs() < PATH_EPSILON
+            };
+            if !same_axis {
+                break;
+            }
+            if !retained[j]
+                || is_merged_shape_boundary(&candidates[j], horizontal, shapes, shape_retained)
+            {
+                retained[j] = false;
+                continue;
+            }
+            let a = &candidates[i].line;
+            let b = &candidates[j].line;
+            let compatible = a.stroke == b.stroke
+                && (a.stroke || (a.fill && b.fill))
+                && (!a.stroke
+                    || ((a.stroke_width.unwrap_or(0.0) - b.stroke_width.unwrap_or(0.0)).abs()
+                        < PATH_EPSILON
+                        && (a.stroke_color.is_none()
+                            || b.stroke_color.is_none()
+                            || a.stroke_color == b.stroke_color)))
+                && (a.stroke || a.fill_color == b.fill_color);
+            if !compatible {
+                continue;
+            }
+            let threshold = PATH_EPSILON
+                + if a.stroke {
+                    a.stroke_width.unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+            let touching = if horizontal {
+                b.x1 < a.x2 + threshold && b.x2 > a.x1 - threshold
+            } else {
+                b.y1 < a.y2 + threshold && b.y2 > a.y1 - threshold
+            };
+            if touching {
+                let b = candidates[j].line.clone();
+                if horizontal {
+                    candidates[i].line.x1 = candidates[i].line.x1.min(b.x1);
+                    candidates[i].line.x2 = candidates[i].line.x2.max(b.x2);
+                } else {
+                    candidates[i].line.y1 = candidates[i].line.y1.min(b.y1);
+                    candidates[i].line.y2 = candidates[i].line.y2.max(b.y2);
+                }
+                retained[j] = false;
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .zip(retained)
+        .filter_map(|(c, keep)| keep.then_some(c.line))
+        .collect()
+}
+
+fn is_merged_shape_boundary(
+    candidate: &LineCandidate,
+    horizontal: bool,
+    shapes: &[VectorShape],
+    shape_retained: &[bool],
+) -> bool {
+    if shape_retained[candidate.shape_index] {
+        return false;
+    }
+    let shape = &shapes[candidate.shape_index].bbox;
+    if horizontal {
+        (candidate.line.y1 - shape.y).abs() < PATH_EPSILON
+            || (candidate.line.y1 - (shape.y + shape.height)).abs() < PATH_EPSILON
+    } else {
+        (candidate.line.x1 - shape.x).abs() < PATH_EPSILON
+            || (candidate.line.x1 - (shape.x + shape.width)).abs() < PATH_EPSILON
+    }
+}
+
 fn rectf_to_rect(r: &RectF) -> Rect {
     Rect {
         x: r.left,
@@ -532,6 +1383,7 @@ fn extract_page_text_items(
     view_box: &RectF,
     glyph_resolver: Option<&dyn crate::GlyphResolver>,
     emit_word_boxes: bool,
+    extract_text_metadata: bool,
 ) -> Result<Vec<TextItem>, LiteParseError> {
     let char_count = text_page.char_count();
     if char_count <= 0 {
@@ -562,7 +1414,7 @@ fn extract_page_text_items(
     let page_rotation = page.rotation();
     let vp_xform = page.viewport_transform(view_box);
     let mut items: Vec<TextItem> = Vec::new();
-    let mut seg = SegmentBuilder::new(emit_word_boxes);
+    let mut seg = SegmentBuilder::new(emit_word_boxes, extract_text_metadata);
     let garbage_fonts = detect_garbage_unicode_fonts(text_page, char_count);
     let mut glyph_decoder = GlyphDecoder::new(
         std::env::var("LITEPARSE_DEBUG_GLYPH").is_ok(),
@@ -646,9 +1498,16 @@ fn extract_page_text_items(
             continue;
         }
 
-        // Spaces: mark that we're in a pending-space state.
-        if c == ' ' {
-            seg.mark_pending_space();
+        // Whitespace: mark that we're in a pending-space state while retaining
+        // the source character code and PDFium-generated distinction.
+        if c.is_whitespace() {
+            seg.mark_pending_space(is_generated, ch.char_code());
+            // Keep PDFium-generated gaps as item boundaries so the emitted
+            // item can retain the same trailing-space-generated distinction
+            // as the source extractor. The visible text remains trimmed.
+            if is_generated && extract_text_metadata {
+                seg.flush(&mut items);
+            }
             continue;
         }
 
@@ -707,22 +1566,26 @@ fn extract_page_text_items(
             let y_overlap = vp_loose.top < seg.vp_bottom + y_tolerance
                 && vp_loose.bottom > seg.vp_top - y_tolerance;
 
-            let gap = vp_strict.left - seg.last_char_right;
+            // Gaps are measured along the segment's writing direction, so a
+            // right-to-left run reads exactly like a left-to-right one: positive
+            // means "further along the line", negative means "doubled back".
+            let gap = seg.gap_to(&vp_strict, c);
 
             // Detect line change using complementary checks:
             // 1. Strict vertical separation: char's strict top is well below last char's strict bottom
-            // 2. Line wrap: char goes back leftward AND strict top is below last char's strict bottom
-            //    (even slightly), indicating text wrapped to a new line within the same text object
-            // 3. Very large leftward jump: if the char jumps back by more than the current
+            // 2. Line wrap: char goes back against the writing direction AND strict top is below
+            //    last char's strict bottom (even slightly), indicating text wrapped to a new line
+            //    within the same text object
+            // 3. Very large backward jump: if the char jumps back by more than the current
             //    segment width, it's definitely a new line (handles OCR text with tall bounding
             //    boxes that overlap vertically between lines)
             let strict_below = vp_strict.top > seg.last_char_bottom;
-            let large_leftward_jump = gap < -5.0;
+            let large_backward_jump = gap < -5.0;
             let seg_width = seg.vp_right - seg.vp_left;
-            let very_large_leftward_jump = seg_width > 20.0 && gap < -(seg_width * 0.5);
+            let very_large_backward_jump = seg_width > 20.0 && gap < -(seg_width * 0.5);
             let line_changed = vp_strict.top > seg.last_char_bottom + y_tolerance
-                || (strict_below && large_leftward_jump)
-                || very_large_leftward_jump;
+                || (strict_below && large_backward_jump)
+                || very_large_backward_jump;
 
             // Dot leader detection: break at the boundary between dots and non-dots.
             // This prevents items like "Total . . . . 330,100" from merging.
@@ -750,7 +1613,7 @@ fn extract_page_text_items(
                 };
                 let split = gap >= MAX_INLINE_GAP
                     || (seg.pending_space && gap > seg.avg_char_width() * 2.2);
-                let loose_gap = vp_strict.left - seg.last_char_loose_right;
+                let loose_gap = seg.loose_gap_to(&vp_strict, c);
                 let em_vp = (vp_loose.bottom - vp_loose.top).abs();
                 let space_w = ch.font_space_width().map(|w| w * em_vp).unwrap_or(-1.0);
                 eprintln!(
@@ -795,7 +1658,7 @@ fn extract_page_text_items(
                             .is_some_and(|p| p.is_ascii_alphanumeric());
                         if prev_alnum && c.is_ascii_alphanumeric() {
                             let em_vp = (vp_loose.bottom - vp_loose.top).abs();
-                            let loose_gap = vp_strict.left - seg.last_char_loose_right;
+                            let loose_gap = seg.loose_gap_to(&vp_strict, c);
                             if em_vp > 0.0 && loose_gap > 0.0 {
                                 let s = font_space_cal.entry(fk.clone()).or_default();
                                 if s.len() < 512 {
@@ -820,7 +1683,7 @@ fn extract_page_text_items(
                 // of the rendered em height as the space estimate.
                 let em_vp = (vp_loose.bottom - vp_loose.top).abs();
                 let space_w = ch.font_space_width().map(|w| w * em_vp).unwrap_or(0.0);
-                let loose_gap = vp_strict.left - seg.last_char_loose_right;
+                let loose_gap = seg.loose_gap_to(&vp_strict, c);
                 let both_alnum = c.is_ascii_alphanumeric()
                     && seg
                         .text
@@ -863,8 +1726,11 @@ fn extract_page_text_items(
     // PDFs carry the neighbouring page's text at x beyond the page edge in
     // the same content stream; viewers never show it. Partially-visible
     // items are kept.
-    let vb_w = (view_box.right - view_box.left).abs();
-    let vb_h = (view_box.top - view_box.bottom).abs();
+    // Item coordinates have already been transformed into the
+    // rotation-adjusted viewport. Clip against dimensions in that same space;
+    // using the raw CropBox dimensions here drops the right/bottom portion of
+    // /Rotate 90 and /Rotate 270 pages.
+    let (vb_w, vb_h) = page.viewport_size(view_box);
     let pre_clip_count = items.len();
     items.retain(|it| {
         it.x < vb_w
@@ -1468,6 +2334,16 @@ struct SegmentBuilder {
     last_char_right: f32,
     // Right edge of last char LOOSE bounds (advance-relative gap calculation)
     last_char_loose_right: f32,
+    // Left edges of the same boxes. Right-to-left runs (Hebrew, Arabic) advance
+    // leftward, so their trailing edge is the LEFT one; `gap_to` picks the pair
+    // that matches the segment's writing direction.
+    last_char_left: f32,
+    last_char_loose_left: f32,
+    // Writing direction of the segment, latched from its first strong-direction
+    // character. Stays `None` through leading neutrals (digits, punctuation) so
+    // a segment opening with "(" still picks up RTL from the Hebrew/Arabic
+    // letter that follows.
+    dir_rtl: Option<bool>,
     // Bottom of last char strict bounds (for line-change detection)
     last_char_bottom: f32,
     // Count of non-space characters (for avg width calculation)
@@ -1491,6 +2367,9 @@ struct SegmentBuilder {
     mcid: Option<i32>,
     fill_color: Option<String>,
     stroke_color: Option<String>,
+    char_codes: Vec<u32>,
+    pending_space_char_codes: Vec<u32>,
+    pending_space_generated: bool,
     has_content: bool,
     pending_space: bool,
     // Per-word sub-boxes, finalized at each inter-word space break. The
@@ -1505,10 +2384,12 @@ struct SegmentBuilder {
     word_has: bool,
     // When false, per-word tracking is skipped entirely and `words` stays empty.
     emit_words: bool,
+    // When false, source-code/trailing-space metadata is not accumulated.
+    extract_text_metadata: bool,
 }
 
 impl SegmentBuilder {
-    fn new(emit_words: bool) -> Self {
+    fn new(emit_words: bool, extract_text_metadata: bool) -> Self {
         Self {
             text: String::new(),
             vp_left: f32::MAX,
@@ -1517,6 +2398,9 @@ impl SegmentBuilder {
             vp_bottom: f32::MIN,
             last_char_right: f32::MIN,
             last_char_loose_right: f32::MIN,
+            last_char_left: f32::MAX,
+            last_char_loose_left: f32::MAX,
+            dir_rtl: None,
             last_char_bottom: f32::MIN,
             char_count: 0,
             unmapped_char_count: 0,
@@ -1535,6 +2419,9 @@ impl SegmentBuilder {
             mcid: None,
             fill_color: None,
             stroke_color: None,
+            char_codes: Vec::new(),
+            pending_space_char_codes: Vec::new(),
+            pending_space_generated: false,
             has_content: false,
             pending_space: false,
             words: Vec::new(),
@@ -1545,6 +2432,7 @@ impl SegmentBuilder {
             word_bottom: f32::MIN,
             word_has: false,
             emit_words,
+            extract_text_metadata,
         }
     }
 
@@ -1590,6 +2478,48 @@ impl SegmentBuilder {
         self.word_has = false;
     }
 
+    /// Gap from the segment's last character to the incoming one, measured
+    /// along the writing direction against the previous char's *trailing* edge
+    /// (its right edge for left-to-right text, its left edge for right-to-left).
+    /// Positive means the incoming char sits further along the line, negative
+    /// means it doubled back — the same sign convention in both directions, so
+    /// every threshold downstream stays direction-agnostic.
+    fn gap_to(&self, vp_strict: &RectF, c: char) -> f32 {
+        if self.dir_is_rtl(c) {
+            self.last_char_left - vp_strict.right
+        } else {
+            vp_strict.left - self.last_char_right
+        }
+    }
+
+    /// As [`gap_to`](Self::gap_to), but against the previous char's LOOSE box,
+    /// which subtracts out intra-word kerning/overhang. This is the
+    /// advance-relative gap the missing-space recovery compares to the font's
+    /// space width.
+    fn loose_gap_to(&self, vp_strict: &RectF, c: char) -> f32 {
+        if self.dir_is_rtl(c) {
+            self.last_char_loose_left - vp_strict.right
+        } else {
+            vp_strict.left - self.last_char_loose_right
+        }
+    }
+
+    /// Writing direction to use for the pair (segment tail, `c`). Falls back to
+    /// the incoming character while the segment has only seen neutrals.
+    fn dir_is_rtl(&self, c: char) -> bool {
+        self.dir_rtl.unwrap_or_else(|| is_rtl_char(c))
+    }
+
+    /// Record `c`'s contribution to the segment's writing direction. Neutral
+    /// characters (digits, punctuation, spaces) leave it untouched.
+    fn note_direction(&mut self, c: char) {
+        if is_rtl_char(c) {
+            self.dir_rtl = Some(true);
+        } else if c.is_alphabetic() {
+            self.dir_rtl = Some(false);
+        }
+    }
+
     /// Average width of non-space characters in the current segment.
     /// Prefers actual glyph widths (text_width) over bbox width, since bbox
     /// includes inter-character gaps that inflate the average and cause
@@ -1623,7 +2553,11 @@ impl SegmentBuilder {
         self.vp_bottom = vp_loose.bottom;
         self.last_char_right = vp_strict.right;
         self.last_char_loose_right = vp_loose.right;
+        self.last_char_left = vp_strict.left;
+        self.last_char_loose_left = vp_loose.left;
         self.last_char_bottom = vp_strict.bottom;
+        self.dir_rtl = None;
+        self.note_direction(c);
         self.char_count = 1;
         self.unmapped_char_count = if counts_as_unmapped(recovered, ch.has_unicode_map_error()) {
             1
@@ -1632,10 +2566,18 @@ impl SegmentBuilder {
         };
         self.has_content = true;
         self.pending_space = false;
+        if self.extract_text_metadata {
+            self.pending_space_char_codes.clear();
+        }
+        self.pending_space_generated = false;
         self.words.clear();
         self.word_has = false;
         self.add_word_char(c, vp_loose);
         self.text_width = 0.0;
+        if self.extract_text_metadata {
+            self.char_codes.clear();
+            self.char_codes.push(ch.char_code());
+        }
         self.font_is_buggy = false;
         self.font_is_embedded = false;
         self.font = None;
@@ -1733,8 +2675,14 @@ impl SegmentBuilder {
         self.vp_bottom = self.vp_bottom.max(vp_loose.bottom);
         self.last_char_right = vp_strict.right;
         self.last_char_loose_right = vp_loose.right;
+        self.last_char_left = vp_strict.left;
+        self.last_char_loose_left = vp_loose.left;
         self.last_char_bottom = vp_strict.bottom;
+        self.note_direction(c);
         self.char_count += 1;
+        if self.extract_text_metadata {
+            self.char_codes.push(ch.char_code());
+        }
         if counts_as_unmapped(recovered, ch.has_unicode_map_error()) {
             self.unmapped_char_count += 1;
         }
@@ -1777,9 +2725,13 @@ impl SegmentBuilder {
     }
 
     /// Record that a space was seen.
-    fn mark_pending_space(&mut self) {
+    fn mark_pending_space(&mut self, is_generated: bool, char_code: u32) {
         if self.has_content {
             self.pending_space = true;
+            if self.extract_text_metadata {
+                self.pending_space_generated = is_generated;
+                self.pending_space_char_codes.push(char_code);
+            }
         }
     }
 
@@ -1788,7 +2740,11 @@ impl SegmentBuilder {
         if self.pending_space {
             self.break_word();
             self.text.push(' ');
+            if self.extract_text_metadata {
+                self.char_codes.append(&mut self.pending_space_char_codes);
+            }
             self.pending_space = false;
+            self.pending_space_generated = false;
         }
     }
 
@@ -1799,6 +2755,9 @@ impl SegmentBuilder {
         }
 
         self.break_word();
+        if self.extract_text_metadata {
+            self.char_codes.append(&mut self.pending_space_char_codes);
+        }
         let trimmed = self.text.trim();
         if !trimmed.is_empty() {
             let width = self.vp_right - self.vp_left;
@@ -1834,6 +2793,8 @@ impl SegmentBuilder {
                 mcid: self.mcid,
                 fill_color: self.fill_color.clone(),
                 stroke_color: self.stroke_color.clone(),
+                char_codes: std::mem::take(&mut self.char_codes),
+                trailing_space_generated: self.pending_space_generated,
                 confidence: None,
                 link: None,
                 strike: false,
@@ -1841,7 +2802,7 @@ impl SegmentBuilder {
             });
         }
 
-        *self = Self::new(self.emit_words);
+        *self = Self::new(self.emit_words, self.extract_text_metadata);
     }
 }
 
@@ -1849,6 +2810,89 @@ impl SegmentBuilder {
 mod tests {
     use super::*;
     use std::f32::consts::PI;
+
+    fn rotated_text_pdf() -> Vec<u8> {
+        let content =
+            b"BT /F1 10 Tf 20 40 Td (FIRSTMARK) Tj ET\nBT /F1 10 Tf 20 250 Td (SECONDMARK) Tj ET";
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Rotate 90 /Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Rotate 270 /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>".to_vec(),
+            [
+                format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                content,
+                b"\nendstream",
+            ]
+            .concat(),
+            [
+                format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                content,
+                b"\nendstream",
+            ]
+            .concat(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn rotated_pages_use_viewport_dimensions_and_keep_edge_text() {
+        let pages =
+            extract_pages_from_input(&PdfInput::Bytes(rotated_text_pdf()), None, usize::MAX, None)
+                .unwrap();
+
+        assert_eq!(pages.len(), 2);
+        for page in &pages {
+            assert_eq!((page.page_width, page.page_height), (300.0, 200.0));
+            let raw_text = page
+                .text_items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>()
+                .replace(char::is_whitespace, "");
+            assert!(raw_text.contains("FIRSTMARK"), "raw text: {raw_text}");
+            assert!(raw_text.contains("SECONDMARK"), "raw text: {raw_text}");
+        }
+
+        let parsed = crate::projection::project_pages_to_grid(pages);
+        for page in parsed {
+            let text = page
+                .text_items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>()
+                .replace(char::is_whitespace, "");
+            assert!(text.contains("FIRSTMARK"), "extracted text: {text}");
+            assert!(text.contains("SECONDMARK"), "extracted text: {text}");
+            assert!(
+                page.text_items
+                    .iter()
+                    .all(|item| item.x + item.width <= page.page_width + 0.1)
+            );
+        }
+    }
 
     // A glyph PDFium flags with a raw /ToUnicode map error normally counts
     // toward the item's unmapped tally...
@@ -1871,6 +2915,61 @@ mod tests {
     fn cleanly_mapped_glyph_never_counts_as_unmapped() {
         assert!(!counts_as_unmapped(false, false));
         assert!(!counts_as_unmapped(true, false));
+    }
+
+    fn segment_with_one_char() -> SegmentBuilder {
+        let mut segment = SegmentBuilder::new(false, true);
+        segment.text = "A".into();
+        segment.vp_left = 1.0;
+        segment.vp_right = 7.0;
+        segment.vp_top = 2.0;
+        segment.vp_bottom = 12.0;
+        segment.char_count = 1;
+        segment.has_content = true;
+        segment.char_codes = vec![65];
+        segment
+    }
+
+    #[test]
+    fn generated_trailing_space_is_exposed_without_changing_trimmed_text() {
+        let mut segment = segment_with_one_char();
+        segment.mark_pending_space(true, 32);
+        let mut items = Vec::new();
+        segment.flush(&mut items);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "A");
+        assert_eq!(items[0].char_codes, vec![65, 32]);
+        assert!(items[0].trailing_space_generated);
+    }
+
+    #[test]
+    fn real_trailing_space_is_not_marked_as_generated() {
+        let mut segment = segment_with_one_char();
+        segment.mark_pending_space(false, 32);
+        let mut items = Vec::new();
+        segment.flush(&mut items);
+
+        assert_eq!(items[0].char_codes, vec![65, 32]);
+        assert!(!items[0].trailing_space_generated);
+    }
+
+    #[test]
+    fn disabled_text_metadata_does_not_accumulate_source_codes() {
+        let mut segment = SegmentBuilder::new(false, false);
+        segment.text = "A".into();
+        segment.vp_left = 1.0;
+        segment.vp_right = 7.0;
+        segment.vp_top = 2.0;
+        segment.vp_bottom = 12.0;
+        segment.char_count = 1;
+        segment.has_content = true;
+        segment.mark_pending_space(true, 32);
+        let mut items = Vec::new();
+        segment.flush(&mut items);
+
+        assert!(items[0].char_codes.is_empty());
+        assert!(!items[0].trailing_space_generated);
     }
 
     fn strike_item() -> TextItem {
@@ -2010,10 +3109,15 @@ mod tests {
             page_number: 1,
             page_width: 100.0,
             page_height: 100.0,
+            content_bounds: None,
             text_items: items,
             graphics: Vec::new(),
+            vector_graphics: None,
             struct_nodes: Vec::new(),
             image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         }
     }
 
@@ -2168,6 +3272,307 @@ mod tests {
         assert_eq!(color_to_argb_hex(&z), "00000000");
     }
 
+    fn vector_path(
+        bbox: RectF,
+        segments: Vec<pdfium::PathSegment>,
+        stroke: bool,
+        fill: bool,
+        stroke_width: f32,
+        color: pdfium::Color,
+    ) -> PathObject {
+        PathObject {
+            bbox,
+            stroke_color: stroke.then_some(color),
+            fill_color: fill.then_some(color),
+            stroke_width,
+            is_stroked: stroke,
+            is_filled: fill,
+            segments,
+        }
+    }
+
+    #[test]
+    fn vector_graphics_reports_paint_curve_and_merges_axis_lines() {
+        let black = pdfium::Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let paths = vec![
+            vector_path(
+                RectF {
+                    left: 10.0,
+                    top: 10.0,
+                    right: 30.0,
+                    bottom: 11.0,
+                },
+                vec![
+                    pdfium::PathSegment {
+                        kind: SegmentKind::MoveTo,
+                        x: 10.0,
+                        y: 10.0,
+                        close: false,
+                    },
+                    pdfium::PathSegment {
+                        kind: SegmentKind::LineTo,
+                        x: 20.0,
+                        y: 10.0,
+                        close: false,
+                    },
+                    pdfium::PathSegment {
+                        kind: SegmentKind::BezierTo,
+                        x: 20.0,
+                        y: 10.0,
+                        close: false,
+                    },
+                ],
+                true,
+                false,
+                1.0,
+                black,
+            ),
+            vector_path(
+                RectF {
+                    left: 20.0,
+                    top: 10.2,
+                    right: 30.0,
+                    bottom: 11.0,
+                },
+                vec![
+                    pdfium::PathSegment {
+                        kind: SegmentKind::MoveTo,
+                        x: 20.0,
+                        y: 10.0,
+                        close: false,
+                    },
+                    pdfium::PathSegment {
+                        kind: SegmentKind::LineTo,
+                        x: 30.0,
+                        y: 10.0,
+                        close: false,
+                    },
+                ],
+                true,
+                false,
+                1.0,
+                black,
+            ),
+        ];
+        let output = build_vector_graphics(&paths, None);
+        assert_eq!(output.shapes.len(), 2);
+        assert!(output.shapes[0].has_curve);
+        assert_eq!(output.shapes[0].stroke_color.as_deref(), Some("ff000000"));
+        assert_eq!(output.lines.len(), 1);
+        assert!((output.lines[0].x1 - 10.0).abs() < 0.001);
+        assert!((output.lines[0].x2 - 30.0).abs() < 0.001);
+        assert_eq!(output.lines[0].stroke_width, Some(1.0));
+    }
+
+    #[test]
+    fn white_fill_on_content_margin_suppresses_lines_but_keeps_shape() {
+        let white = pdfium::Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        // Unstroked solid-white fill whose left edge sits on the content
+        // margin: with content bounds it must contribute no lines; without
+        // content bounds the heuristic is inert and the edges survive.
+        let rect_segments = vec![
+            pdfium::PathSegment {
+                kind: SegmentKind::MoveTo,
+                x: 10.0,
+                y: 10.0,
+                close: false,
+            },
+            pdfium::PathSegment {
+                kind: SegmentKind::LineTo,
+                x: 100.0,
+                y: 10.0,
+                close: false,
+            },
+            pdfium::PathSegment {
+                kind: SegmentKind::LineTo,
+                x: 100.0,
+                y: 50.0,
+                close: false,
+            },
+            pdfium::PathSegment {
+                kind: SegmentKind::LineTo,
+                x: 10.0,
+                y: 50.0,
+                close: false,
+            },
+        ];
+        let paths = vec![vector_path(
+            RectF {
+                left: 10.0,
+                top: 10.0,
+                right: 100.0,
+                bottom: 50.0,
+            },
+            rect_segments,
+            false,
+            true,
+            0.0,
+            white,
+        )];
+        let content = Rect {
+            x: 10.0,
+            y: 5.0,
+            width: 500.0,
+            height: 700.0,
+        };
+
+        let with_bounds = build_vector_graphics(&paths, Some(&content));
+        assert_eq!(with_bounds.shapes.len(), 1);
+        assert!(with_bounds.lines.is_empty());
+
+        let without_bounds = build_vector_graphics(&paths, None);
+        assert!(!without_bounds.lines.is_empty());
+    }
+
+    #[test]
+    fn white_fill_extends_to_consecutive_overlapping_white_fill() {
+        let white = pdfium::Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        let segments = |x1: f32, x2: f32| {
+            vec![
+                pdfium::PathSegment {
+                    kind: SegmentKind::MoveTo,
+                    x: x1,
+                    y: 10.0,
+                    close: false,
+                },
+                pdfium::PathSegment {
+                    kind: SegmentKind::LineTo,
+                    x: x2,
+                    y: 10.0,
+                    close: false,
+                },
+            ]
+        };
+        // First fill sits on the left content margin; the second is drawn
+        // immediately after and overlaps it, so the blank area extends.
+        let paths = vec![
+            vector_path(
+                RectF {
+                    left: 10.0,
+                    top: 10.0,
+                    right: 60.0,
+                    bottom: 50.0,
+                },
+                segments(10.0, 60.0),
+                false,
+                true,
+                0.0,
+                white,
+            ),
+            vector_path(
+                RectF {
+                    left: 59.0,
+                    top: 10.0,
+                    right: 120.0,
+                    bottom: 50.0,
+                },
+                segments(59.0, 120.0),
+                false,
+                true,
+                0.0,
+                white,
+            ),
+        ];
+        let content = Rect {
+            x: 10.0,
+            y: 5.0,
+            width: 500.0,
+            height: 700.0,
+        };
+        let output = build_vector_graphics(&paths, Some(&content));
+        assert!(output.lines.is_empty());
+    }
+
+    #[test]
+    fn vector_graphics_merges_consecutive_contained_solid_fills() {
+        let blue = pdfium::Color {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        };
+        let paths = vec![
+            vector_path(
+                RectF {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 20.0,
+                    bottom: 20.0,
+                },
+                vec![],
+                false,
+                true,
+                0.0,
+                blue,
+            ),
+            vector_path(
+                RectF {
+                    left: 2.0,
+                    top: 2.0,
+                    right: 10.0,
+                    bottom: 10.0,
+                },
+                vec![],
+                false,
+                true,
+                0.0,
+                blue,
+            ),
+        ];
+        let output = build_vector_graphics(&paths, None);
+        assert_eq!(output.shapes.len(), 1);
+        assert_eq!(output.shapes[0].bbox.width, 20.0);
+        assert_eq!(output.shapes[0].fill_color.as_deref(), Some("ff0000ff"));
+    }
+
+    #[test]
+    fn vector_graphics_ignores_unpainted_and_diagonal_paths() {
+        let path = vector_path(
+            RectF {
+                left: 0.0,
+                top: 0.0,
+                right: 10.0,
+                bottom: 10.0,
+            },
+            vec![
+                pdfium::PathSegment {
+                    kind: SegmentKind::MoveTo,
+                    x: 0.0,
+                    y: 0.0,
+                    close: false,
+                },
+                pdfium::PathSegment {
+                    kind: SegmentKind::LineTo,
+                    x: 10.0,
+                    y: 10.0,
+                    close: false,
+                },
+            ],
+            false,
+            false,
+            0.0,
+            pdfium::Color::default(),
+        );
+        let output = build_vector_graphics(&[path], None);
+        assert!(output.shapes.is_empty());
+        assert!(output.lines.is_empty());
+    }
+
     #[test]
     fn extract_pages_from_input_missing_file_errors() {
         let res = extract_pages_from_input(
@@ -2177,5 +3582,86 @@ mod tests {
             None,
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn page_error_is_fail_fast_by_default() {
+        let mut page_errors = Vec::new();
+        let result = resolve_page_result::<()>(
+            3,
+            Err(LiteParseError::Other("broken page".into())),
+            false,
+            &mut page_errors,
+        );
+
+        assert!(result.is_err());
+        assert!(page_errors.is_empty());
+    }
+
+    #[test]
+    fn page_error_can_be_collected_and_skipped() {
+        let mut page_errors = Vec::new();
+        let result = resolve_page_result::<()>(
+            3,
+            Err(LiteParseError::Other("broken page".into())),
+            true,
+            &mut page_errors,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(
+            page_errors,
+            vec![PageError {
+                page_number: 3,
+                message: "broken page".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn image_cache_remove_page_drops_failed_pages_renders() {
+        let image_ref = |id: &str, raw: &[u8]| ImageRef {
+            id: id.to_string(),
+            bbox: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            obj_index: 0,
+            format: "png".into(),
+            pixel_width: 1,
+            pixel_height: 1,
+            rotation: 0.0,
+            jpeg_bytes: None,
+            raw_bytes: Some(raw.to_vec()),
+            bits_per_pixel: 32,
+            colorspace: 0,
+        };
+        let cached = |id: &str, page: u32, raw: &[u8]| CachedImage {
+            raw_bytes: raw.to_vec(),
+            id: id.to_string(),
+            page,
+            format: "png".into(),
+            bytes: std::sync::Arc::new(Vec::new()),
+        };
+
+        let mut cache = ImageCache::default();
+        cache.insert(&image_ref("p2_1", b"two"), cached("p2_1", 2, b"two"));
+        cache.insert(&image_ref("p3_1", b"three"), cached("p3_1", 3, b"three"));
+
+        // Page 2 failed after rendering: its cache entry must go so a later
+        // duplicate of the same bytes can't claim `duplicate_of: "p2_1"` for
+        // an image that was rolled back out of the output.
+        cache.remove_page(2);
+
+        assert!(cache.get(&image_ref("p5_1", b"two"), b"two").is_none());
+        assert_eq!(
+            cache
+                .get(&image_ref("p5_2", b"three"), b"three")
+                .map(|c| c.id.as_str()),
+            Some("p3_1")
+        );
     }
 }

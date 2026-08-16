@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use liteparse::config::{LiteParseConfig, OutputFormat};
 use liteparse::conversion;
 use liteparse::extract;
+use liteparse::ocr_merge::LayoutComplexityReason;
 use liteparse::output::{json, text};
 use liteparse::parser::LiteParse;
 use liteparse::render;
@@ -78,6 +79,10 @@ struct ParseCommand {
     #[arg(long)]
     target_pages: Option<String>,
 
+    /// Continue after page-level extraction errors and report them in JSON.
+    #[arg(long)]
+    continue_on_page_error: bool,
+
     /// DPI for rendering (default: 150)
     #[arg(long, default_value = "150")]
     dpi: f32,
@@ -99,17 +104,19 @@ struct ParseCommand {
     num_workers: Option<usize>,
 
     /// How to surface raster images in markdown output:
-    /// `off` strips them, `placeholder` (default) emits `![](image_pN_K.png)`
-    /// references in reading order, `embed` extracts each image's PNG bytes
-    /// and writes them next to the markdown output when `--image-output-dir`
-    /// is set.
+    /// `off` strips them, `placeholder` (default) emits `![](img_pN_K.png)`
+    /// references in reading order, and `embed` preserves the same presentation.
+    /// Use `--extract-images` to extract image bytes and metadata.
     #[arg(long, default_value = "placeholder")]
     image_mode: String,
 
-    /// Directory to write embedded images to when `--image-mode embed` is
-    /// set. Each image is written as `image_{id}.png` to match the
-    /// references in the markdown output. Has no effect for other image
-    /// modes. Created if missing.
+    /// Extract embedded image bytes and metadata.
+    #[arg(long)]
+    extract_images: bool,
+
+    /// Directory to write embedded images to. Valid source JPEGs keep their
+    /// format; other images are PNG. Requires `--extract-images`. Created if
+    /// missing.
     #[arg(long)]
     image_output_dir: Option<String>,
 
@@ -120,11 +127,49 @@ struct ParseCommand {
     #[arg(long)]
     no_links: bool,
 
+    /// Keep running headers/footers in markdown output. By default, lines
+    /// that repeat in the top/bottom page bands across pages (and obvious
+    /// page chrome like `Page N of M`) are stripped from markdown. Pass this
+    /// to retain them all — e.g. for extraction pipelines that prefer to
+    /// deduplicate downstream rather than risk losing content.
+    #[arg(long)]
+    keep_headers_footers: bool,
+
+    /// Include all PDF annotations as page-scoped structured JSON/API data.
+    #[arg(long)]
+    extract_annotations: bool,
+
+    /// Include AcroForm widget fields and values as page-scoped structured data.
+    #[arg(long)]
+    extract_form_fields: bool,
+
+    /// Include the tagged-PDF logical structure tree.
+    #[arg(long)]
+    extract_structure_tree: bool,
+    /// Include each page's classified layout blocks (headings, paragraphs,
+    /// list items, tables with per-cell boxes, code, rules, figures) with
+    /// bounding boxes, in reading order.
+    #[arg(long)]
+    extract_blocks: bool,
+    /// Include raw XFA packets (name + XML content) in JSON output.
+    #[arg(long)]
+    extract_xfa_packets: bool,
+    /// Include each page's content_bounds (union bbox of top-level content
+    /// objects, viewport coords) in JSON output.
+    #[arg(long)]
+    extract_content_bounds: bool,
+
     /// Include per-page complexity signals (the same `is-complex` reports) as a
     /// `complexity` object on each page of JSON output. Off by default; enabling
     /// it runs the extra vector-text detection pass.
     #[arg(long)]
     complexity: bool,
+    /// Include rich PDF text metadata in text items and JSON output.
+    #[arg(long)]
+    extract_text_metadata: bool,
+    /// Include page-scoped vector shapes and merged horizontal/vertical lines.
+    #[arg(long)]
+    extract_vector_graphics: bool,
 }
 
 #[derive(Args, Debug)]
@@ -190,6 +235,10 @@ struct BatchParseCommand {
     #[arg(long, default_value = "1000")]
     max_pages: usize,
 
+    /// Continue after page-level extraction errors and report them in JSON.
+    #[arg(long)]
+    continue_on_page_error: bool,
+
     /// DPI for rendering
     #[arg(long, default_value = "150")]
     dpi: f32,
@@ -218,6 +267,37 @@ struct BatchParseCommand {
     /// page of JSON output. Off by default.
     #[arg(long)]
     complexity: bool,
+    /// Include rich PDF text metadata in text items and JSON output.
+    #[arg(long)]
+    extract_text_metadata: bool,
+    /// Extract embedded image bytes and metadata.
+    #[arg(long)]
+    extract_images: bool,
+    /// Include page-scoped vector shapes and merged horizontal/vertical lines.
+    #[arg(long)]
+    extract_vector_graphics: bool,
+
+    /// Include all PDF annotations as page-scoped structured JSON/API data.
+    #[arg(long)]
+    extract_annotations: bool,
+    /// Include AcroForm widget fields and values as page-scoped structured data.
+    #[arg(long)]
+    extract_form_fields: bool,
+    /// Include the tagged-PDF logical structure tree.
+    #[arg(long)]
+    extract_structure_tree: bool,
+    /// Include each page's classified layout blocks (headings, paragraphs,
+    /// list items, tables with per-cell boxes, code, rules, figures) with
+    /// bounding boxes, in reading order.
+    #[arg(long)]
+    extract_blocks: bool,
+    /// Include raw XFA packets (name + XML content) in JSON output.
+    #[arg(long)]
+    extract_xfa_packets: bool,
+    /// Include each page's content_bounds (union bbox of top-level content
+    /// objects, viewport coords) in JSON output.
+    #[arg(long)]
+    extract_content_bounds: bool,
 }
 
 #[derive(Args, Debug)]
@@ -271,6 +351,22 @@ fn parse_output_format(s: &str) -> Result<OutputFormat, String> {
 }
 
 /// Parse a `Name: Value` header string into a `(name, value)` pair.
+/// Read all bytes from stdin, used when the input path is `-` (e.g. a piped
+/// document: `curl -sL … | lit parse -`). Errors carry a hint so a common
+/// mistake — passing `-` with nothing piped — is diagnosable.
+fn read_stdin_bytes() -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin().lock().read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "no data on stdin (input `-` expects a document piped in, e.g. `curl … | lit parse -`)",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn parse_header(s: &str) -> Result<(String, String), String> {
     let (name, value) = s
         .split_once(':')
@@ -295,6 +391,24 @@ fn parse_image_mode(s: &str) -> Result<liteparse::config::ImageMode, String> {
     }
 }
 
+/// Surface tolerated page failures on stderr. JSON output carries
+/// `page_errors` itself, but text/markdown would otherwise silently omit the
+/// failed pages, so this prints unconditionally (not gated on `--quiet`).
+fn warn_page_errors(result: &liteparse::parser::ParseResult, file: Option<&str>) {
+    for error in &result.page_errors {
+        match file {
+            Some(file) => eprintln!(
+                "[liteparse] {}: page {} failed to extract and was skipped: {}",
+                file, error.page_number, error.message
+            ),
+            None => eprintln!(
+                "[liteparse] page {} failed to extract and was skipped: {}",
+                error.page_number, error.message
+            ),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -310,6 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: cmd.target_pages,
+                continue_on_page_error: cmd.continue_on_page_error,
                 dpi: cmd.dpi,
                 output_format: format,
                 preserve_very_small_text: cmd.preserve_small_text,
@@ -318,8 +433,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ocr_server_url: cmd.ocr_server_url,
                 ocr_server_headers: cmd.ocr_server_headers,
                 image_mode,
+                extract_images: cmd.extract_images,
+                image_output_dir: cmd.image_output_dir.clone(),
                 extract_links: !cmd.no_links,
+                keep_headers_footers: cmd.keep_headers_footers,
+                extract_annotations: cmd.extract_annotations,
+                extract_form_fields: cmd.extract_form_fields,
+                extract_structure_tree: cmd.extract_structure_tree,
+                extract_blocks: cmd.extract_blocks,
+                extract_xfa_packets: cmd.extract_xfa_packets,
+                extract_content_bounds: cmd.extract_content_bounds,
                 include_complexity: cmd.complexity,
+                extract_text_metadata: cmd.extract_text_metadata,
+                extract_vector_graphics: cmd.extract_vector_graphics,
                 ..Default::default()
             };
             if let Some(n) = cmd.num_workers {
@@ -327,28 +453,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let lp = LiteParse::new(config);
-            let result = lp.parse(&cmd.file).await?;
+            let result = if cmd.file == "-" {
+                lp.parse_input(PdfInput::Bytes(read_stdin_bytes()?)).await?
+            } else {
+                lp.parse(&cmd.file).await?
+            };
+            warn_page_errors(&result, None);
             let formatted = match lp.config().output_format {
-                OutputFormat::Json => json::format_json(&result.pages)?,
+                OutputFormat::Json => {
+                    json::format_json_result(&result, lp.config().extract_text_metadata)?
+                }
                 OutputFormat::Text => text::format_text(&result.pages),
                 OutputFormat::Markdown => result.text.clone(),
             };
-            if let Some(dir) = cmd.image_output_dir.as_deref()
-                && !result.images.is_empty()
-            {
-                std::fs::create_dir_all(dir)?;
-                for img in &result.images {
-                    let path = format!("{}/image_{}.{}", dir, img.id, img.format);
-                    std::fs::write(&path, &img.bytes)?;
-                }
-                if !cmd.quiet {
-                    eprintln!(
-                        "[liteparse] wrote {} image(s) to {}",
-                        result.images.len(),
-                        dir
-                    );
-                }
-            }
 
             match cmd.output {
                 Some(path) => {
@@ -413,6 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: None,
+                continue_on_page_error: cmd.continue_on_page_error,
                 dpi: cmd.dpi,
                 output_format: format.clone(),
                 preserve_very_small_text: false,
@@ -421,6 +539,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ocr_server_url: cmd.ocr_server_url,
                 ocr_server_headers: cmd.ocr_server_headers,
                 include_complexity: cmd.complexity,
+                extract_text_metadata: cmd.extract_text_metadata,
+                extract_images: cmd.extract_images,
+                extract_vector_graphics: cmd.extract_vector_graphics,
+                extract_annotations: cmd.extract_annotations,
+                extract_form_fields: cmd.extract_form_fields,
+                extract_structure_tree: cmd.extract_structure_tree,
+                extract_blocks: cmd.extract_blocks,
+                extract_xfa_packets: cmd.extract_xfa_packets,
+                extract_content_bounds: cmd.extract_content_bounds,
                 ..Default::default()
             };
             if let Some(n) = cmd.num_workers {
@@ -462,11 +589,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match lp.parse(file_path).await {
                     Ok(result) => {
+                        warn_page_errors(&result, Some(file_path));
                         let fmt_result: Result<String, Box<dyn std::error::Error>> =
                             match lp.config().output_format {
-                                OutputFormat::Json => {
-                                    json::format_json(&result.pages).map_err(|e| e.into())
-                                }
+                                OutputFormat::Json => json::format_json_result(
+                                    &result,
+                                    lp.config().extract_text_metadata,
+                                )
+                                .map_err(|e| e.into()),
                                 OutputFormat::Text => Ok(text::format_text(&result.pages)),
                                 OutputFormat::Markdown => Ok(result.text.clone()),
                             };
@@ -524,7 +654,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             };
             let lp = LiteParse::new(config);
-            let is_complex = lp.is_complex(PdfInput::Path(cmd.file)).await?;
+            let input = if cmd.file == "-" {
+                PdfInput::Bytes(read_stdin_bytes()?)
+            } else {
+                PdfInput::Path(cmd.file)
+            };
+            let is_complex = lp.is_complex(input).await?;
 
             let complex_pages = is_complex.iter().filter(|c| c.needs_ocr).count();
 
@@ -547,11 +682,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     "SIMPLE"
                 };
+                let layout_count = |reason: LayoutComplexityReason| {
+                    is_complex
+                        .iter()
+                        .filter(|c| {
+                            c.layout
+                                .as_ref()
+                                .is_some_and(|l| l.reasons.contains(&reason))
+                        })
+                        .count()
+                };
                 eprintln!(
-                    "{} — {}/{} page(s) need OCR",
+                    "{} — {}/{} page(s) need OCR; layout: {} multi-column, {} table, {} graphics-dense",
                     verdict,
                     complex_pages,
-                    is_complex.len()
+                    is_complex.len(),
+                    layout_count(LayoutComplexityReason::MultiColumn),
+                    layout_count(LayoutComplexityReason::TableLikely),
+                    layout_count(LayoutComplexityReason::DenseGraphics),
                 );
             }
 
@@ -594,26 +742,6 @@ fn batch_output_path(
         .with_extension(out_ext)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::batch_output_path;
-    use std::path::Path;
-
-    #[test]
-    fn batch_output_path_preserves_output_dir_without_trailing_slash() {
-        let out_path = batch_output_path("docs/report.pdf", "docs", "out", "txt");
-
-        assert_eq!(out_path, Path::new("out/report.txt"));
-    }
-
-    #[test]
-    fn batch_output_path_mirrors_nested_files_without_trailing_slash() {
-        let out_path = batch_output_path("docs/nested/report.pdf", "docs", "out", "md");
-
-        assert_eq!(out_path, Path::new("out/nested/report.md"));
-    }
-}
-
 fn collect_files_inner(
     dir: &std::path::Path,
     recursive: bool,
@@ -644,4 +772,111 @@ fn collect_files_inner(
         files.push(path_str);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn batch_output_path_preserves_output_dir_without_trailing_slash() {
+        let out_path = batch_output_path("docs/report.pdf", "docs", "out", "txt");
+
+        assert_eq!(out_path, Path::new("out/report.txt"));
+    }
+
+    #[test]
+    fn batch_output_path_mirrors_nested_files_without_trailing_slash() {
+        let out_path = batch_output_path("docs/nested/report.pdf", "docs", "out", "md");
+
+        assert_eq!(out_path, Path::new("out/nested/report.md"));
+    }
+
+    #[test]
+    fn extract_text_metadata_flag_is_available_for_parse_and_batch() {
+        let cli = Cli::try_parse_from(["lit", "parse", "document.pdf", "--extract-text-metadata"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Parse(ParseCommand {
+                extract_text_metadata: true,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "lit",
+            "batch-parse",
+            "input",
+            "output",
+            "--extract-text-metadata",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::BatchParse(BatchParseCommand {
+                extract_text_metadata: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn extract_form_fields_flag_is_available_for_parse_and_batch() {
+        let cli =
+            Cli::try_parse_from(["lit", "parse", "document.pdf", "--extract-form-fields"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Parse(ParseCommand {
+                extract_form_fields: true,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "lit",
+            "batch-parse",
+            "input",
+            "output",
+            "--extract-form-fields",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::BatchParse(BatchParseCommand {
+                extract_form_fields: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn extract_structure_tree_flag_is_available_for_parse_and_batch() {
+        let cli = Cli::try_parse_from(["lit", "parse", "document.pdf", "--extract-structure-tree"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Parse(ParseCommand {
+                extract_structure_tree: true,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "lit",
+            "batch-parse",
+            "input",
+            "output",
+            "--extract-structure-tree",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::BatchParse(BatchParseCommand {
+                extract_structure_tree: true,
+                ..
+            })
+        ));
+    }
 }

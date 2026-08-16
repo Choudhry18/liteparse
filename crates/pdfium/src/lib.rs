@@ -9,14 +9,15 @@ mod text_page;
 mod types;
 
 pub use bitmap::Bitmap;
-pub use document::{Document, OutlineEntry};
+pub use document::{Document, FormEnvironment, OutlineEntry, SignatureSummary, XfaPacket};
 pub use error::PdfiumError;
 pub use font::{Font, FontType};
 pub use library::Library;
 pub use page::{
-    ImageBounds, Page, PathObject, PathSegment, PdfLink, SegmentKind, ViewportTransform,
+    ImageBounds, ImageObjectInfo, ImageObjects, Page, PathObject, PathSegment, PdfAnnotation,
+    PdfFormField, PdfLink, SegmentKind, ViewportTransform,
 };
-pub use struct_tree::StructNode;
+pub use struct_tree::{StructNode, StructureAttributeValue, StructureElement};
 pub use text_page::{TextChar, TextCharIter, TextPage};
 pub use types::*;
 
