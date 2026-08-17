@@ -54,6 +54,7 @@ use crate::docx::parse::drawing::schema::picture::{CNvPicPrXml, CNvPrXml};
 use crate::docx::parse::drawing::schema::shape::{ExtXml, OffXml, SpPrXml, XfrmXml};
 use crate::docx::parse::serde_xml;
 
+use super::geometry::SlideRect;
 use super::text::{TextBody, TextBodyXml};
 
 // ── Lowered model ────────────────────────────────────────────────────────────
@@ -81,6 +82,15 @@ pub struct Shape {
     /// source EMU to check against), and a debug dump that cannot tell them
     /// apart makes a bad cascade look like a bad file.
     pub transform_inherited: bool,
+    /// This shape's position **on the slide**, filled by
+    /// [`crate::pptx::geometry`]. `None` until that pass runs.
+    ///
+    /// Distinct from `transform`, which stays exactly as the file declares it —
+    /// inside a group that is the group's *child* coordinate space and is not a
+    /// slide position at all. Keeping both means a debug dump and the geometry
+    /// probe can still see the declared EMU, which is what they check against
+    /// the source XML.
+    pub slide_rect: Option<SlideRect>,
     pub kind: ShapeKind,
 }
 
@@ -828,6 +838,7 @@ fn lower_sp(sp: SpXml) -> Shape {
         placeholder: nv_pr.and_then(|nv| nv.ph).map(PhXml::into_model),
         transform: properties.as_ref().and_then(|p| p.transform),
         transform_inherited: false,
+        slide_rect: None,
         kind: ShapeKind::AutoShape(Box::new(AutoShape {
             properties,
             text: sp.tx_body.map(TextBodyXml::into_model),
@@ -852,6 +863,7 @@ fn lower_pic(pic: PicXml) -> Shape {
             .map(PhXml::into_model),
         transform,
         transform_inherited: false,
+        slide_rect: None,
         kind: ShapeKind::Picture(Box::new(Picture {
             nv_pic_pr: NvPicProperties {
                 cnv_pr: non_visual,
@@ -870,6 +882,7 @@ fn lower_cxn(cxn: CxnSpXml) -> Shape {
         placeholder: None,
         transform: properties.as_ref().and_then(|p| p.transform),
         transform_inherited: false,
+        slide_rect: None,
         kind: ShapeKind::Connector(Box::new(Connector { properties })),
     }
 }
@@ -882,6 +895,7 @@ fn lower_grp(grp: GrpSpXml) -> Shape {
         placeholder: None,
         transform,
         transform_inherited: false,
+        slide_rect: None,
         kind: ShapeKind::Group(Box::new(Group {
             properties: None,
             child_offset: xfrm
@@ -912,6 +926,7 @@ fn lower_graphic_frame(gf: GraphicFrameXml) -> Shape {
         placeholder: None,
         transform: gf.xfrm.map(Into::into),
         transform_inherited: false,
+        slide_rect: None,
         kind: ShapeKind::GraphicFrame(Box::new(GraphicFrame { payload })),
     }
 }
