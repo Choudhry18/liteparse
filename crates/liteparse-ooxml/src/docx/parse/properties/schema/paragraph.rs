@@ -398,7 +398,7 @@ impl PPrXml {
             contextual_spacing: last_toggle(self.contextual_spacing),
             bidi: last_toggle(self.bidi),
             word_wrap: last_toggle(self.word_wrap),
-            outline_level: self.outline_lvl.and_then(|v| OutlineLevel::from_ooxml(v)),
+            outline_level: self.outline_lvl.and_then(OutlineLevel::from_ooxml),
             text_alignment: self.text_alignment.map(TextAlignment::from),
             cnf_style: self.cnf_style.map(CnfStyle::from),
             frame_properties: self.frame_pr.map(FrameKind::from),
@@ -418,7 +418,7 @@ impl PPrXml {
 fn numbering_ref(x: NumPrXml) -> Option<NumberingReference> {
     let num_id = x.num_id?;
     Some(NumberingReference {
-        num_id: num_id,
+        num_id,
         level: x.ilvl.unwrap_or(0),
     })
 }

@@ -106,10 +106,10 @@ fn resolve_one(
     }
 
     // Resolve parent first (if any).
-    if let Some(ref parent_id) = style.based_on {
-        if !resolved.contains_key(parent_id) {
-            resolve_one(parent_id, sheet, theme, resolved, visiting);
-        }
+    if let Some(ref parent_id) = style.based_on
+        && !resolved.contains_key(parent_id)
+    {
+        resolve_one(parent_id, sheet, theme, resolved, visiting);
     }
 
     // Start with own properties.
@@ -123,12 +123,12 @@ fn resolve_one(
     // §17.7.2: table property inheritance — cell margins from parent table styles.
     let mut table = style.table_properties.clone();
     // Merge from resolved parent (if it exists and was successfully resolved).
-    if let Some(ref parent_id) = style.based_on {
-        if let Some(parent_resolved) = resolved.get(parent_id) {
-            merge_paragraph_properties(&mut para, &parent_resolved.paragraph);
-            merge_run_properties(&mut run, &parent_resolved.run);
-            merge_table_properties(&mut table, &parent_resolved.table);
-        }
+    if let Some(ref parent_id) = style.based_on
+        && let Some(parent_resolved) = resolved.get(parent_id)
+    {
+        merge_paragraph_properties(&mut para, &parent_resolved.paragraph);
+        merge_run_properties(&mut run, &parent_resolved.run);
+        merge_table_properties(&mut table, &parent_resolved.table);
     }
 
     // §17.7.2: doc defaults are NOT merged here — they are merged by the

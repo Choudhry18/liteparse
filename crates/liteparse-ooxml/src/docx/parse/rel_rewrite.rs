@@ -249,13 +249,13 @@ fn rewrite_vml_image_data(data: &mut VmlImageData, remap: &HashMap<RelId, RelId>
 /// reason) the URL won't match any rId in `remap` and this is a
 /// no-op.
 fn rewrite_in_hyperlink_target(target: &mut HyperlinkTarget, remap: &HashMap<RelId, RelId>) {
-    if let HyperlinkTarget::ExternalRel(id) = target {
-        if let Some(new) = remap.get(id) {
-            // For a subordinate part the remap resolves a hyperlink rId directly
-            // to its external URL (see `load_part_rel_remap`), so the target
-            // becomes a resolved URL rather than another rId.
-            *target = HyperlinkTarget::ExternalUrl(new.as_str().to_string());
-        }
+    if let HyperlinkTarget::ExternalRel(id) = target
+        && let Some(new) = remap.get(id)
+    {
+        // For a subordinate part the remap resolves a hyperlink rId directly
+        // to its external URL (see `load_part_rel_remap`), so the target
+        // becomes a resolved URL rather than another rId.
+        *target = HyperlinkTarget::ExternalUrl(new.as_str().to_string());
     }
 }
 

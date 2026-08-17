@@ -296,10 +296,8 @@ fn parse_presentation(data: &[u8]) -> Result<PresentationXml> {
                 b"notesSz" => out.notes_size = size_attrs(e),
                 _ => {}
             },
-            Event::End(ref e) => {
-                if local_name(e.name().as_ref()) == b"sldIdLst" {
-                    in_slide_id_lst = false;
-                }
+            Event::End(ref e) if local_name(e.name().as_ref()) == b"sldIdLst" => {
+                in_slide_id_lst = false;
             }
             _ => {}
         }

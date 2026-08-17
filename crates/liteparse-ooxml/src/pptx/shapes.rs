@@ -72,6 +72,15 @@ pub struct Shape {
     /// `None` means the file declares no geometry, **not** that the shape sits
     /// at the origin. It is resolved later by the placeholder cascade.
     pub transform: Option<Transform2D>,
+    /// True once [`crate::pptx::cascade`] has filled `transform` in from a
+    /// layout or master placeholder, rather than the file declaring it here.
+    ///
+    /// Kept because "declared" and "inherited" are different facts about the
+    /// document even though they produce the same rectangle: the geometry
+    /// probe excludes inherited shapes from its source-EMU check (there is no
+    /// source EMU to check against), and a debug dump that cannot tell them
+    /// apart makes a bad cascade look like a bad file.
+    pub transform_inherited: bool,
     pub kind: ShapeKind,
 }
 
@@ -818,6 +827,7 @@ fn lower_sp(sp: SpXml) -> Shape {
         non_visual: doc_properties(cnv_pr),
         placeholder: nv_pr.and_then(|nv| nv.ph).map(PhXml::into_model),
         transform: properties.as_ref().and_then(|p| p.transform),
+        transform_inherited: false,
         kind: ShapeKind::AutoShape(Box::new(AutoShape {
             properties,
             text: sp.tx_body.map(TextBodyXml::into_model),
@@ -841,6 +851,7 @@ fn lower_pic(pic: PicXml) -> Shape {
             .and_then(|nv| nv.ph)
             .map(PhXml::into_model),
         transform,
+        transform_inherited: false,
         kind: ShapeKind::Picture(Box::new(Picture {
             nv_pic_pr: NvPicProperties {
                 cnv_pr: non_visual,
@@ -858,6 +869,7 @@ fn lower_cxn(cxn: CxnSpXml) -> Shape {
         non_visual: doc_properties(cxn.nv_cxn_sp_pr.map(|nv| nv.cnv_pr)),
         placeholder: None,
         transform: properties.as_ref().and_then(|p| p.transform),
+        transform_inherited: false,
         kind: ShapeKind::Connector(Box::new(Connector { properties })),
     }
 }
@@ -869,6 +881,7 @@ fn lower_grp(grp: GrpSpXml) -> Shape {
         non_visual: doc_properties(grp.nv_grp_sp_pr.map(|nv| nv.cnv_pr)),
         placeholder: None,
         transform,
+        transform_inherited: false,
         kind: ShapeKind::Group(Box::new(Group {
             properties: None,
             child_offset: xfrm
@@ -898,6 +911,7 @@ fn lower_graphic_frame(gf: GraphicFrameXml) -> Shape {
         non_visual: doc_properties(gf.nv_graphic_frame_pr.map(|nv| nv.cnv_pr)),
         placeholder: None,
         transform: gf.xfrm.map(Into::into),
+        transform_inherited: false,
         kind: ShapeKind::GraphicFrame(Box::new(GraphicFrame { payload })),
     }
 }

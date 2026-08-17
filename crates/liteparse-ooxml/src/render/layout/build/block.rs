@@ -92,10 +92,10 @@ pub(super) fn build_paragraph_block(
             state.shape_default_text_color,
             state.shape_default_font_family.as_deref(),
         );
-        if let Some(ref mrp) = p.mark_run_properties {
-            if let Some(fs) = mrp.font_size {
-                size = Pt::from(fs);
-            }
+        if let Some(ref mrp) = p.mark_run_properties
+            && let Some(fs) = mrp.font_size
+        {
+            size = Pt::from(fs);
         }
         let line_height = ctx.measurer.default_line_height(&family, size);
         fragments.push(Fragment::LineBreak { line_height });
@@ -123,13 +123,12 @@ pub(super) fn build_paragraph_block(
                 hyperlink_url,
                 ..
             } = frag
+                && hyperlink_url.is_some()
             {
-                if hyperlink_url.is_some() {
-                    *color = RgbColor::BLACK;
-                    // Rare (TOC hyperlinks only); clones this fragment's shared
-                    // font on write.
-                    Rc::make_mut(font).underline = false;
-                }
+                *color = RgbColor::BLACK;
+                // Rare (TOC hyperlinks only); clones this fragment's shared
+                // font on write.
+                Rc::make_mut(font).underline = false;
             }
         }
     }
@@ -417,10 +416,10 @@ pub(super) fn build_fragments(
         );
 
     // §17.7.2: table conditional formatting — lower priority than paragraph style.
-    if let Some(c) = cond {
-        if let Some(ref pp) = c.paragraph_properties {
-            merge_paragraph_properties(&mut merged_props, pp);
-        }
+    if let Some(c) = cond
+        && let Some(ref pp) = c.paragraph_properties
+    {
+        merge_paragraph_properties(&mut merged_props, pp);
     }
     // §17.7.2: table style paragraph properties — lower priority than conditional.
     if let Some(ts) = table_style {
@@ -432,28 +431,28 @@ pub(super) fn build_fragments(
     }
 
     // §17.7.2: table style run properties override Normal.
-    if let Some(ts) = table_style {
-        if let Some(fs) = ts.run.font_size {
-            default_size = Pt::from(fs);
-            run_defaults.font_size = Some(fs);
-        }
+    if let Some(ts) = table_style
+        && let Some(fs) = ts.run.font_size
+    {
+        default_size = Pt::from(fs);
+        run_defaults.font_size = Some(fs);
     }
 
     // §17.7.6: conditional run property overrides — higher priority than
     // table style and paragraph style. Overlay (not merge): conditional
     // values replace existing ones.
-    if let Some(c) = cond {
-        if let Some(ref rp) = c.run_properties {
-            // Overlay: for each Some field in rp, replace in run_defaults.
-            let mut overlay = rp.clone();
-            merge_run_properties(&mut overlay, &run_defaults);
-            run_defaults = overlay;
-            if let Some(fs) = run_defaults.font_size {
-                default_size = Pt::from(fs);
-            }
-            if let Some(color) = run_defaults.color {
-                default_color = resolve_color(color, ColorContext::Text);
-            }
+    if let Some(c) = cond
+        && let Some(ref rp) = c.run_properties
+    {
+        // Overlay: for each Some field in rp, replace in run_defaults.
+        let mut overlay = rp.clone();
+        merge_run_properties(&mut overlay, &run_defaults);
+        run_defaults = overlay;
+        if let Some(fs) = run_defaults.font_size {
+            default_size = Pt::from(fs);
+        }
+        if let Some(color) = run_defaults.color {
+            default_color = resolve_color(color, ColorContext::Text);
         }
     }
 

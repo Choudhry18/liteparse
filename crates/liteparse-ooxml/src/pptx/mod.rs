@@ -10,10 +10,14 @@
 //! `<a:xfrm>` inherits position and size from its layout, which inherits
 //! from its master, and the match rule differs at each rung.
 
+pub mod cascade;
 pub mod package;
 pub mod shapes;
 pub mod text;
 
+pub use cascade::{
+    CascadeStats, MatchRule, PlaceholderGeometry, apply_inherited_geometry, apply_slide,
+};
 pub use package::{EMU_PER_POINT, Part, PresentationInfo, PresentationPackage, SlideParts, walk};
 pub use shapes::{
     AutoShape, Connector, GraphicFrame, GraphicFramePayload, Group, Placeholder, PlaceholderKind,

@@ -230,13 +230,13 @@ impl From<LvlXml> for NumberingLevelDefinition {
         let (indentation, run_properties) = extract_level_properties(x.p_pr, x.r_pr);
         Self {
             level: x.ilvl,
-            format: x.num_fmt.map(|v| NumberFormat::from(v)),
+            format: x.num_fmt.map(NumberFormat::from),
             level_text: x.lvl_text.map(|v| v.val).unwrap_or_default(),
             start: x.start,
             justification: x.lvl_jc.map(Alignment::from),
             indentation,
             run_properties,
-            lvl_pic_bullet_id: x.lvl_pic_bullet_id.map(|v| NumPicBulletId::new(v)),
+            lvl_pic_bullet_id: x.lvl_pic_bullet_id.map(NumPicBulletId::new),
             suffix: x.suff.map(LevelSuffix::from).unwrap_or_default(),
             is_legal: x.is_lgl.map(|OnOff(b)| b).unwrap_or(false),
         }
@@ -255,7 +255,7 @@ fn extract_level_properties(
 fn convert_num(n: NumXml) -> NumberingInstance {
     let abstract_num_id = n
         .abstract_num_id
-        .map(|v| AbstractNumId::new(v))
+        .map(AbstractNumId::new)
         .unwrap_or_else(|| {
             log::warn!(
                 "numbering instance numId={:?} has no abstractNumId; defaulting to 0",

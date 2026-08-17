@@ -94,10 +94,10 @@ pub fn resolve_font_set_themes(fonts: &mut FontSet, theme: &crate::model::Theme)
         &mut fonts.east_asian,
         &mut fonts.complex_script,
     ] {
-        if let Some(ref tf) = slot.theme {
-            if let Some(name) = resolve_theme_font_ref(tf, theme) {
-                slot.explicit = Some(name);
-            }
+        if let Some(ref tf) = slot.theme
+            && let Some(name) = resolve_theme_font_ref(tf, theme)
+        {
+            slot.explicit = Some(name);
         }
     }
 }

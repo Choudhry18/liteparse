@@ -127,13 +127,13 @@ fn emit_one_row(
         // governs the merged region; letting a continuation paint over the span
         // would let a stale or differing `shd` on a row that has no independent
         // existence win for that row.
-        if cell_input.vertical_merge != Some(VerticalMergeState::Continue) {
-            if let Some(color) = cell_input.shading {
-                bufs.commands.push(DrawCommand::Rect {
-                    rect: PtRect::from_xywh(entry.cell_x, row_top, entry.cell_w, effective_h),
-                    color,
-                });
-            }
+        if cell_input.vertical_merge != Some(VerticalMergeState::Continue)
+            && let Some(color) = cell_input.shading
+        {
+            bufs.commands.push(DrawCommand::Rect {
+                rect: PtRect::from_xywh(entry.cell_x, row_top, entry.cell_w, effective_h),
+                color,
+            });
         }
 
         // §17.4.38: restore the top border when this row starts a slice and the

@@ -1500,10 +1500,9 @@ pub(crate) fn layout_section_with_clearance(
                 // with identical borders suppress interior top borders.
                 if effective_style.borders.is_some()
                     && effective_style.borders == state.prev_borders
+                    && let Some(ref mut b) = effective_style.borders
                 {
-                    if let Some(ref mut b) = effective_style.borders {
-                        b.top = None;
-                    }
+                    b.top = None;
                 }
                 // §17.3.1.9: spacing collapse (must happen before float registration).
                 if effective_style.contextual_spacing

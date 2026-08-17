@@ -727,17 +727,17 @@ impl FontRegistry {
     fn resolve_uncached(&self, family: &str, style: FontStyle) -> (TypefaceEntry, ResolveRule) {
         // 1. Embedded, by family + variant.
         let variant = variant_for_style(style);
-        if let Some(&eid) = self.embedded_index.get(&(family.to_lowercase(), variant)) {
-            if let Some(face) = self.embedded[eid.0 as usize].face {
-                log::debug!("[font] '{}' {:?} → embedded #{}", family, style, eid.0);
-                return (
-                    TypefaceEntry {
-                        id: face,
-                        origin: TypefaceOrigin::Embedded { id: eid },
-                    },
-                    ResolveRule::Embedded,
-                );
-            }
+        if let Some(&eid) = self.embedded_index.get(&(family.to_lowercase(), variant))
+            && let Some(face) = self.embedded[eid.0 as usize].face
+        {
+            log::debug!("[font] '{}' {:?} → embedded #{}", family, style, eid.0);
+            return (
+                TypefaceEntry {
+                    id: face,
+                    origin: TypefaceOrigin::Embedded { id: eid },
+                },
+                ResolveRule::Embedded,
+            );
         }
 
         // 2. Exact family match. fontdb declines a family it does not have
@@ -772,16 +772,16 @@ impl FontRegistry {
         // 4. Style suffix baked into the family name. The requested
         // bold/italic still applies, so "Times New Roman Bold" lands on the
         // real TNR bold face.
-        if let Some(base) = strip_style_suffix(family) {
-            if let Some(id) = self.query(&[fontdb::Family::Name(&base)], style) {
-                log::debug!(
-                    "[font] '{}' {:?} → suffix-stripped '{}'",
-                    family,
-                    style,
-                    base
-                );
-                return (system_entry(id), ResolveRule::StyleSuffix);
-            }
+        if let Some(base) = strip_style_suffix(family)
+            && let Some(id) = self.query(&[fontdb::Family::Name(&base)], style)
+        {
+            log::debug!(
+                "[font] '{}' {:?} → suffix-stripped '{}'",
+                family,
+                style,
+                base
+            );
+            return (system_entry(id), ResolveRule::StyleSuffix);
         }
 
         // 5. Substitution table. Candidates in table order, so a host carrying
@@ -832,13 +832,13 @@ impl FontRegistry {
     /// missing color emoji font is never correct.
     pub fn resolve_exact(&self, family: &str, style: FontStyle) -> Option<TypefaceEntry> {
         let variant = variant_for_style(style);
-        if let Some(&eid) = self.embedded_index.get(&(family.to_lowercase(), variant)) {
-            if let Some(face) = self.embedded[eid.0 as usize].face {
-                return Some(TypefaceEntry {
-                    id: face,
-                    origin: TypefaceOrigin::Embedded { id: eid },
-                });
-            }
+        if let Some(&eid) = self.embedded_index.get(&(family.to_lowercase(), variant))
+            && let Some(face) = self.embedded[eid.0 as usize].face
+        {
+            return Some(TypefaceEntry {
+                id: face,
+                origin: TypefaceOrigin::Embedded { id: eid },
+            });
         }
         self.query(&[fontdb::Family::Name(family)], style)
             .map(system_entry)

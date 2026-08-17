@@ -332,10 +332,10 @@ fn resolve_hyperlinks_in_inlines(
         match inline {
             Inline::Hyperlink(link) => {
                 // Resolve an unresolved relationship id to its actual URL.
-                if let HyperlinkTarget::ExternalRel(ref rel_id) = link.target {
-                    if let Some(rel) = rels.find_by_id(rel_id.as_str()) {
-                        link.target = HyperlinkTarget::ExternalUrl(rel.target.clone());
-                    }
+                if let HyperlinkTarget::ExternalRel(ref rel_id) = link.target
+                    && let Some(rel) = rels.find_by_id(rel_id.as_str())
+                {
+                    link.target = HyperlinkTarget::ExternalUrl(rel.target.clone());
                 }
                 // Recurse into hyperlink content.
                 resolve_hyperlinks_in_inlines(&mut link.content, rels);

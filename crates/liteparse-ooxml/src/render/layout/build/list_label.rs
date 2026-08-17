@@ -122,20 +122,19 @@ pub(super) fn inject_list_label(
         }
         fragments.insert(0, label_frag);
 
-        if !drop_separator {
-            if let Some(lvl_left) = level_def
+        if !drop_separator
+            && let Some(lvl_left) = level_def
                 .and_then(|l| l.indentation.as_ref())
                 .and_then(|ind| ind.start)
-            {
-                merged_props.tabs.insert(
-                    0,
-                    crate::model::TabStop {
-                        position: lvl_left,
-                        alignment: crate::model::TabAlignment::Left,
-                        leader: crate::model::TabLeader::None,
-                    },
-                );
-            }
+        {
+            merged_props.tabs.insert(
+                0,
+                crate::model::TabStop {
+                    position: lvl_left,
+                    alignment: crate::model::TabAlignment::Left,
+                    leader: crate::model::TabLeader::None,
+                },
+            );
         }
     } else {
         inject_text_label(

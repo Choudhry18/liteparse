@@ -72,11 +72,11 @@ pub(super) fn resolve_paragraph_defaults(
         .as_ref()
         .or(resolved.default_paragraph_style_id.as_ref());
 
-    if let Some(style_id) = effective_style_id {
-        if let Some(resolved_style) = resolved.styles.get(style_id) {
-            merge_paragraph_properties(&mut para_props, &resolved_style.paragraph);
-            run_defaults = resolved_style.run.clone();
-        }
+    if let Some(style_id) = effective_style_id
+        && let Some(resolved_style) = resolved.styles.get(style_id)
+    {
+        merge_paragraph_properties(&mut para_props, &resolved_style.paragraph);
+        run_defaults = resolved_style.run.clone();
     }
 
     // Merge doc defaults as lowest-priority fallback (unless deferred for table cascade).
@@ -493,12 +493,10 @@ pub(super) fn populate_image_data(
         if let Fragment::Image {
             rel_id, image_data, ..
         } = frag
+            && image_data.is_none()
+            && let Some(entry) = media.get(&model::RelId::new(rel_id.as_str()))
         {
-            if image_data.is_none() {
-                if let Some(entry) = media.get(&model::RelId::new(rel_id.as_str())) {
-                    *image_data = Some(entry.clone());
-                }
-            }
+            *image_data = Some(entry.clone());
         }
     }
 }
@@ -771,15 +769,15 @@ fn wingdings_pua_to_unicode(code: u32) -> Option<char> {
 /// Populate underline position/thickness from Skia font metrics.
 pub(super) fn populate_underline_metrics(fragments: &mut [Fragment], measurer: &TextMeasurer) {
     for frag in fragments.iter_mut() {
-        if let Fragment::Text { font, .. } = frag {
-            if font.underline {
-                // Underlined runs only; `make_mut` clones the shared font so
-                // the metrics can be written back.
-                let fp = std::rc::Rc::make_mut(font);
-                let (pos, thickness) = measurer.underline_metrics(fp);
-                fp.underline_position = pos;
-                fp.underline_thickness = thickness;
-            }
+        if let Fragment::Text { font, .. } = frag
+            && font.underline
+        {
+            // Underlined runs only; `make_mut` clones the shared font so
+            // the metrics can be written back.
+            let fp = std::rc::Rc::make_mut(font);
+            let (pos, thickness) = measurer.underline_metrics(fp);
+            fp.underline_position = pos;
+            fp.underline_thickness = thickness;
         }
     }
 }

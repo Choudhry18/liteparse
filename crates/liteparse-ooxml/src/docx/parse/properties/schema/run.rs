@@ -199,7 +199,7 @@ impl RPrXml {
             position: self.position,
             lang: self.lang.map(Into::into),
             border: self.bdr.map(Into::into),
-            text_scale: self.char_scale.map(|v| TextScale::new(v)),
+            text_scale: self.char_scale.map(TextScale::new),
         };
         (props, style_id)
     }

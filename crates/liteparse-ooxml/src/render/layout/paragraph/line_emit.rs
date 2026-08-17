@@ -1052,26 +1052,25 @@ fn decimal_anchor(
         if let Fragment::Text {
             text, font, width, ..
         } = fragment
+            && let Some(byte_idx) = text.find(separator)
         {
-            if let Some(byte_idx) = text.find(separator) {
-                let prefix = &text[..byte_idx];
-                let prefix_width = match measure_text {
-                    Some(measure) => measure(prefix, font).0,
-                    // No measurer (fitting-only paths): apportion the
-                    // fragment's known width by character share. Approximate
-                    // for proportional faces, but the alternative is ignoring
-                    // the separator entirely.
-                    None => {
-                        let total = text.chars().count();
-                        if total == 0 {
-                            Pt::ZERO
-                        } else {
-                            *width * (prefix.chars().count() as f32 / total as f32)
-                        }
+            let prefix = &text[..byte_idx];
+            let prefix_width = match measure_text {
+                Some(measure) => measure(prefix, font).0,
+                // No measurer (fitting-only paths): apportion the
+                // fragment's known width by character share. Approximate
+                // for proportional faces, but the alternative is ignoring
+                // the separator entirely.
+                None => {
+                    let total = text.chars().count();
+                    if total == 0 {
+                        Pt::ZERO
+                    } else {
+                        *width * (prefix.chars().count() as f32 / total as f32)
                     }
-                };
-                return ZoneAnchor::At(before + prefix_width);
-            }
+                }
+            };
+            return ZoneAnchor::At(before + prefix_width);
         }
         before += fragment.width();
     }

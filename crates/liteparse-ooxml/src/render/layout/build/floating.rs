@@ -1052,10 +1052,10 @@ pub(super) fn find_vml_absolute_position(inline: &model::Inline) -> Option<(Pt, 
 
 fn find_vml_pos_in_pict(pict: &model::Pict) -> Option<(Pt, Pt)> {
     for shape in pict.shapes() {
-        if shape.common.text_box.is_some() {
-            if let Some(pos) = vml_absolute_position(&shape.common.style) {
-                return Some(pos);
-            }
+        if shape.common.text_box.is_some()
+            && let Some(pos) = vml_absolute_position(&shape.common.style)
+        {
+            return Some(pos);
         }
     }
     None

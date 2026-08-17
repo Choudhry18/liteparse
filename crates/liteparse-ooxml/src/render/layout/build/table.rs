@@ -305,15 +305,15 @@ pub(super) fn build_table(
                     .as_ref()
                     .and_then(|e| e.cell_spacing)
             });
-            if let Some(rs) = row_spacing {
-                if resolve_cell_spacing(Some(rs)) != cell_spacing && !state.warned_row_cell_spacing
-                {
-                    state.warned_row_cell_spacing = true;
-                    log::warn!(
-                        "§17.4.41/§17.4.42: row-level tblCellSpacing overrides are not applied; \
+            if let Some(rs) = row_spacing
+                && resolve_cell_spacing(Some(rs)) != cell_spacing
+                && !state.warned_row_cell_spacing
+            {
+                state.warned_row_cell_spacing = true;
+                log::warn!(
+                    "§17.4.41/§17.4.42: row-level tblCellSpacing overrides are not applied; \
                          using the table-level value ({cell_spacing:?})"
-                    );
-                }
+                );
             }
 
             TableRowInput {

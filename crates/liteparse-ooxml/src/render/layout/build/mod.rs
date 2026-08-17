@@ -307,10 +307,10 @@ fn build_non_story_content(
                 if frags.is_empty() && block_i + 1 < block_count && !has_floating_anchor {
                     let (family, mut size, ..) =
                         resolve_paragraph_defaults(p, ctx.resolved, false, None, None);
-                    if let Some(ref mrp) = p.mark_run_properties {
-                        if let Some(fs) = mrp.font_size {
-                            size = Pt::from(fs);
-                        }
+                    if let Some(ref mrp) = p.mark_run_properties
+                        && let Some(fs) = mrp.font_size
+                    {
+                        size = Pt::from(fs);
                     }
                     let line_height = ctx.measurer.default_line_height(&family, size);
                     frags.push(Fragment::LineBreak { line_height });

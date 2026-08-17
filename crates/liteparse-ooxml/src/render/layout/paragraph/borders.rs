@@ -134,29 +134,25 @@ pub(super) fn emit_segment_borders_and_shading(
     // §17.3.1.24: render paragraph borders at the indent edges. Top/bottom only
     // on the owning segment; sides on every segment.
     if let Some(ref borders) = style.borders {
-        if draw_top {
-            if let Some(ref top) = borders.top {
-                commands.push(DrawCommand::Line {
-                    line: crate::render::geometry::PtLineSegment::new(
-                        PtOffset::new(para_left, box_top),
-                        PtOffset::new(para_right, box_top),
-                    ),
-                    color: top.color,
-                    width: top.width,
-                });
-            }
+        if draw_top && let Some(ref top) = borders.top {
+            commands.push(DrawCommand::Line {
+                line: crate::render::geometry::PtLineSegment::new(
+                    PtOffset::new(para_left, box_top),
+                    PtOffset::new(para_right, box_top),
+                ),
+                color: top.color,
+                width: top.width,
+            });
         }
-        if draw_bottom {
-            if let Some(ref bottom) = borders.bottom {
-                commands.push(DrawCommand::Line {
-                    line: crate::render::geometry::PtLineSegment::new(
-                        PtOffset::new(para_left, box_bottom),
-                        PtOffset::new(para_right, box_bottom),
-                    ),
-                    color: bottom.color,
-                    width: bottom.width,
-                });
-            }
+        if draw_bottom && let Some(ref bottom) = borders.bottom {
+            commands.push(DrawCommand::Line {
+                line: crate::render::geometry::PtLineSegment::new(
+                    PtOffset::new(para_left, box_bottom),
+                    PtOffset::new(para_right, box_bottom),
+                ),
+                color: bottom.color,
+                width: bottom.width,
+            });
         }
         if let Some(ref left) = borders.left {
             commands.push(DrawCommand::Line {

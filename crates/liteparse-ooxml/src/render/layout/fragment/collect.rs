@@ -132,13 +132,13 @@ where
     if let Some(th) = theme {
         crate::render::resolve::fonts::resolve_font_set_themes(&mut effective_props.fonts, th);
     }
-    if let (Some(style_id), Some(styles)) = (&tr.style_id, resolved_styles) {
-        if let Some(resolved_style) = styles.get(style_id) {
-            crate::render::resolve::properties::merge_run_properties(
-                &mut effective_props,
-                &resolved_style.run,
-            );
-        }
+    if let (Some(style_id), Some(styles)) = (&tr.style_id, resolved_styles)
+        && let Some(resolved_style) = styles.get(style_id)
+    {
+        crate::render::resolve::properties::merge_run_properties(
+            &mut effective_props,
+            &resolved_style.run,
+        );
     }
     if let Some(para_run) = paragraph_run_defaults {
         crate::render::resolve::properties::merge_run_properties(&mut effective_props, para_run);
@@ -678,19 +678,18 @@ where
                 Inline::Image(img) => {
                     // Only render INLINE images as fragments.
                     // Anchor (floating) images are handled separately in build.rs.
-                    if matches!(img.placement, crate::model::ImagePlacement::Inline { .. }) {
-                        if let Some(rel_id) =
+                    if matches!(img.placement, crate::model::ImagePlacement::Inline { .. })
+                        && let Some(rel_id) =
                             crate::render::resolve::images::extract_image_rel_id(img)
-                        {
-                            let w = Pt::from(img.extent.width);
-                            let h = Pt::from(img.extent.height);
-                            fragments.push(Fragment::Image {
-                                size: PtSize::new(w, h),
-                                rel_id: rel_id.as_str().to_string(),
-                                image_data: None,
-                                src_rect: crate::render::resolve::images::extract_src_rect(img),
-                            });
-                        }
+                    {
+                        let w = Pt::from(img.extent.width);
+                        let h = Pt::from(img.extent.height);
+                        fragments.push(Fragment::Image {
+                            size: PtSize::new(w, h),
+                            rel_id: rel_id.as_str().to_string(),
+                            image_data: None,
+                            src_rect: crate::render::resolve::images::extract_src_rect(img),
+                        });
                     }
                 }
                 Inline::Hyperlink(link) => {
