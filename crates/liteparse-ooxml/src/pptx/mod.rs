@@ -14,6 +14,7 @@ pub mod cascade;
 pub mod package;
 pub mod shapes;
 pub mod text;
+pub mod textcascade;
 
 pub use cascade::{
     CascadeStats, MatchRule, PlaceholderGeometry, apply_inherited_geometry, apply_slide,
@@ -25,5 +26,9 @@ pub use shapes::{
 };
 pub use text::{
     AutoNumberScheme, Bullet, ListStyle, Spacing, TextBody, TextParagraph, TextParagraphProperties,
-    parse_text_body,
+    TextStyles, parse_default_text_style, parse_text_body, parse_text_styles,
+};
+pub use textcascade::{
+    DeckTextDefaults, PlaceholderTextStyles, ResolvedTextStyle, SizeSource, TextCascade,
+    TextStyleClass,
 };

@@ -89,6 +89,11 @@ pub struct SlideParts {
 /// debug-print dumps them.
 pub struct PresentationPackage {
     pub info: PresentationInfo,
+    /// `ppt/presentation.xml` itself, kept because it is the outermost rung of
+    /// the **text** cascade: `p:defaultTextStyle` lives here and is the only
+    /// source a non-placeholder shape can reach. 2,144 of the corpus runs that
+    /// declare no size resolve against it.
+    pub presentation: Part,
     /// Slides in **presentation order** — `<p:sldIdLst>`, not part order.
     pub slides: Vec<SlideParts>,
     /// `ppt/theme/themeN.xml` for the first master, when present.
@@ -185,6 +190,7 @@ pub fn walk(data: &[u8]) -> Result<PresentationPackage> {
 
     Ok(PresentationPackage {
         info,
+        presentation: pres,
         slides,
         theme,
         notes_master,

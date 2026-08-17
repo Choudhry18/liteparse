@@ -288,6 +288,63 @@ pub fn parse_text_body(data: &[u8]) -> Result<TextBody> {
     Ok(xml.into_model())
 }
 
+/// §19.3.1.52 `p:txStyles` — a master's three whole-part text styles.
+///
+/// The outer two rungs of the text cascade are *not* placeholder shapes.
+/// A master carries one `p:txStyles` for the whole part, and a placeholder
+/// reaches the right child by its **kind**, not by matching a shape. See
+/// [`pptx::textcascade`] for the routing and the corpus measurement behind it.
+///
+/// [`pptx::textcascade`]: crate::pptx::textcascade
+#[derive(Clone, Debug, Default)]
+pub struct TextStyles {
+    /// `p:titleStyle` — `title` and `ctrTitle` placeholders.
+    pub title: ListStyle,
+    /// `p:bodyStyle` — everything body-ish.
+    pub body: ListStyle,
+    /// `p:otherStyle` — `dt`, `ftr`, `sldNum` and the rest of the chrome.
+    pub other: ListStyle,
+}
+
+impl TextStyles {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_empty() && self.body.is_empty() && self.other.is_empty()
+    }
+}
+
+/// Parse `p:txStyles` out of a **whole slide master part**.
+///
+/// Takes `p:sldMaster`'s bytes rather than the `p:txStyles` element, matching
+/// [`parse_shape_tree`]: callers hold parts, not subtrees.
+///
+/// A master with no `p:txStyles` yields an empty [`TextStyles`] rather than an
+/// error — the fail-open posture of this vendor. On the corpus all 70 masters
+/// declare one, so an empty result means something is genuinely unusual.
+///
+/// [`parse_shape_tree`]: crate::pptx::parse_shape_tree
+pub fn parse_text_styles(data: &[u8]) -> Result<TextStyles> {
+    let xml: SlideMasterStylesXml = serde_xml::from_xml(data)?;
+    Ok(xml
+        .tx_styles
+        .map(TxStylesXml::into_model)
+        .unwrap_or_default())
+}
+
+/// Parse `p:defaultTextStyle` out of a **whole `ppt/presentation.xml` part**.
+///
+/// The outermost rung, and the only one a non-placeholder shape can reach:
+/// 2,144 of the 2,301 corpus runs on non-placeholder shapes that declare no
+/// size get it from here, so this is not a rare fallback.
+///
+/// Absent yields an empty [`ListStyle`]; 45 of 45 corpus decks declare one.
+pub fn parse_default_text_style(data: &[u8]) -> Result<ListStyle> {
+    let xml: PresentationStylesXml = serde_xml::from_xml(data)?;
+    Ok(xml
+        .default_text_style
+        .map(ListStyleXml::into_model)
+        .unwrap_or_default())
+}
+
 // ── Schema ───────────────────────────────────────────────────────────────────
 //
 // Field coverage is driven by a census over the 45-deck corpus rather than by
@@ -324,6 +381,46 @@ impl TextBodyXml {
                 .collect(),
         }
     }
+}
+
+/// `p:sldMaster`, read only for its `p:txStyles`. Every other child — the
+/// shape tree, the colour map, the layout id list — is another module's job,
+/// and serde's unknown-field tolerance drops them.
+#[derive(Debug, Deserialize, Default)]
+struct SlideMasterStylesXml {
+    #[serde(rename = "txStyles", default)]
+    tx_styles: Option<TxStylesXml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TxStylesXml {
+    #[serde(rename = "titleStyle", default)]
+    title: Option<ListStyleXml>,
+    #[serde(rename = "bodyStyle", default)]
+    body: Option<ListStyleXml>,
+    #[serde(rename = "otherStyle", default)]
+    other: Option<ListStyleXml>,
+}
+
+impl TxStylesXml {
+    fn into_model(self) -> TextStyles {
+        // The three children are `CT_TextListStyle`, the same type as
+        // `a:lstStyle`, so the nine-level schema is reused verbatim rather
+        // than re-declared.
+        let lower = |s: Option<ListStyleXml>| s.map(ListStyleXml::into_model).unwrap_or_default();
+        TextStyles {
+            title: lower(self.title),
+            body: lower(self.body),
+            other: lower(self.other),
+        }
+    }
+}
+
+/// `p:presentation`, read only for its `p:defaultTextStyle`.
+#[derive(Debug, Deserialize, Default)]
+struct PresentationStylesXml {
+    #[serde(rename = "defaultTextStyle", default)]
+    default_text_style: Option<ListStyleXml>,
 }
 
 #[derive(Debug, Deserialize, Default)]
