@@ -564,3 +564,100 @@ async fn test_parse_docx_native_complexity_integration() {
         .expect("native parse succeeds");
     assert!(parsed.pages.iter().all(|p| p.complexity.is_none()));
 }
+
+/// Native PPTX path end-to-end.
+///
+/// The load-bearing assertion is the byte-identity between `parsed.text` and
+/// the emitter's own output: `office/pptx.rs` is what the corpus content-recall
+/// number (0.9256 vs anydoc's 0.9250) was measured on, and the wiring must not
+/// perturb it. If this fails, the recorded score no longer describes what the
+/// CLI produces.
+///
+/// The rest pins the contract the geometry pass added: one page per slide, real
+/// boxes on every page, and an outline built from slide titles.
+#[cfg(feature = "pptx-native")]
+#[tokio::test]
+#[serial]
+async fn test_parse_pptx_native_integration() {
+    let path = "../../bench/pptx_corpus/staging/cloudviper_workshop__19687752.pptx";
+    let lit = LiteParse::new(LiteParseConfig {
+        output_format: liteparse::config::OutputFormat::Markdown,
+        quiet: true,
+        ..Default::default()
+    });
+    let parsed = lit.parse(path).await.expect("native parse succeeds");
+
+    let data = std::fs::read(path).expect("fixture readable");
+    let blocks = liteparse::office::pptx::pptx_to_blocks(
+        &data,
+        liteparse::office::pptx::EmitOptions {
+            // Mirrors the defaults the parse above ran with: `extract_links` is
+            // on by default, and the native path always emits notes.
+            links: true,
+            notes: true,
+        },
+    )
+    .expect("blocks");
+    let expected = liteparse::markdown_layout::render_blocks(&blocks);
+    assert_eq!(
+        parsed.text, expected,
+        "native pipeline markdown must match the emitter byte-for-byte"
+    );
+
+    // A slide is a page — the counts cannot drift, because a `BlockSource`
+    // indexes pages directly.
+    assert_eq!(parsed.pages.len(), 25, "one page per slide");
+    assert!(
+        parsed
+            .pages
+            .iter()
+            .all(|p| p.page_width > 0.0 && p.page_height > 0.0),
+        "real slide dimensions"
+    );
+
+    let items: usize = parsed.pages.iter().map(|p| p.text_items.len()).sum();
+    assert!(items > 500, "per-run geometry present: {items} items");
+    assert!(
+        parsed
+            .pages
+            .iter()
+            .flat_map(|p| &p.text_items)
+            .all(|i| i.width > 0.0 || i.text.trim().is_empty()),
+        "no degenerate boxes on visible text"
+    );
+    assert!(
+        !parsed.outline.is_empty(),
+        "outline built from slide titles"
+    );
+    assert!(
+        parsed.outline.iter().all(|o| o.level == 1),
+        "PPTX has no heading hierarchy, so every outline entry is level 1"
+    );
+}
+
+/// A config the native PPTX path cannot honor is a hard error, not a silent
+/// swap to LibreOffice — the user picks the engine, the engine never picks for
+/// them. `extract_images` is the PPTX-specific entry: the reader emits nothing
+/// for `ShapeKind::Picture`, so honoring the flag would mean handing back an
+/// empty list.
+#[cfg(feature = "pptx-native")]
+#[tokio::test]
+#[serial]
+async fn test_pptx_native_unsupported_config_is_hard_error() {
+    let lit = LiteParse::new(LiteParseConfig {
+        extract_images: true,
+        quiet: true,
+        ..Default::default()
+    });
+    let msg = match lit
+        .parse("../../bench/pptx_corpus/staging/cloudviper_workshop__19687752.pptx")
+        .await
+    {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("unsupported option must not silently fall back"),
+    };
+    assert!(
+        msg.contains("extract_images") && msg.contains("native PPTX"),
+        "error names the option and the engine: {msg}"
+    );
+}

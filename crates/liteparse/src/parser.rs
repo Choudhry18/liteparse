@@ -406,6 +406,41 @@ impl LiteParse {
             }
         }
 
+        // Native PPTX path, same contract as the DOCX one above: engine
+        // failures fall through to LibreOffice, an unsupported option is a hard
+        // error rather than a silent engine swap.
+        #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+        if self.config.office_native {
+            if let Some(reason) = self.native_pptx_ineligible_reason() {
+                if crate::office::pptx_bytes(&input).is_some() {
+                    return Err(LiteParseError::Config(format!(
+                        "`{reason}` is not supported by the native PPTX path; \
+                         disable it, or set office_native = false \
+                         (CLI: --no-office-native) to parse via the conversion path"
+                    )));
+                }
+            } else if let Some(bytes) = crate::office::pptx_bytes(&input) {
+                match self.try_parse_pptx_native(&bytes) {
+                    Ok(Some(result)) => {
+                        let total =
+                            web_time::Instant::now().duration_since(t0).as_secs_f64() * 1000.0;
+                        log(&format!("[liteparse] native pptx total: {:.1}ms", total));
+                        return Ok(result);
+                    }
+                    Ok(None) => {
+                        log(
+                            "[liteparse] office_native: text-sparse pptx, falling back to conversion path for OCR",
+                        );
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "[liteparse] office_native failed ({e}); falling back to conversion path"
+                        ));
+                    }
+                }
+            }
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         let (validated_input, _guard) =
             conversion::resolve_pdf_input(input, self.config.password.as_deref(), false).await?;
@@ -788,6 +823,173 @@ impl LiteParse {
         } else {
             None
         }
+    }
+
+    /// Config options the native PPTX path cannot honor. Hitting one with
+    /// `office_native` on is a hard `Config` error, not a fallback.
+    ///
+    /// Two entries are PPTX-specific and are here because the alternative is
+    /// silent under-delivery:
+    ///
+    /// * `extract_images` — the PPTX reader does not extract media at all yet
+    ///   (`ShapeKind::Picture` emits nothing), so an enabled flag would hand
+    ///   back an empty list rather than the deck's pictures.
+    /// * `extract_annotations` — the geometry adapter builds fragments with no
+    ///   `LinkTarget`, so there are no link rects to merge. Markdown links
+    ///   (`extract_links`) are unaffected: those come from the emitter, which
+    ///   does resolve `a:hlinkClick`.
+    ///
+    /// `image_mode` is deliberately *not* here. Pictures already emit nothing
+    /// on the markdown path this ships beside, so a placeholder-mode parse gets
+    /// exactly what the (benchmarked) emitter has always produced; promoting
+    /// that long-standing content gap to a hard error would reject the default
+    /// config.
+    #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+    fn native_pptx_ineligible_reason(&self) -> Option<&'static str> {
+        let c = &self.config;
+        if c.extract_form_fields {
+            Some("extract_form_fields")
+        } else if c.extract_structure_tree {
+            Some("extract_structure_tree")
+        } else if c.extract_vector_graphics {
+            Some("extract_vector_graphics")
+        } else if c.crop_box.is_some() {
+            Some("crop_box")
+        } else if c.skip_diagonal_text {
+            Some("skip_diagonal_text")
+        } else if c.effective_extract_images() {
+            Some("extract_images")
+        } else if c.extract_annotations {
+            Some("extract_annotations")
+        } else {
+            None
+        }
+    }
+
+    /// Run the native PPTX pipeline. Contract matches the DOCX sibling:
+    /// `Ok(None)` is an eligible fallback (text-sparse deck with OCR on), and
+    /// panics map to `Err` so the caller degrades to LibreOffice.
+    #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+    fn try_parse_pptx_native(&self, data: &[u8]) -> Result<Option<ParseResult>, LiteParseError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parse_pptx_native_inner(data)
+        }))
+        .unwrap_or_else(|_| {
+            Err(LiteParseError::Conversion(
+                "native pptx layout panicked".to_string(),
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+    fn parse_pptx_native_inner(&self, data: &[u8]) -> Result<Option<ParseResult>, LiteParseError> {
+        use crate::office::{pptx, pptx_layout};
+
+        // A deck embeds no fonts, so unlike the DOCX path there is nothing to
+        // register — but the registry must still be the *same* one the geometry
+        // pass measures with, since the converter re-measures each item.
+        let registry = liteparse_ooxml::render::fonts::FontRegistry::build(&[], &[])
+            .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
+        let geo = pptx_layout::slides_to_pages(data, &registry)?;
+
+        if self.config.ocr_enabled {
+            let total_chars: usize = geo
+                .pages
+                .iter()
+                .flat_map(|p| &p.text_items)
+                .map(|i| i.text.trim().len())
+                .sum();
+            if total_chars < Self::NATIVE_TEXT_SPARSE_CHARS {
+                return Ok(None);
+            }
+        }
+
+        let tagged = pptx::emit_with_sources(
+            data,
+            pptx::EmitOptions {
+                links: self.config.extract_links,
+                // Speaker notes are the single largest content difference
+                // between this path and the converted one — LibreOffice's PDF
+                // export renders 0.5% of them. They land in the slide's
+                // markdown and contribute no `TextItem`s, because the text
+                // genuinely is not on the slide (user, 2026-08-17).
+                notes: true,
+            },
+        )?;
+        let n_pages = geo.pages.len();
+        let page_blocks = split_pptx_blocks_by_page(&tagged, n_pages);
+        let outline = pptx_slide_outline(&page_blocks);
+        let all_blocks: Vec<crate::markdown_layout::Block> =
+            tagged.into_iter().map(|(b, _)| b).collect();
+
+        let complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>> =
+            if self.config.include_complexity {
+                geo.pages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let tables = page_blocks[i]
+                            .iter()
+                            .filter(|b| {
+                                matches!(
+                                    b,
+                                    crate::markdown_layout::Block::Table { .. }
+                                        | crate::markdown_layout::Block::MergedTable { .. }
+                                )
+                            })
+                            .count();
+                        // No image rects: the reader does not place pictures
+                        // yet. A slide's column count is 1 — PPTX has no
+                        // section columns, and shapes are not columns.
+                        Some(crate::ocr_merge::calculate_native_page_complexity(
+                            p,
+                            &[],
+                            tables,
+                            1,
+                        ))
+                    })
+                    .collect()
+            } else {
+                vec![None; n_pages]
+            };
+
+        // Page selection mirrors the PDF and DOCX paths: `target_pages` filters
+        // by 1-based number, then `max_pages` truncates. A slide *is* a page,
+        // so a page number is a slide number.
+        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> = geo
+            .pages
+            .into_iter()
+            .zip(page_blocks)
+            .zip(complexity)
+            .collect();
+        let mut page_filtered = false;
+        if let Some(targets) = self.resolve_target_pages()? {
+            let keep: std::collections::HashSet<usize> =
+                targets.iter().map(|p| *p as usize).collect();
+            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
+            page_filtered = true;
+        }
+        if selected.len() > self.config.max_pages {
+            selected.truncate(self.config.max_pages);
+            page_filtered = true;
+        }
+        let mut pages = Vec::with_capacity(selected.len());
+        let mut page_blocks = Vec::with_capacity(selected.len());
+        let mut page_stats = Vec::with_capacity(selected.len());
+        for ((p, b), s) in selected {
+            pages.push(p);
+            page_blocks.push(b);
+            page_stats.push(s);
+        }
+
+        Ok(Some(self.parse_from_native_blocks(
+            pages,
+            page_blocks,
+            (!page_filtered).then_some(all_blocks),
+            outline,
+            Vec::new(),
+            page_stats,
+        )))
     }
 
     /// Run the native DOCX pipeline. `Ok(None)` means "eligible fallback":
@@ -1230,6 +1432,76 @@ impl LiteParse {
     pub fn config(&self) -> &LiteParseConfig {
         &self.config
     }
+}
+
+/// Distribute a deck's blocks across slides.
+///
+/// Trivial next to the DOCX sibling, and for a structural reason: a DOCX block
+/// has to be *located* by the layout stage, because a paragraph's page is
+/// whatever pagination decided. A `BlockSource` already names its slide — the
+/// index is intrinsic, not recovered — so this is a bucket sort.
+///
+/// All three sources land on the same page. Notes and SmartArt contribute no
+/// `TextItem`s (their text is not on the slide, and a diagram's runs have no
+/// rectangle), but they *are* content of that slide and belong in its markdown.
+/// Concatenating the buckets reproduces the doc-level markdown exactly, since
+/// the emitter already walks slides in presentation order.
+#[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+fn split_pptx_blocks_by_page(
+    tagged: &[(
+        crate::markdown_layout::Block,
+        crate::office::pptx::BlockSource,
+    )],
+    n_pages: usize,
+) -> Vec<Vec<crate::markdown_layout::Block>> {
+    use crate::office::pptx::BlockSource;
+
+    let mut out = vec![Vec::new(); n_pages];
+    for (block, src) in tagged {
+        let idx = match src {
+            BlockSource::Slide(n) | BlockSource::Notes(n) | BlockSource::Diagram(n) => *n,
+        };
+        // A slide the geometry pass skipped still has a page, so this only
+        // guards against a deck whose emitter and layout disagree on slide
+        // count — which would be a bug, not a document property.
+        if let Some(bucket) = out.get_mut(idx) {
+            bucket.push(block.clone());
+        }
+    }
+    out
+}
+
+/// The document outline, one entry per slide title.
+///
+/// Every entry is level 1. PPTX has no heading hierarchy — `outlineLvl` is a
+/// DOCX concept and a body placeholder's indent level is a bullet depth, not a
+/// rank — so a flat outline is the honest shape, matching the emitter's own
+/// `TITLE_HEADING_LEVEL`.
+///
+/// `y_pdf` is `None`. The DOCX path fills it from the first text command inside
+/// an outline bracket; here the title's position is knowable but the outline is
+/// derived from blocks rather than from draw commands, and a slide title is
+/// found by its page, not by scrolling to an offset within it.
+#[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+fn pptx_slide_outline(page_blocks: &[Vec<crate::markdown_layout::Block>]) -> Vec<OutlineTarget> {
+    use crate::markdown_layout::Block;
+
+    let mut out = Vec::new();
+    for (idx, blocks) in page_blocks.iter().enumerate() {
+        for block in blocks {
+            if let Block::Heading { level, text } = block
+                && !text.trim().is_empty()
+            {
+                out.push(OutlineTarget {
+                    level: *level,
+                    title: text.clone(),
+                    page_index: idx as i32,
+                    y_pdf: None,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Distribute the emitted blocks across pages using the layout's block→page

@@ -56,6 +56,15 @@ pub struct EmitOptions {
 pub enum BlockSource {
     /// Body content of slide `n`, zero-based.
     Slide(usize),
+    /// SmartArt text on slide `n`, zero-based.
+    ///
+    /// Distinguished from [`BlockSource::Slide`] because the text is not in the
+    /// slide part at all — the `p:graphicFrame` holds only `dgm:relIds` and the
+    /// content lives in `ppt/diagrams/data*.xml`, laid out by the diagram's own
+    /// algorithm. The frame has a rectangle; the runs inside it do not, so a
+    /// consumer that needs per-run geometry has to know these blocks cannot
+    /// supply it.
+    Diagram(usize),
     /// Speaker notes attached to slide `n`, zero-based.
     Notes(usize),
 }
@@ -88,72 +97,116 @@ pub fn emit_with_sources(
 /// Both rungs are keyed by part *path* and rebuilt once per path, never once
 /// per slide. Every previous PPTX probe records this discipline because a deck
 /// with 60 slides sharing 3 layouts otherwise reparses those layouts 60 times.
-struct Deck {
+pub(crate) struct Deck {
     master_geo: HashMap<String, PlaceholderGeometry>,
     layout_geo: HashMap<String, PlaceholderGeometry>,
     master_text: HashMap<String, (PlaceholderTextStyles, DeckTextDefaults)>,
     layout_text: HashMap<String, PlaceholderTextStyles>,
     default_text_style: ListStyle,
+    /// The rung-7-only defaults a slide falls back to when its master has no
+    /// entry. Stored on the deck rather than built as a local in the walk so
+    /// that [`PreparedSlide`] can borrow it and every walk builds the *same*
+    /// `TextCascade` — see [`Deck::prepare`].
+    fallback_defaults: DeckTextDefaults,
+}
+
+/// One slide's shapes with their geometry composed and their text cascade
+/// assembled — everything a walk needs before it visits a shape.
+///
+/// This exists so that the markdown walk and the geometry walk cannot drift.
+/// They must agree on the composed rectangles and on the cascade, because a
+/// `TextItem` is only a faithful box for the markdown a reader sees if both
+/// came out of the same resolution. Two copies of this setup would compile,
+/// run, and disagree silently.
+pub(crate) struct PreparedSlide<'d> {
+    pub(crate) shapes: Vec<Shape>,
+    layout_text: Option<&'d PlaceholderTextStyles>,
+    master_text: Option<&'d PlaceholderTextStyles>,
+    deck_defaults: &'d DeckTextDefaults,
+}
+
+impl<'d> PreparedSlide<'d> {
+    /// The slide-level text cascade (rungs 4-7). Rung 2, the shape's own
+    /// `a:lstStyle`, is layered on per text body by the caller.
+    pub(crate) fn cascade(&self) -> TextCascade<'d> {
+        TextCascade {
+            shape: None,
+            layout: self.layout_text,
+            master: self.master_text,
+            deck: Some(self.deck_defaults),
+        }
+    }
 }
 
 impl Deck {
-    fn new(pkg: &PresentationPackage) -> Self {
+    pub(crate) fn new(pkg: &PresentationPackage) -> Self {
+        // Rung 7. A deck whose presentation.xml will not parse still
+        // resolves through the earlier rungs, so this degrades to empty
+        // rather than failing the deck.
+        let default_text_style =
+            pptx::parse_default_text_style(&pkg.presentation.xml).unwrap_or_default();
         Self {
             master_geo: HashMap::new(),
             layout_geo: HashMap::new(),
             master_text: HashMap::new(),
             layout_text: HashMap::new(),
-            // Rung 7. A deck whose presentation.xml will not parse still
-            // resolves through the earlier rungs, so this degrades to empty
-            // rather than failing the deck.
-            default_text_style: pptx::parse_default_text_style(&pkg.presentation.xml)
-                .unwrap_or_default(),
+            fallback_defaults: DeckTextDefaults {
+                master_styles: TextStyles::default(),
+                default_text_style: default_text_style.clone(),
+            },
+            default_text_style,
         }
+    }
+
+    /// Prime the cascades for this slide's layout/master, parse its shape
+    /// tree, and compose its geometry.
+    ///
+    /// `None` when the shape tree will not parse — fail-open, the same slide
+    /// is skipped by every walk.
+    pub(crate) fn prepare(&mut self, slide: &pptx::SlideParts) -> Option<PreparedSlide<'_>> {
+        self.prime(slide);
+
+        let mut shapes = pptx::parse_shape_tree(&slide.slide.xml).ok()?;
+        let layout_geo = slide
+            .layout
+            .as_ref()
+            .and_then(|l| self.layout_geo.get(&l.path));
+        // Cascade before composition: a placeholder has no rectangle to
+        // compose until it has inherited one.
+        pptx::apply_inherited_geometry(&mut shapes, layout_geo, MatchRule::Idx);
+        pptx::apply_slide_geometry(&mut shapes);
+
+        let master = slide
+            .master
+            .as_ref()
+            .and_then(|m| self.master_text.get(&m.path));
+        Some(PreparedSlide {
+            shapes,
+            layout_text: slide
+                .layout
+                .as_ref()
+                .and_then(|l| self.layout_text.get(&l.path)),
+            master_text: master.map(|(p, _)| p),
+            deck_defaults: master.map_or(&self.fallback_defaults, |(_, d)| d),
+        })
     }
 
     fn emit(&mut self, pkg: &PresentationPackage, opts: EmitOptions) -> Vec<(Block, BlockSource)> {
         let mut out = Vec::new();
 
         for (idx, slide) in pkg.slides.iter().enumerate() {
-            self.prime(slide);
-
-            let Ok(mut shapes) = pptx::parse_shape_tree(&slide.slide.xml) else {
+            let Some(prepared) = self.prepare(slide) else {
                 continue;
             };
-            let layout_geo = slide
-                .layout
-                .as_ref()
-                .and_then(|l| self.layout_geo.get(&l.path));
-            // Cascade before composition: a placeholder has no rectangle to
-            // compose until it has inherited one.
-            pptx::apply_inherited_geometry(&mut shapes, layout_geo, MatchRule::Idx);
-            pptx::apply_slide_geometry(&mut shapes);
-
-            let fallback = DeckTextDefaults {
-                master_styles: TextStyles::default(),
-                default_text_style: self.default_text_style.clone(),
-            };
-            let master = slide
-                .master
-                .as_ref()
-                .and_then(|m| self.master_text.get(&m.path));
-            let cascade = TextCascade {
-                shape: None,
-                layout: slide
-                    .layout
-                    .as_ref()
-                    .and_then(|l| self.layout_text.get(&l.path)),
-                master: master.map(|(p, _)| p),
-                deck: Some(master.map_or(&fallback, |(_, d)| d)),
-            };
+            let shapes = &prepared.shapes;
 
             let mut ctx = SlideCtx {
-                cascade,
+                cascade: prepared.cascade(),
                 part: &slide.slide,
                 package: &pkg.package,
                 opts,
             };
-            for shape in reading_order(&shapes) {
+            for shape in reading_order(shapes) {
                 emit_shape(shape, &mut ctx, &mut out, BlockSource::Slide(idx));
             }
 
@@ -237,7 +290,7 @@ struct SlideCtx<'a> {
 /// A group is one unit. Its children are emitted in their own reading order
 /// within it, so a two-column group does not interleave with unrelated shapes
 /// elsewhere on the slide.
-fn reading_order(shapes: &[Shape]) -> Vec<&Shape> {
+pub(crate) fn reading_order(shapes: &[Shape]) -> Vec<&Shape> {
     let mut v: Vec<&Shape> = shapes
         .iter()
         .filter(|s| !is_chrome(s.placeholder.as_ref()))
@@ -259,7 +312,7 @@ fn reading_order(shapes: &[Shape]) -> Vec<&Shape> {
     v
 }
 
-fn is_title(ph: Option<&Placeholder>) -> bool {
+pub(crate) fn is_title(ph: Option<&Placeholder>) -> bool {
     matches!(
         ph.map(|p| p.kind),
         Some(PlaceholderKind::Title | PlaceholderKind::CtrTitle)
@@ -573,6 +626,10 @@ fn emit_diagram(
     };
     let Ok(bodies) = pptx::parse_diagram_text(xml) else {
         return;
+    };
+    let src = match src {
+        BlockSource::Slide(n) | BlockSource::Diagram(n) => BlockSource::Diagram(n),
+        BlockSource::Notes(n) => BlockSource::Notes(n),
     };
     for body in &bodies {
         emit_text_body(body, None, ctx, out, src);

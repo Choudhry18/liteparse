@@ -13,6 +13,7 @@ pub mod measurer;
 pub mod page;
 pub mod paragraph;
 pub mod section;
+pub mod shape_body;
 pub mod table;
 
 use crate::render::dimension::Pt;

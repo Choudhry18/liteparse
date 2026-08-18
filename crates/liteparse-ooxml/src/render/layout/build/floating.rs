@@ -1146,68 +1146,17 @@ fn anchors_to_paragraph(anchor: &crate::model::AnchorProperties) -> bool {
     )
 }
 
-/// §20.1.10.60 `ST_TextAnchoringType`: where a shape's text body sits inside
-/// the box its insets leave.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BodyAnchor {
-    Top,
-    Center,
-    Bottom,
-}
-
-impl BodyAnchor {
-    /// Total over `TextAnchoringType`, with the §20.1.2.1.1 default for an
-    /// absent attribute.
-    fn resolve(anchor: Option<crate::model::TextAnchoringType>) -> Self {
-        use crate::model::TextAnchoringType as T;
-        match anchor {
-            None | Some(T::Top) => Self::Top,
-            Some(T::Center) => Self::Center,
-            Some(T::Bottom) => Self::Bottom,
-            // §20.1.10.60 `just`/`dist` stretch the *inter-line* spacing to
-            // fill the box, which this sub-layout has no line-level control
-            // over. Degrading to `Top` is the closest honest reading: a
-            // justified body also begins at the top, it simply is not
-            // stretched to reach the bottom.
-            Some(anchor @ (T::Justified | T::Distributed)) => {
-                log::warn!(
-                    "shape text: anchor={anchor:?} distributes lines to fill the body \
-                     (§20.1.10.60), which is not modelled — anchoring to the top instead"
-                );
-                Self::Top
-            }
-        }
-    }
-
-    /// How far below the top inset a `text_height`-tall body sits in a
-    /// `box_height`-tall box.
-    ///
-    /// The slack is floored at zero, so a body taller than its box anchors to
-    /// the top and overflows *downward* whatever the attribute says.
-    /// `@vertOverflow` defaults to `overflow` — Word draws overflowing shape
-    /// text rather than clipping it — and centring a body that does not fit
-    /// would put its first lines above the shape, over whatever sits there. So
-    /// the choice here is only ever about where the spare room goes. A body
-    /// that asks for `clip` is trimmed afterwards, in `overflow_keeps`, not by
-    /// moving it.
-    fn offset(self, box_height: Pt, text_height: Pt) -> Pt {
-        let slack = (box_height - text_height).max(Pt::ZERO);
-        match self {
-            Self::Top => Pt::ZERO,
-            Self::Center => slack * 0.5,
-            Self::Bottom => slack,
-        }
-    }
-}
-
 /// §17.17.1 / §20.1.2.1.1: lay out a shape's `wps:txbx/w:txbxContent` into
 /// shape-local draw commands. Output is in shape-local Pt with origin at the
 /// shape's top-left; the stacker shifts by `(fs.x, shape_y)` when emitting,
 /// so the text appears inside the shape's bounding box on top of the fill.
 ///
-/// Body insets (§20.1.2.1.1 lIns/tIns/rIns/bIns) deflate the box the body is
-/// laid out in, and §20.1.10.60 `anchor` places it within that box. The
-/// function also runs a fresh `BuildState` for list/footnote counters so the
+/// This is the DOCX-shaped **front** half: it turns `w:txbxContent` into
+/// `LayoutBlock`s and resolves the `wps:style/fontRef` defaults. The placement
+/// half — insets, anchor, `@vertOverflow` — is format-neutral DrawingML and
+/// lives in [`crate::render::layout::shape_body`], shared with the PPTX path.
+///
+/// The function runs a fresh `BuildState` for list/footnote counters so the
 /// shape's interior doesn't pollute the outer document; `field_ctx` is copied
 /// so PAGE/NUMPAGES inside a shape's text body still resolve against the host
 /// page.
@@ -1221,23 +1170,11 @@ pub(super) fn build_shape_text_commands(
         return Vec::new();
     }
 
-    // §20.1.2.1.1 spec defaults: 91440 EMU horizontal, 45720 EMU vertical.
-    let default_lr = Pt::new(91440.0 / 12700.0); // ≈ 7.2pt
-    let default_tb = Pt::new(45720.0 / 12700.0); // ≈ 3.6pt
-    let (left_inset, top_inset, right_inset, bot_inset) =
-        wsp.body_pr
-            .as_ref()
-            .map_or((default_lr, default_tb, default_lr, default_tb), |bp| {
-                (
-                    bp.left_inset.map_or(default_lr, Pt::from),
-                    bp.top_inset.map_or(default_tb, Pt::from),
-                    bp.right_inset.map_or(default_lr, Pt::from),
-                    bp.bottom_inset.map_or(default_tb, Pt::from),
-                )
-            });
-
-    let content_width = (extent.width - left_inset - right_inset).max(Pt::ZERO);
-    if content_width <= Pt::ZERO {
+    // Checked up front so a body with no room to wrap in costs nothing — the
+    // shared placement half checks it again, which is cheap and pure, and
+    // keeps the bail *before* the fontRef/theme work below rather than after.
+    let insets = crate::render::layout::shape_body::BodyInsets::resolve(wsp.body_pr.as_ref());
+    if insets.content_width(extent) <= Pt::ZERO {
         return Vec::new();
     }
 
@@ -1303,80 +1240,13 @@ pub(super) fn build_shape_text_commands(
     // height, which is what an empty paragraph and an image-only line fall back
     // to — otherwise a shrunk body would keep full-size blank lines.
     let line_height = auto_fit.scale_font(super::default_line_height(ctx));
-    // Shape text is laid out at *build* time, before the shape is placed on a
-    // page, so a §20.4.3.1 `inside`/`outside` float nested inside a shape's
-    // text box has no parity to resolve against and takes the odd-page
-    // reading. The same structural limit as the table-cell path in
-    // `layout_cell`, and rarer still.
-    let result = crate::render::layout::section::stack_blocks(
+
+    crate::render::layout::shape_body::layout_shape_body(
         &hf.blocks,
-        content_width,
+        extent,
+        wsp.body_pr.as_ref(),
         line_height,
-        None,
-        PageParity::Odd,
-    );
-
-    // §20.1.10.60: `bIns` closes off the bottom of the box the body sits in,
-    // and `anchor` decides where in that box it sits. Both were previously
-    // dropped, which pinned every body to the top.
-    let content_height = (extent.height - top_inset - bot_inset).max(Pt::ZERO);
-    let anchor = BodyAnchor::resolve(wsp.body_pr.as_ref().and_then(|bp| bp.anchor));
-    let body_top = top_inset + anchor.offset(content_height, result.height);
-
-    // `@vertOverflow` decides what happens to the part of the body that does
-    // not fit. `Overflow` — the spec default, and the only value the corpus
-    // asks for — keeps everything, so the common path is untouched.
-    let overflow = wsp
-        .body_pr
-        .as_ref()
-        .and_then(|bp| bp.vert_overflow)
-        .unwrap_or_default();
-    let box_bottom = top_inset + content_height;
-
-    let mut commands = Vec::with_capacity(result.commands.len());
-    for mut cmd in result.commands {
-        cmd.shift(left_inset, body_top);
-        if !overflow_keeps(overflow, &cmd, box_bottom) {
-            continue;
-        }
-        commands.push(cmd);
-    }
-    commands
-}
-
-/// Whether `@vertOverflow` keeps `cmd`, given the bottom of the body's box.
-///
-/// Total over [`TextVertOverflow`] with no catch-all, so a new value of the
-/// attribute has to state its own behaviour here.
-///
-/// **This drops whole commands, which is a line-granular approximation of what
-/// Word does.** Word clips at the pixel, so a line straddling the box edge
-/// shows its top sliver; here it disappears. Real clipping needs a canvas clip
-/// that survives into paint, and draw commands are flattened into one flat
-/// per-page list with no scoping — so it would mean a new `DrawCommand`
-/// wrapper variant and an arm in every consumer. Dropping is the safe
-/// direction (`clip`'s contract is that nothing paints outside the box), and
-/// no corpus document asks for `clip` at all — 4 explicit `overflow`, 10
-/// `bodyPr` with the attribute absent, zero `clip` or `ellipsis` — so this is
-/// worth revisiting only once a real document needs the sliver.
-fn overflow_keeps(
-    overflow: crate::model::TextVertOverflow,
-    cmd: &crate::render::layout::draw_command::DrawCommand,
-    box_bottom: Pt,
-) -> bool {
-    use crate::model::TextVertOverflow;
-
-    match overflow {
-        TextVertOverflow::Overflow => true,
-        // `ellipsis` is `clip` plus an indicator on the last visible line.
-        // Choosing that line and refitting it around the ellipsis glyph is a
-        // decision this sub-layout does not make, so the indicator is dropped
-        // and the clipping is honoured — the same text as `clip`, which is far
-        // closer to Word than not clipping at all.
-        TextVertOverflow::Clip | TextVertOverflow::Ellipsis => cmd
-            .vertical_span()
-            .is_none_or(|(_, bottom)| bottom <= box_bottom),
-    }
+    )
 }
 
 #[cfg(test)]

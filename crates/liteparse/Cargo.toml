@@ -22,6 +22,10 @@ required-features = ["docx-native"]
 name = "pptx_blocks"
 required-features = ["pptx-native"]
 
+[[example]]
+name = "pptx_layout_probe"
+required-features = ["pptx-native"]
+
 [features]
 default = ["tesseract", "docx-native", "pptx-native"]
 oar-ocr = ["dep:oar-ocr"]

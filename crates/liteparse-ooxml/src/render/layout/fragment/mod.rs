@@ -354,6 +354,50 @@ pub fn font_props_from_run(
     }
 }
 
+/// Measure one run of text into word-level [`Fragment::Text`]s and append them
+/// to `fragments`.
+///
+/// The format-neutral entry to the fragment builder. The DOCX path reaches the
+/// same code through `collect_fragments`, which additionally resolves
+/// highlight, run borders, fields, footnote marks and the §17.3.2 run cascade —
+/// none of which a DrawingML run has. What both paths must share is the part
+/// below that: **where the words break** and **how they are measured**. A
+/// second word-splitter would wrap the same sentence differently in a PPTX text
+/// box than in a DOCX one, and no test would catch it because neither output is
+/// wrong on its own.
+///
+/// Control characters other than tab are stripped, and emoji clusters are
+/// classified and routed to the raster path, exactly as for DOCX.
+pub fn emit_run_fragments(
+    text: &str,
+    font: &FontProps,
+    color: RgbColor,
+    hyperlink: Option<&LinkTarget>,
+    measurer: &crate::render::layout::measurer::TextMeasurer<'_>,
+    fragments: &mut Vec<Fragment>,
+) {
+    let style = text::TextRunStyle {
+        color,
+        // A DrawingML run carries no §17.3.2.32 shading, no §17.3.2.4 run
+        // border, and no baseline shift that this path resolves — `a:rPr`
+        // expresses super/subscript as `@baseline`, which the caller applies to
+        // the size rather than to the fragment.
+        shading: None,
+        border: None,
+        baseline_offset: Pt::ZERO,
+    };
+    let measure = |t: &str, f: &FontProps| measurer.measure(t, f);
+    text::emit_text_fragments(
+        text,
+        font,
+        &style,
+        hyperlink,
+        &measure,
+        Some(measurer),
+        fragments,
+    );
+}
+
 /// Convert a number to lowercase Roman numerals.
 pub fn to_roman_lower(mut n: u32) -> String {
     const VALS: [(u32, &str); 13] = [
