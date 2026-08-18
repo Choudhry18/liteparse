@@ -28,7 +28,7 @@ pub use shapes::{
 };
 pub use text::{
     AutoNumberScheme, Bullet, ListStyle, Spacing, TextBody, TextParagraph, TextParagraphProperties,
-    TextStyles, parse_default_text_style, parse_text_body, parse_text_styles,
+    TextStyles, parse_default_text_style, parse_diagram_text, parse_text_body, parse_text_styles,
 };
 pub use textcascade::{
     DeckTextDefaults, PlaceholderTextStyles, ResolvedTextStyle, SizeSource, TextCascade,

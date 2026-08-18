@@ -18,8 +18,12 @@ path = "src/main.rs"
 name = "docx_blocks"
 required-features = ["docx-native"]
 
+[[example]]
+name = "pptx_blocks"
+required-features = ["pptx-native"]
+
 [features]
-default = ["tesseract", "docx-native"]
+default = ["tesseract", "docx-native", "pptx-native"]
 oar-ocr = ["dep:oar-ocr"]
 oar-ocr-auto-download = ["oar-ocr", "oar-ocr/auto-download"]
 oar-ocr-cuda = ["oar-ocr", "oar-ocr/cuda"]
@@ -29,8 +33,13 @@ oar-ocr-coreml = ["oar-ocr", "oar-ocr/coreml"]
 oar-ocr-webgpu = ["oar-ocr", "oar-ocr/webgpu"]
 oar-ocr-openvino = ["oar-ocr", "oar-ocr/openvino"]
 tesseract = ["dep:tesseract-rs"]
-# Native DOCX structure reading (no LibreOffice, no projection).
-docx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster"]
+# Native office structure reading (no LibreOffice, no projection).
+# `office-native` is an internal marker enabled by every native-office reader, so code shared
+# between them (office::inline, the `apply_link` re-export) has one cfg to
+# name instead of an `any(...)` list that grows with each format.
+office-native = []
+docx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
+pptx-native = ["dep:liteparse-ooxml", "office-native"]
 
 [dependencies]
 blake3 = "1"

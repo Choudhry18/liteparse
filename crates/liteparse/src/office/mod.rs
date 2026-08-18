@@ -14,6 +14,10 @@
 pub mod docx;
 #[cfg(feature = "docx-native")]
 pub mod docx_layout;
+#[cfg(feature = "office-native")]
+pub(crate) mod inline;
+#[cfg(feature = "pptx-native")]
+pub mod pptx;
 
 /// The input's bytes when it is a `.docx` the native path should try, `None`
 /// otherwise. Path inputs are matched on extension only (`.doc`/`.docm`/

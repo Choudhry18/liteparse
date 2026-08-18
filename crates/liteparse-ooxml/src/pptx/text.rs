@@ -330,6 +330,57 @@ pub fn parse_text_styles(data: &[u8]) -> Result<TextStyles> {
         .unwrap_or_default())
 }
 
+/// Parse the text of a **whole SmartArt data part** (`ppt/diagrams/data*.xml`).
+///
+/// SmartArt is the one payload whose content is not in the slide at all: the
+/// `p:graphicFrame` carries only `dgm:relIds`, and `@r:dm` points here. A
+/// shape-tree walk therefore cannot see any of it — on the corpus that is
+/// **53 parts, all 53 carrying text, 12,102 characters**, which made it the
+/// largest single content gap for a native reader.
+///
+/// Returns one [`TextBody`] per `dgm:pt` that has one, in document order.
+/// Nothing is filtered: the corpus says every text-bearing point is untyped
+/// (334 of 334), so the `doc` and `pres` presentation nodes contribute nothing
+/// and there is no duplication to guard against — 2 repeated strings across
+/// the whole corpus, both genuine.
+///
+/// The caller resolves the relationship, because relationship resolution needs
+/// the owning [`Part`](crate::pptx::Part) and this layer only sees bytes.
+pub fn parse_diagram_text(data: &[u8]) -> Result<Vec<TextBody>> {
+    let xml: DiagramDataXml = serde_xml::from_xml(data)?;
+    Ok(xml
+        .pt_lst
+        .map(|l| l.points)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|pt| pt.text)
+        .map(TextBodyXml::into_model)
+        .filter(|b| !b.is_empty())
+        .collect())
+}
+
+/// §21.4.2.11 `dgm:dataModel`.
+#[derive(Debug, Deserialize, Default)]
+struct DiagramDataXml {
+    #[serde(rename = "ptLst", default)]
+    pt_lst: Option<DiagramPtLstXml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DiagramPtLstXml {
+    #[serde(rename = "pt", default)]
+    points: Vec<DiagramPtXml>,
+}
+
+/// §21.4.2.25 `dgm:pt`. `dgm:t` is an ordinary DrawingML text body, so the
+/// same lowering serves it — the grammar is shared even though the namespace
+/// is not.
+#[derive(Debug, Deserialize, Default)]
+struct DiagramPtXml {
+    #[serde(rename = "t", default)]
+    text: Option<TextBodyXml>,
+}
+
 /// Parse `p:defaultTextStyle` out of a **whole `ppt/presentation.xml` part**.
 ///
 /// The outermost rung, and the only one a non-placeholder shape can reach:

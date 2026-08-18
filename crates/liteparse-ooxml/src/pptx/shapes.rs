@@ -208,7 +208,17 @@ pub struct GraphicFrame {
 pub enum GraphicFramePayload {
     /// A DrawingML table (`a:tbl`) — 36 of 102 corpus frames.
     Table(Box<Table>),
-    /// SmartArt (53), embedded OLE (11) or a chart (2).
+    /// SmartArt (53 corpus frames), which does not hold its own content: the
+    /// frame carries only `dgm:relIds`, and the text lives in the data part
+    /// that `@r:dm` points at (`ppt/diagrams/data*.xml`). Resolving the
+    /// relationship needs the owning [`Part`](crate::pptx::Part), which this
+    /// layer does not have, so the id is surfaced for the caller to resolve.
+    ///
+    /// Worth its own variant rather than `Unsupported`: on the corpus all 53
+    /// parts carry text, 12,102 characters of it, and a shape walk alone can
+    /// never see any of it.
+    Diagram { data_rel: String },
+    /// Embedded OLE (11) or a chart (2) — payloads we genuinely do not read.
     ///
     /// Kept as a typed variant rather than dropped so that a caller can emit a
     /// placeholder and a probe can *count* what is being lost. Silently
@@ -711,6 +721,17 @@ struct GraphicDataXml {
     uri: String,
     #[serde(rename = "tbl", default)]
     tbl: Option<TblXml>,
+    #[serde(rename = "relIds", default)]
+    rel_ids: Option<DgmRelIdsXml>,
+}
+
+/// §21.4.2.19 `dgm:relIds`. Four relationship ids; `@r:dm` is the data model,
+/// the only one carrying text (`@r:lo` layout, `@r:qs` quick style,
+/// `@r:cs` colours are all presentation).
+#[derive(Debug, Deserialize, Default)]
+struct DgmRelIdsXml {
+    #[serde(rename = "@dm", default)]
+    dm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -917,9 +938,10 @@ fn lower_graphic_frame(gf: GraphicFrameXml) -> Shape {
         .unwrap_or_default()
         .graphic_data
         .unwrap_or_default();
-    let payload = match data.tbl {
-        Some(tbl) => GraphicFramePayload::Table(Box::new(lower_table(tbl))),
-        None => GraphicFramePayload::Unsupported { uri: data.uri },
+    let payload = match (data.tbl, data.rel_ids.and_then(|r| r.dm)) {
+        (Some(tbl), _) => GraphicFramePayload::Table(Box::new(lower_table(tbl))),
+        (None, Some(dm)) if !dm.is_empty() => GraphicFramePayload::Diagram { data_rel: dm },
+        _ => GraphicFramePayload::Unsupported { uri: data.uri },
     };
     Shape {
         non_visual: doc_properties(gf.nv_graphic_frame_pr.map(|nv| nv.cnv_pr)),
