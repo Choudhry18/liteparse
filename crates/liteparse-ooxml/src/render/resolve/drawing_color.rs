@@ -28,7 +28,7 @@
 //! Alpha transforms act on the alpha channel only (§20.1.2.3.1/2/3).
 
 use crate::model::dimension::{Dimension, SixtieThousandthDeg, ThousandthPercent};
-use crate::model::{ColorTransform, DrawingColor, SchemeColorVal, Theme};
+use crate::model::{ColorMap, ColorTransform, DrawingColor, SchemeColorVal, Theme};
 
 /// RGBA with per-channel `f32` in `[0, 1]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,6 +90,9 @@ pub struct DrawingColorContext<'a> {
     /// style-matrix fill referenced via `<a:fillRef>`. `None` outside that
     /// context (body `phClr` has no concrete color and falls back to black).
     pub placeholder: Option<Rgba>,
+    /// §19.3.1.6: the slide's effective `p:clrMap`. `None` for Word, which has
+    /// no such element and falls back to `bg_tx_convention`'s guess.
+    pub color_map: Option<ColorMap>,
 }
 
 impl<'a> DrawingColorContext<'a> {
@@ -98,6 +101,15 @@ impl<'a> DrawingColorContext<'a> {
             theme,
             bg_tx_convention: BgTxConvention::LightBackground,
             placeholder: None,
+            color_map: None,
+        }
+    }
+
+    /// Return a copy of this context with a PresentationML colour map installed.
+    pub fn with_color_map(self, map: Option<ColorMap>) -> Self {
+        Self {
+            color_map: map,
+            ..self
         }
     }
 
@@ -148,6 +160,15 @@ fn resolve_scheme(name: SchemeColorVal, ctx: &DrawingColorContext<'_>) -> Rgba {
     let theme = match ctx.theme {
         Some(t) => t,
         None => return Rgba::BLACK,
+    };
+    // §19.3.1.6: when the host *states* the mapping, it replaces the guess.
+    // `ColorMap::map` passes `dk1`/`lt1`/`dk2`/`lt2` and `phClr` through, so
+    // the arms below still see every name they saw before — a mapped `tx1`
+    // simply arrives as the `Dk1` (or `Lt1`) it resolves to, and the
+    // `BgTxConvention` arms become unreachable rather than wrong.
+    let name = match ctx.color_map {
+        Some(map) => map.map(name),
+        None => name,
     };
     let scheme = &theme.color_scheme;
     let rgb = match (name, ctx.bg_tx_convention) {
@@ -444,6 +465,7 @@ mod tests {
             theme: None,
             bg_tx_convention: BgTxConvention::LightBackground,
             placeholder: None,
+            color_map: None,
         }
     }
 
@@ -452,6 +474,7 @@ mod tests {
             theme: Some(theme),
             bg_tx_convention: BgTxConvention::LightBackground,
             placeholder: None,
+            color_map: None,
         }
     }
 
@@ -525,6 +548,39 @@ mod tests {
         assert_eq!(r.to_rgb24(), 0xFFFFFF);
     }
 
+    /// A stated `p:clrMap` beats the inferred Word convention. Without this,
+    /// a dark-backgrounded master's `tx1` title resolves to the theme's *dark*
+    /// colour and paints black on black.
+    #[test]
+    fn color_map_overrides_the_bg_tx_convention() {
+        let theme = sample_theme();
+        let ctx = DrawingColorContext::new(Some(&theme)).with_color_map(Some(ColorMap {
+            tx1: SchemeColorVal::Lt1,
+            bg1: SchemeColorVal::Dk1,
+            ..ColorMap::default()
+        }));
+        let c = resolve_drawing_color(
+            &DrawingColor::Scheme {
+                name: SchemeColorVal::Tx1,
+                transforms: Vec::new(),
+            },
+            &ctx,
+        );
+        assert_eq!(c.to_rgb24(), theme.color_scheme.light1);
+    }
+
+    /// The map must not touch the theme-side names — §19.3.1.6 has no slot for
+    /// them, and rewriting one would break every `dk1` in the corpus.
+    #[test]
+    fn color_map_passes_theme_side_names_through() {
+        let map = ColorMap {
+            tx1: SchemeColorVal::Lt1,
+            ..ColorMap::default()
+        };
+        assert_eq!(map.map(SchemeColorVal::Dk1), SchemeColorVal::Dk1);
+        assert_eq!(map.map(SchemeColorVal::PhClr), SchemeColorVal::PhClr);
+    }
+
     #[test]
     fn scheme_tx1_maps_to_lt1_on_dark_bg() {
         let theme = sample_theme();
@@ -532,6 +588,7 @@ mod tests {
             theme: Some(&theme),
             bg_tx_convention: BgTxConvention::DarkBackground,
             placeholder: None,
+            color_map: None,
         };
         let c = DrawingColor::Scheme {
             name: SchemeColorVal::Tx1,

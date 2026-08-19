@@ -37,11 +37,13 @@ use serde::Deserialize;
 
 use crate::model::dimension::{Dimension, Emu, HundredthPoints, ThousandthPercent};
 use crate::model::{
-    Alignment, BodyProperties, BreakKind, Color, FontSlot, Hyperlink, HyperlinkTarget, Inline,
-    RelId, RunElement, RunProperties, StrikeStyle, TextRun, ThemeFontRef, UnderlineStyle,
+    Alignment, BodyProperties, BreakKind, FontSlot, Hyperlink, HyperlinkTarget, Inline, RelId,
+    RunElement, RunProperties, StrikeStyle, TextRun, ThemeFontRef, UnderlineStyle,
 };
 
 use crate::docx::error::Result;
+use crate::docx::parse::drawing::schema::color::to_drawing_color;
+use crate::docx::parse::drawing::schema::fill::SolidFillXml;
 use crate::docx::parse::drawing::schema::shape::BodyPrXml;
 use crate::docx::parse::serde_xml;
 
@@ -944,6 +946,10 @@ struct TextCharPropertiesXml {
         deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
     )]
     baseline: Option<Dimension<ThousandthPercent>>,
+    /// §21.1.2.3.9. The DOCX schema's `solidFill` is the same §20.1.8.54
+    /// element with the same `EG_ColorChoice` child, so it is shared rather
+    /// than re-declared — the srgb-only local copy this replaces silently
+    /// dropped the 3,437 corpus runs whose colour is a scheme reference.
     #[serde(rename = "solidFill", default)]
     solid_fill: Option<SolidFillXml>,
     #[serde(rename = "latin", default)]
@@ -964,7 +970,12 @@ impl TextCharPropertiesXml {
             italic: self.i,
             underline: self.u.map(Into::into),
             strike: self.strike.map(Into::into),
-            color: self.solid_fill.and_then(SolidFillXml::into_color),
+            // Unresolved on purpose: a scheme reference needs the theme *and*
+            // the master's `p:clrMap`, which live at the slide, not here.
+            drawing_color: self
+                .solid_fill
+                .and_then(|f| f.color)
+                .and_then(to_drawing_color),
             // `@spc` is hundredths of a point; `w:spacing` is twips.
             spacing: self.spc.map(|s| Dimension::new((s.raw() * 20) / 100)),
             kerning: self.kern.map(|k| k.to_half_points()),
@@ -1090,31 +1101,6 @@ impl TextFontXml {
             _ => FontSlot::from_name(typeface),
         }
     }
-}
-
-/// A `solidFill` carrying either a literal sRGB value or a theme colour.
-///
-/// Theme colours are **not** resolved here: `a:schemeClr` needs the theme's
-/// colour map plus any `phClr` substitution, which the cascade supplies.
-/// Returning `None` for them means "inherit", which is the safe reading —
-/// inventing black would be the silent corruption ATTRIBUTION.md warns about.
-#[derive(Debug, Deserialize, Default)]
-struct SolidFillXml {
-    #[serde(rename = "srgbClr", default)]
-    srgb_clr: Option<SrgbClrXml>,
-}
-
-impl SolidFillXml {
-    fn into_color(self) -> Option<Color> {
-        let raw = self.srgb_clr?.val?;
-        u32::from_str_radix(raw.trim(), 16).ok().map(Color::Rgb)
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct SrgbClrXml {
-    #[serde(rename = "@val", default)]
-    val: Option<String>,
 }
 
 /// §20.1.10.82 ST_TextUnderlineType — a large enum of which the corpus uses a
@@ -1400,14 +1386,34 @@ mod tests {
         assert_eq!(b.paragraphs[0].text(), "one  two");
     }
 
-    /// A theme colour needs the colour map and any `phClr` substitution, so
-    /// it stays unresolved. Inventing black here would be silent corruption.
+    /// A theme colour is *carried*, not resolved: `schemeClr` needs the theme
+    /// and the master's `p:clrMap`, neither of which is a property of the run.
+    /// It used to be dropped here, which read downstream as "no colour
+    /// declared" and painted 3,437 corpus runs black.
     #[test]
-    fn scheme_color_stays_unresolved_rather_than_defaulting_to_black() {
+    fn scheme_color_is_carried_unresolved() {
         let b = body(
             r#"<a:p><a:r><a:rPr><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:rPr><a:t>x</a:t></a:r></a:p>"#,
         );
-        assert_eq!(run_props(&b, 0, 0).color, None);
+        assert!(matches!(
+            run_props(&b, 0, 0).drawing_color,
+            Some(crate::model::DrawingColor::Scheme {
+                name: crate::model::SchemeColorVal::Tx1,
+                ..
+            })
+        ));
+    }
+
+    /// The transforms are the reason a `Color` could not carry this: a tinted
+    /// scheme reference is a colour *expression*, not a value.
+    #[test]
+    fn scheme_color_keeps_its_transforms() {
+        let b = body(
+            r#"<a:p><a:r><a:rPr><a:solidFill><a:schemeClr val="accent1"><a:lumMod val="65000"/></a:schemeClr></a:solidFill></a:rPr><a:t>x</a:t></a:r></a:p>"#,
+        );
+        let props = run_props(&b, 0, 0);
+        let color = props.drawing_color.as_ref().expect("colour");
+        assert_eq!(color.transforms().len(), 1);
     }
 
     #[test]
@@ -1415,7 +1421,20 @@ mod tests {
         let b = body(
             r#"<a:p><a:r><a:rPr><a:solidFill><a:srgbClr val="FF6600"/></a:solidFill></a:rPr><a:t>x</a:t></a:r></a:p>"#,
         );
-        assert_eq!(run_props(&b, 0, 0).color, Some(Color::Rgb(0xFF6600)));
+        assert!(matches!(
+            run_props(&b, 0, 0).drawing_color,
+            Some(crate::model::DrawingColor::Srgb { rgb: 0xFF6600, .. })
+        ));
+    }
+
+    /// `w:rPr`'s colour field stays Word's. Setting both would give the
+    /// cascade two sources of truth for one property.
+    #[test]
+    fn drawingml_does_not_populate_the_word_color_field() {
+        let b = body(
+            r#"<a:p><a:r><a:rPr><a:solidFill><a:srgbClr val="FF6600"/></a:solidFill></a:rPr><a:t>x</a:t></a:r></a:p>"#,
+        );
+        assert_eq!(run_props(&b, 0, 0).color, None);
     }
 
     /// `cap="none"` is an explicit off, which the cascade must be able to

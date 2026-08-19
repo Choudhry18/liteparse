@@ -3,6 +3,7 @@
 use crate::model::dimension::{Dimension, HalfPoints, Twips};
 
 use super::color::Color;
+use super::drawing_color::DrawingColor;
 use super::formatting::{Border, Shading};
 
 /// Run properties — only fields explicitly present in the XML are `Some`.
@@ -15,6 +16,18 @@ pub struct RunProperties {
     pub underline: Option<UnderlineStyle>,
     pub strike: Option<StrikeStyle>,
     pub color: Option<Color>,
+    /// §21.1.2.3.9 `a:rPr/a:solidFill` — DrawingML's text colour, which
+    /// `color` cannot express: [`Color`] is `Rgb | Auto`, while a run in a
+    /// slide is most often a *scheme* reference carrying transforms
+    /// (`<a:schemeClr val="tx1"><a:lumMod val="65000"/></a:schemeClr>`).
+    /// Resolving it needs the theme and the master's colour map, neither of
+    /// which the parser has, so the reference is carried unresolved and the
+    /// consumer resolves it — see `office::pptx_layout::collect_run_fragments`.
+    ///
+    /// Word never sets this; DrawingML never sets `color`. They are separate
+    /// fields rather than one because both must survive the same cascade and
+    /// neither can be lowered into the other without losing information.
+    pub drawing_color: Option<DrawingColor>,
     pub highlight: Option<HighlightColor>,
     pub shading: Option<Shading>,
     pub vertical_align: Option<VerticalAlign>,

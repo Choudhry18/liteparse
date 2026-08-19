@@ -169,6 +169,86 @@ pub enum SchemeColorVal {
     Lt2,
 }
 
+// ── CT_ColorMapping (§19.3.1.6) ─────────────────────────────────────────────
+
+/// §19.3.1.6 `p:clrMap` — a slide master's mapping from the *host* slot names
+/// (`bg1`/`tx1`/…) onto the theme's own slots (`dk1`/`lt1`/…).
+///
+/// This is the PresentationML answer to the question
+/// [`crate::render::resolve::drawing_color::BgTxConvention`] answers for Word:
+/// what does `<a:schemeClr val="tx1"/>` actually point at? Word infers it from
+/// an assumed background brightness (§17.3.1.31); PowerPoint states it, per
+/// master, and a master is free to state the swapped form — which is how a
+/// dark-backgrounded design keeps `tx1` meaning "readable text".
+///
+/// On the 45-deck corpus, 30 of 70 slide masters declare a non-identity map
+/// (all of them swapping `bg2`/`tx2`; exactly one also swaps `bg1`/`tx1`), so
+/// inferring instead of reading is a wrong colour on 22 of 45 decks, not a
+/// missing one — the failure mode that renders as confidently-legible text in
+/// the wrong hue rather than as an obvious gap.
+///
+/// The four theme-side names (`dk1`/`lt1`/`dk2`/`lt2`) are *not* mapped: they
+/// already name the scheme directly and §19.3.1.6 has no slot for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorMap {
+    pub bg1: SchemeColorVal,
+    pub tx1: SchemeColorVal,
+    pub bg2: SchemeColorVal,
+    pub tx2: SchemeColorVal,
+    pub accent1: SchemeColorVal,
+    pub accent2: SchemeColorVal,
+    pub accent3: SchemeColorVal,
+    pub accent4: SchemeColorVal,
+    pub accent5: SchemeColorVal,
+    pub accent6: SchemeColorVal,
+    pub hlink: SchemeColorVal,
+    pub folink: SchemeColorVal,
+}
+
+impl Default for ColorMap {
+    /// The mapping a master gets when it declares no `p:clrMap`, which is also
+    /// the one 40 of the corpus's 70 masters declare explicitly.
+    fn default() -> Self {
+        Self {
+            bg1: SchemeColorVal::Lt1,
+            tx1: SchemeColorVal::Dk1,
+            bg2: SchemeColorVal::Lt2,
+            tx2: SchemeColorVal::Dk2,
+            accent1: SchemeColorVal::Accent1,
+            accent2: SchemeColorVal::Accent2,
+            accent3: SchemeColorVal::Accent3,
+            accent4: SchemeColorVal::Accent4,
+            accent5: SchemeColorVal::Accent5,
+            accent6: SchemeColorVal::Accent6,
+            hlink: SchemeColorVal::Hlink,
+            folink: SchemeColorVal::FolHlink,
+        }
+    }
+}
+
+impl ColorMap {
+    /// Apply the mapping. Names with no slot in `p:clrMap` — the theme-side
+    /// four and `phClr` — pass through untouched, which is what makes this
+    /// safe to apply unconditionally at the head of scheme resolution.
+    pub fn map(self, name: SchemeColorVal) -> SchemeColorVal {
+        match name {
+            SchemeColorVal::Bg1 => self.bg1,
+            SchemeColorVal::Tx1 => self.tx1,
+            SchemeColorVal::Bg2 => self.bg2,
+            SchemeColorVal::Tx2 => self.tx2,
+            SchemeColorVal::Accent1 => self.accent1,
+            SchemeColorVal::Accent2 => self.accent2,
+            SchemeColorVal::Accent3 => self.accent3,
+            SchemeColorVal::Accent4 => self.accent4,
+            SchemeColorVal::Accent5 => self.accent5,
+            SchemeColorVal::Accent6 => self.accent6,
+            SchemeColorVal::Hlink => self.hlink,
+            SchemeColorVal::FolHlink => self.folink,
+            other => other,
+        }
+    }
+}
+
 // ── ST_SystemColorVal (§20.1.10.57) ─────────────────────────────────────────
 
 /// §20.1.10.57 ST_SystemColorVal — OS-defined color name.

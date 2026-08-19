@@ -12,7 +12,7 @@
 //! The design below follows that census throughout; where a rule looks
 //! arbitrary it is usually a corpus measurement, and the comment says which.
 
-use liteparse_ooxml::model::{Inline, RunElement, RunProperties, StrikeStyle};
+use liteparse_ooxml::model::{ColorMap, Inline, RunElement, RunProperties, StrikeStyle};
 use liteparse_ooxml::pptx::{
     self, AutoNumberScheme, Background, BackgroundSource, Bullet, DeckTextDefaults,
     GraphicFramePayload, ListStyle, MatchRule, Placeholder, PlaceholderGeometry, PlaceholderKind,
@@ -111,6 +111,11 @@ pub struct Deck {
     /// is not the same as "no background": see [`pptx::resolve_background`].
     master_bg: HashMap<String, Option<Background>>,
     layout_bg: HashMap<String, Option<Background>>,
+    /// §19.3.1.6 `p:clrMap` per master and §19.3.1.7 `p:clrMapOvr` per layout,
+    /// cached beside the background for the same reason. `None` means the part
+    /// states no map of its own.
+    master_clr_map: HashMap<String, Option<ColorMap>>,
+    layout_clr_map: HashMap<String, Option<ColorMap>>,
     default_text_style: ListStyle,
     /// The rung-7-only defaults a slide falls back to when its master has no
     /// entry. Stored on the deck rather than built as a local in the walk so
@@ -142,6 +147,15 @@ pub struct PreparedSlide<'d> {
     /// pass does. `None` means no part in the chain declared one, which does
     /// not happen on the corpus (0 of 1,278) and is therefore a signal.
     pub background: Option<(BackgroundSource, Background)>,
+    /// §19.3.1.6 the colour map in force on this slide, resolved down the same
+    /// slide → layout → master chain as `background`.
+    ///
+    /// `None` means no part in the chain stated one, in which case
+    /// [`ColorMap::default`] — the spec's identity mapping — applies; it is
+    /// carried as `Option` rather than defaulted here so that the probe can
+    /// tell "stated" from "assumed", which is exactly the 30-of-70 masters the
+    /// census found.
+    pub color_map: Option<ColorMap>,
     layout_text: Option<&'d PlaceholderTextStyles>,
     master_text: Option<&'d PlaceholderTextStyles>,
     deck_defaults: &'d DeckTextDefaults,
@@ -174,6 +188,8 @@ impl Deck {
             layout_text: HashMap::new(),
             master_bg: HashMap::new(),
             layout_bg: HashMap::new(),
+            master_clr_map: HashMap::new(),
+            layout_clr_map: HashMap::new(),
             fallback_defaults: DeckTextDefaults {
                 master_styles: TextStyles::default(),
                 default_text_style: default_text_style.clone(),
@@ -206,6 +222,26 @@ impl Deck {
                 .and_then(Option::as_ref),
         )
         .map(|(src, bg)| (src, bg.clone()));
+        // Nearest rung wins, and a `p:clrMapOvr/a:masterClrMapping` parses to
+        // `None`, which is what makes "inherit" fall through correctly here.
+        let color_map = part
+            .color_map
+            .or_else(|| {
+                slide
+                    .layout
+                    .as_ref()
+                    .and_then(|l| self.layout_clr_map.get(&l.path))
+                    .copied()
+                    .flatten()
+            })
+            .or_else(|| {
+                slide
+                    .master
+                    .as_ref()
+                    .and_then(|m| self.master_clr_map.get(&m.path))
+                    .copied()
+                    .flatten()
+            });
         let layout_geo = slide
             .layout
             .as_ref()
@@ -222,6 +258,7 @@ impl Deck {
         Some(PreparedSlide {
             shapes,
             background,
+            color_map,
             layout_text: slide
                 .layout
                 .as_ref()
@@ -272,6 +309,8 @@ impl Deck {
             let part = pptx::parse_slide_part(&master.xml).unwrap_or_default();
             let shapes = part.shapes;
             self.master_bg.insert(master.path.clone(), part.background);
+            self.master_clr_map
+                .insert(master.path.clone(), part.color_map);
             self.master_geo.insert(
                 master.path.clone(),
                 PlaceholderGeometry::from_master(&shapes),
@@ -298,6 +337,8 @@ impl Deck {
             let part = pptx::parse_slide_part(&layout.xml).unwrap_or_default();
             let mut shapes = part.shapes;
             self.layout_bg.insert(layout.path.clone(), part.background);
+            self.layout_clr_map
+                .insert(layout.path.clone(), part.color_map);
             pptx::apply_inherited_geometry(&mut shapes, master_geo, MatchRule::CollapsedKind);
             self.layout_geo.insert(
                 layout.path.clone(),

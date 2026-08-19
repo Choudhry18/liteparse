@@ -47,11 +47,12 @@ use serde::Deserialize;
 use crate::model::dimension::{Dimension, Emu};
 use crate::model::geometry::{Offset, Size};
 use crate::model::{
-    BodyProperties, DocProperties, DrawingFill, NvPicProperties, Picture, ShapeProperties,
-    StyleMatrixRef, TextAnchoringType, TextVerticalType, Transform2D,
+    BodyProperties, ColorMap, DocProperties, DrawingFill, NvPicProperties, Picture,
+    ShapeProperties, StyleMatrixRef, TextAnchoringType, TextVerticalType, Transform2D,
 };
 
 use crate::docx::error::Result;
+use crate::docx::parse::drawing::schema::color::StSchemeColorVal;
 use crate::docx::parse::drawing::schema::fill::BlipFillXml;
 use crate::docx::parse::drawing::schema::picture::{CNvPicPrXml, CNvPrXml};
 use crate::docx::parse::drawing::schema::shape::{
@@ -504,14 +505,30 @@ pub struct SlidePart {
     /// Only 58 of the corpus's 1,278 slides declare their own; 1,125 inherit
     /// from the master.
     pub background: Option<Background>,
+    /// §19.3.1.6 `p:clrMap` (master) or §19.3.1.7 `p:clrMapOvr`'s
+    /// `a:overrideClrMapping` (slide/layout), when *this* part states one.
+    ///
+    /// `None` means "not stated here" and inherits, exactly like `background`
+    /// — and a `p:clrMapOvr` holding `a:masterClrMapping` is a `None`, because
+    /// that element's entire content is "inherit".
+    pub color_map: Option<ColorMap>,
 }
 
 /// Parse a slide, layout, master or notes-slide part into its shapes and its
 /// own (uninherited) background.
 pub fn parse_slide_part(data: &[u8]) -> Result<SlidePart> {
     let part: SlidePartXml = serde_xml::from_xml(data)?;
+    // The colour map is a sibling of `p:cSld`, not a child, so it survives a
+    // part with no shape tree at all.
+    let color_map = part
+        .clr_map
+        .or_else(|| part.clr_map_ovr.and_then(|o| o.override_clr_mapping))
+        .map(ClrMapXml::into_color_map);
     let Some(c_sld) = part.c_sld else {
-        return Ok(SlidePart::default());
+        return Ok(SlidePart {
+            color_map,
+            ..Default::default()
+        });
     };
     Ok(SlidePart {
         shapes: c_sld
@@ -519,6 +536,7 @@ pub fn parse_slide_part(data: &[u8]) -> Result<SlidePart> {
             .map(|t| lower_children(t.children))
             .unwrap_or_default(),
         background: c_sld.bg.and_then(Background::from_xml),
+        color_map,
     })
 }
 
@@ -532,6 +550,122 @@ pub fn parse_slide_part(data: &[u8]) -> Result<SlidePart> {
 struct SlidePartXml {
     #[serde(rename = "cSld", default)]
     c_sld: Option<CSldXml>,
+    /// §19.3.1.6, on `p:sldMaster` only.
+    #[serde(rename = "clrMap", default)]
+    clr_map: Option<ClrMapXml>,
+    /// §19.3.1.7, on `p:sld` and `p:sldLayout` only. Never both, since no
+    /// part's content model allows the two elements together.
+    #[serde(rename = "clrMapOvr", default)]
+    clr_map_ovr: Option<ClrMapOvrXml>,
+}
+
+/// §19.3.1.6 CT_ColorMapping. Every attribute is *required* by the schema, but
+/// each is read as optional and defaulted individually: a master missing one is
+/// malformed, and per §17.17 the honest reading of a missing/invalid value is
+/// the default mapping rather than a rejected deck.
+#[derive(Deserialize)]
+struct ClrMapXml {
+    #[serde(
+        rename = "@bg1",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    bg1: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@tx1",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    tx1: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@bg2",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    bg2: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@tx2",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    tx2: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@accent1",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    accent1: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@accent2",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    accent2: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@accent3",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    accent3: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@accent4",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    accent4: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@accent5",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    accent5: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@accent6",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    accent6: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@hlink",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    hlink: Option<StSchemeColorVal>,
+    #[serde(
+        rename = "@folHlink",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    fol_hlink: Option<StSchemeColorVal>,
+}
+
+impl ClrMapXml {
+    fn into_color_map(self) -> ColorMap {
+        let d = ColorMap::default();
+        ColorMap {
+            bg1: self.bg1.map_or(d.bg1, Into::into),
+            tx1: self.tx1.map_or(d.tx1, Into::into),
+            bg2: self.bg2.map_or(d.bg2, Into::into),
+            tx2: self.tx2.map_or(d.tx2, Into::into),
+            accent1: self.accent1.map_or(d.accent1, Into::into),
+            accent2: self.accent2.map_or(d.accent2, Into::into),
+            accent3: self.accent3.map_or(d.accent3, Into::into),
+            accent4: self.accent4.map_or(d.accent4, Into::into),
+            accent5: self.accent5.map_or(d.accent5, Into::into),
+            accent6: self.accent6.map_or(d.accent6, Into::into),
+            hlink: self.hlink.map_or(d.hlink, Into::into),
+            folink: self.fol_hlink.map_or(d.folink, Into::into),
+        }
+    }
+}
+
+/// §19.3.1.7 CT_ColorMappingOverride — a choice of `a:masterClrMapping`
+/// (inherit, and the only form the corpus's 41 overrides actually use) and
+/// `a:overrideClrMapping` (a full CT_ColorMapping stated locally).
+#[derive(Deserialize)]
+struct ClrMapOvrXml {
+    #[serde(rename = "overrideClrMapping", default)]
+    override_clr_mapping: Option<ClrMapXml>,
 }
 
 #[derive(Deserialize)]
@@ -1245,6 +1379,7 @@ fn lower_table(tbl: TblXml) -> Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SchemeColorVal;
 
     /// Wraps a shape-tree fragment in a namespace-declaring slide part, which
     /// is what `parse_shape_tree` expects — prefixes must resolve in the
@@ -1263,6 +1398,58 @@ mod tests {
                </p:sld>"#
         );
         parse_shape_tree(xml.as_bytes()).expect("parses")
+    }
+
+    /// A whole part (not just a shape tree), for the elements that hang off
+    /// `p:sldMaster`/`p:sld` rather than off `p:cSld`.
+    fn part(inner: &str) -> SlidePart {
+        let xml = format!(
+            r#"<p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                      xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+                 <p:cSld><p:spTree/></p:cSld>
+                 {inner}
+               </p:sldMaster>"#
+        );
+        parse_slide_part(xml.as_bytes()).expect("parses")
+    }
+
+    /// The mapping 30 of the corpus's 70 masters state: `bg2`/`tx2` swapped,
+    /// which is the whole reason this element cannot be inferred.
+    #[test]
+    fn swapped_clr_map_is_read() {
+        let p = part(
+            r#"<p:clrMap bg1="lt1" tx1="dk1" bg2="dk2" tx2="lt2" accent1="accent1"
+                         accent2="accent2" accent3="accent3" accent4="accent4"
+                         accent5="accent5" accent6="accent6" hlink="hlink"
+                         folHlink="folHlink"/>"#,
+        );
+        let map = p.color_map.expect("stated");
+        assert_eq!(map.tx2, SchemeColorVal::Lt2);
+        assert_eq!(map.bg2, SchemeColorVal::Dk2);
+        // Untouched slots still map the default way.
+        assert_eq!(map.tx1, SchemeColorVal::Dk1);
+    }
+
+    /// `a:masterClrMapping` *is* "inherit", so it must parse to `None` — a
+    /// default map here would shadow the master's real one on all 2,053
+    /// corpus slides that carry the element.
+    #[test]
+    fn master_clr_mapping_override_is_inherit_not_default() {
+        let p = part(r#"<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>"#);
+        assert_eq!(p.color_map, None);
+    }
+
+    #[test]
+    fn override_clr_mapping_states_a_map() {
+        let p = part(
+            r#"<p:clrMapOvr><a:overrideClrMapping bg1="dk1" tx1="lt1" bg2="lt2" tx2="dk2"
+                 accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4"
+                 accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+               </p:clrMapOvr>"#,
+        );
+        let map = p.color_map.expect("stated");
+        assert_eq!(map.tx1, SchemeColorVal::Lt1);
+        assert_eq!(map.bg1, SchemeColorVal::Dk1);
     }
 
     fn sp(inner: &str) -> String {

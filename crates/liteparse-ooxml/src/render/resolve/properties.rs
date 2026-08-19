@@ -34,6 +34,7 @@ pub fn merge_run_properties(target: &mut RunProperties, base: &RunProperties) {
         underline,
         strike,
         color,
+        drawing_color,
         highlight,
         shading,
         vertical_align,
@@ -217,6 +218,10 @@ mod tests {
             bold: Some(true),
             italic: Some(true),
             font_size: Some(Dimension::<HalfPoints>::new(24)),
+            drawing_color: Some(DrawingColor::Srgb {
+                rgb: 0x00FF00,
+                transforms: Vec::new(),
+            }),
             color: Some(Color::Rgb(0xFF0000)),
             ..Default::default()
         };
@@ -344,6 +349,10 @@ mod tests {
             underline: Some(UnderlineStyle::Single),
             strike: Some(StrikeStyle::Single),
             color: Some(Color::Rgb(0)),
+            drawing_color: Some(DrawingColor::Srgb {
+                rgb: 0,
+                transforms: Vec::new(),
+            }),
             highlight: Some(HighlightColor::Yellow),
             shading: Some(Shading {
                 fill: Color::Rgb(0),
@@ -385,6 +394,7 @@ mod tests {
         assert!(target.underline.is_some());
         assert!(target.strike.is_some());
         assert!(target.color.is_some());
+        assert!(target.drawing_color.is_some());
         assert!(target.highlight.is_some());
         assert!(target.shading.is_some());
         assert!(target.vertical_align.is_some());

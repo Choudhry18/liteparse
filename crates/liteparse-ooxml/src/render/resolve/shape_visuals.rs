@@ -36,20 +36,25 @@ pub struct ResolvedVisuals {
 /// a present-but-empty `<a:effectLst/>` on spPr falls through to the theme
 /// effect style. Only when the direct effectLst has children do we treat it
 /// as an explicit override.
+///
+/// Takes the whole [`DrawingColorContext`] rather than a bare `theme` because
+/// the theme is no longer the only thing a scheme colour resolves through:
+/// PresentationML states its `bg1`/`tx1` mapping in the master's §19.3.1.6
+/// `p:clrMap`, and a shape fill has to see the same map its text does.
 pub fn resolve_shape_visuals(
     props: Option<&ShapeProperties>,
     style_line_ref: Option<&StyleMatrixRef>,
     style_effect_ref: Option<&StyleMatrixRef>,
     style_fill_ref: Option<&StyleMatrixRef>,
-    theme: Option<&Theme>,
+    ctx: &DrawingColorContext<'_>,
 ) -> ResolvedVisuals {
-    let ctx = DrawingColorContext::new(theme);
+    let theme = ctx.theme;
     let props = match props {
         Some(p) => p,
         None => {
             // No spPr, but a bare `<wps:style>` may still carry a fillRef.
             return ResolvedVisuals {
-                fill: resolve_theme_fill(style_fill_ref, theme, &ctx),
+                fill: resolve_theme_fill(style_fill_ref, theme, ctx),
                 stroke: None,
                 effects: Vec::new(),
             };
@@ -59,15 +64,15 @@ pub fn resolve_shape_visuals(
     // §20.1.4.1.13: a direct spPr fill wins; otherwise fall back to the theme
     // fill style referenced by `<a:fillRef>` (recolored by its phClr).
     let fill = match props.fill.as_ref() {
-        Some(f) => resolve_fill(f, &ctx),
-        None => resolve_theme_fill(style_fill_ref, theme, &ctx),
+        Some(f) => resolve_fill(f, ctx),
+        None => resolve_theme_fill(style_fill_ref, theme, ctx),
     };
 
     let theme_ln = theme_line_style(style_line_ref, theme);
     let stroke = props
         .outline
         .as_ref()
-        .and_then(|o| resolve_outline(o, theme_ln, &ctx));
+        .and_then(|o| resolve_outline(o, theme_ln, ctx));
 
     let direct_effects = props
         .effect_list
@@ -75,9 +80,9 @@ pub fn resolve_shape_visuals(
         .map(|el| el.effects.as_slice())
         .unwrap_or(&[]);
     let effects = if !direct_effects.is_empty() {
-        resolve_effects(direct_effects, &ctx)
+        resolve_effects(direct_effects, ctx)
     } else {
-        resolve_theme_effects(style_effect_ref, theme, &ctx)
+        resolve_theme_effects(style_effect_ref, theme, ctx)
     };
 
     ResolvedVisuals {
@@ -468,7 +473,7 @@ mod tests {
 
     #[test]
     fn empty_props_resolves_to_none_visuals() {
-        let v = resolve_shape_visuals(None, None, None, None, None);
+        let v = resolve_shape_visuals(None, None, None, None, &DrawingColorContext::new(None));
         assert!(matches!(v.fill, ResolvedFill::None));
         assert!(v.stroke.is_none());
         assert!(v.effects.is_empty());
@@ -484,7 +489,13 @@ mod tests {
             None,
             None,
         );
-        let v = resolve_shape_visuals(Some(&props), None, None, None, None);
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+        );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!()
         };
@@ -508,7 +519,13 @@ mod tests {
             tail_end: None,
         };
         let props = shape_props(None, Some(outline), None);
-        let v = resolve_shape_visuals(Some(&props), None, None, None, None);
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+        );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(0.75));
         assert_eq!(s.color.to_rgb24(), 0x0000FF);
@@ -534,7 +551,13 @@ mod tests {
             tail_end: None,
         };
         let props = shape_props(None, Some(outline), None);
-        let v = resolve_shape_visuals(Some(&props), None, None, None, None);
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+        );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(0.75));
         assert_eq!(s.color, Rgba::BLACK);
@@ -557,7 +580,13 @@ mod tests {
             tail_end: None,
         };
         let props = shape_props(None, Some(outline), None);
-        let v = resolve_shape_visuals(Some(&props), None, None, None, None);
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+        );
         assert!(v.stroke.is_none());
     }
 
@@ -607,7 +636,13 @@ mod tests {
             idx: 2,
             color: None,
         };
-        let v = resolve_shape_visuals(Some(&props), Some(&ln_ref), None, None, Some(&theme));
+        let v = resolve_shape_visuals(
+            Some(&props),
+            Some(&ln_ref),
+            None,
+            None,
+            &DrawingColorContext::new(Some(&theme)),
+        );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(2.0));
         assert_eq!(s.color.to_rgb24(), 0xD99F34);
@@ -643,7 +678,13 @@ mod tests {
             idx: 1,
             color: None,
         };
-        let v = resolve_shape_visuals(Some(&props), None, Some(&er), None, Some(&theme));
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            Some(&er),
+            None,
+            &DrawingColorContext::new(Some(&theme)),
+        );
         assert_eq!(v.effects.len(), 1);
     }
 
@@ -690,7 +731,13 @@ mod tests {
             idx: 1,
             color: None,
         };
-        let v = resolve_shape_visuals(Some(&props), None, Some(&er), None, Some(&theme));
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            Some(&er),
+            None,
+            &DrawingColorContext::new(Some(&theme)),
+        );
         let ResolvedEffect::OuterShadow {
             blur_radius, color, ..
         } = &v.effects[0];
@@ -722,7 +769,13 @@ mod tests {
                 effects: vec![Effect::OuterShdw(sh)],
             }),
         );
-        let v = resolve_shape_visuals(Some(&props), None, None, None, None);
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+        );
         assert_eq!(v.effects.len(), 1);
         let ResolvedEffect::OuterShadow {
             blur_radius,
@@ -759,7 +812,13 @@ mod tests {
         };
         // No direct spPr fill → the theme fill referenced by fillRef supplies it.
         let props = shape_props(None, None, None);
-        let v = resolve_shape_visuals(Some(&props), None, None, Some(&fill_ref), Some(&theme));
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            Some(&fill_ref),
+            &DrawingColorContext::new(Some(&theme)),
+        );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!("expected solid theme fill, got {:?}", v.fill);
         };
@@ -784,7 +843,13 @@ mod tests {
             None,
             None,
         );
-        let v = resolve_shape_visuals(Some(&props), None, None, Some(&fill_ref), Some(&theme));
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            Some(&fill_ref),
+            &DrawingColorContext::new(Some(&theme)),
+        );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!("expected solid fill");
         };
@@ -799,7 +864,13 @@ mod tests {
             color: None,
         };
         let props = shape_props(None, None, None);
-        let v = resolve_shape_visuals(Some(&props), None, None, Some(&fill_ref), Some(&theme));
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            Some(&fill_ref),
+            &DrawingColorContext::new(Some(&theme)),
+        );
         assert!(matches!(v.fill, ResolvedFill::None));
     }
 }

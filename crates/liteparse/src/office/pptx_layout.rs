@@ -51,7 +51,7 @@
 
 use liteparse_ooxml::model::dimension::Dimension;
 use liteparse_ooxml::model::{
-    Alignment, DrawingFill, PresetGeometryDef, PresetShapeType, ShapeGeometry, Theme,
+    Alignment, ColorMap, DrawingFill, PresetGeometryDef, PresetShapeType, ShapeGeometry, Theme,
 };
 use liteparse_ooxml::pptx::{
     self, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Spacing, TextBody, TextCascade,
@@ -71,7 +71,8 @@ use liteparse_ooxml::render::layout::measurer::TextMeasurer;
 use liteparse_ooxml::render::layout::paragraph::{LineSpacingRule, ParagraphStyle};
 use liteparse_ooxml::render::layout::section::LayoutBlock;
 use liteparse_ooxml::render::layout::shape_body::{layout_shape_body, measure_shape_body};
-use liteparse_ooxml::render::resolve::color::RgbColor;
+use liteparse_ooxml::render::resolve::color::{RgbColor, rgb_from_u32};
+use liteparse_ooxml::render::resolve::drawing_color::{DrawingColorContext, resolve_drawing_color};
 use liteparse_ooxml::render::resolve::fonts::resolve_font_set_themes;
 use liteparse_ooxml::render::resolve::shape_geometry::build_geometry;
 use liteparse_ooxml::render::resolve::shape_visuals::resolve_shape_visuals;
@@ -171,6 +172,22 @@ pub struct SlideGeometry {
     /// background at all. 0 on the corpus, so any number here is a signal
     /// about the package rather than a normal outcome.
     pub undeclared_backgrounds: usize,
+    /// Runs whose colour came from a declared `a:solidFill` on some rung of
+    /// the text cascade.
+    pub runs_colour_declared: usize,
+    /// Runs with no colour anywhere in the cascade, painted black by §21.1.2.3
+    /// default. The remaining gap here is `p:style/a:fontRef`, which supplies
+    /// a shape-level text colour this pass does not parse — 2,043 of the
+    /// corpus's 2,181 `p:style` elements carry one.
+    pub runs_colour_defaulted: usize,
+    /// Runs whose resolved colour is **exactly the colour of the slide's own
+    /// background**, i.e. text that cannot be read.
+    ///
+    /// The gate this step exists for. It over-counts by design — a run over an
+    /// opaque shape fill is legible whatever the backdrop says — so the number
+    /// is a ceiling on invisibility, and the claim it supports is the
+    /// direction it moved, not its absolute value.
+    pub runs_invisible_on_background: usize,
 }
 
 /// Where one text body's items landed on its slide — a shape's, or a single
@@ -258,6 +275,9 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         transparent_backgrounds: 0,
         unrenderable_backgrounds: 0,
         undeclared_backgrounds: 0,
+        runs_colour_declared: 0,
+        runs_colour_defaulted: 0,
+        runs_invisible_on_background: 0,
     };
 
     for (idx, slide) in pkg.slides.iter().enumerate() {
@@ -273,6 +293,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
             let mut ctx = ShapeCtx {
                 cascade,
                 theme,
+                color_map: prepared.color_map,
                 measurer: &measurer,
                 registry,
                 items: &mut items,
@@ -288,6 +309,10 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 transparent_backgrounds: &mut out.transparent_backgrounds,
                 unrenderable_backgrounds: &mut out.unrenderable_backgrounds,
                 undeclared_backgrounds: &mut out.undeclared_backgrounds,
+                background_rgb: None,
+                runs_colour_declared: &mut out.runs_colour_declared,
+                runs_colour_defaulted: &mut out.runs_colour_defaulted,
+                runs_invisible_on_background: &mut out.runs_invisible_on_background,
             };
             // Two walks over one `prepare`, in the order the raster wants
             // them. See [`paint_shape`] for why they cannot be one walk. The
@@ -331,6 +356,11 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
 struct ShapeCtx<'a, 'r> {
     cascade: TextCascade<'a>,
     theme: Option<&'a Theme>,
+    /// §19.3.1.6 the slide's effective colour map, resolved by
+    /// [`Deck::prepare`]. Every scheme colour on the slide — run, shape fill,
+    /// outline, background — goes through this one value, which is the point:
+    /// the three paths must not disagree about what `tx1` names.
+    color_map: Option<ColorMap>,
     measurer: &'a TextMeasurer<'r>,
     registry: &'a FontRegistry,
     items: &'a mut Vec<TextItem>,
@@ -348,6 +378,12 @@ struct ShapeCtx<'a, 'r> {
     transparent_backgrounds: &'a mut usize,
     unrenderable_backgrounds: &'a mut usize,
     undeclared_backgrounds: &'a mut usize,
+    /// The slide backdrop's resolved sRGB, filled in by `paint_background`
+    /// before either walk runs. Only the invisible-text count reads it.
+    background_rgb: Option<u32>,
+    runs_colour_declared: &'a mut usize,
+    runs_colour_defaulted: &'a mut usize,
+    runs_invisible_on_background: &'a mut usize,
 }
 
 impl ShapeCtx<'_, '_> {
@@ -403,7 +439,7 @@ fn paint_background(
         *ctx.undeclared_backgrounds += 1;
         return None;
     };
-    let fill = pptx::background_fill(bg, ctx.theme);
+    let fill = pptx::background_fill(bg, ctx.theme, ctx.color_map);
     if matches!(fill, ResolvedFill::None) {
         // Two very different slides land here, and the resolved fill cannot
         // tell them apart: `resolve_fill` collapses blip, pattern and `grpFill`
@@ -429,6 +465,9 @@ fn paint_background(
         page_size,
     )?;
     *ctx.painted_backgrounds += 1;
+    if let ResolvedFill::Solid(rgba) = fill {
+        ctx.background_rgb = Some(rgba.to_rgb24());
+    }
     let at = ctx.commands.len();
     ctx.commands.push(DrawCommand::Path {
         origin: PtOffset::new(Pt::ZERO, Pt::ZERO),
@@ -490,7 +529,13 @@ fn paint_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
     // three style arguments are `None` and 3,381 corpus shapes with no `spPr`
     // fill element resolve to nothing. That is an *under*-paint: visible, but
     // never misleading.
-    let visuals = resolve_shape_visuals(Some(props), None, None, None, ctx.theme);
+    let visuals = resolve_shape_visuals(
+        Some(props),
+        None,
+        None,
+        None,
+        &DrawingColorContext::new(ctx.theme).with_color_map(ctx.color_map),
+    );
     let paints = !matches!(visuals.fill, ResolvedFill::None) || visuals.stroke.is_some();
     if !paints {
         return;
@@ -1044,6 +1089,47 @@ fn paragraph_block(
     }
 }
 
+/// §21.1.2.3.9 `a:rPr/a:solidFill` → the sRGB the painter draws with.
+///
+/// The colour arrives here already merged down the whole text cascade — run,
+/// shape `a:lstStyle`, layout/master placeholder, master `p:txStyles`,
+/// presentation `defaultTextStyle` — because `drawing_color` is an ordinary
+/// `Option` field of [`RunProperties`] and rides `merge_run_properties` like
+/// every other one. What could not ride the cascade is the *resolution*: a
+/// `schemeClr` needs this slide's theme and its master's `p:clrMap`, and
+/// neither is a property of the run.
+///
+/// Alpha is dropped: `DrawCommand::Text` carries an opaque `RgbColor`, so a
+/// half-transparent run paints solid. That is a smaller error than the black
+/// it replaces, and it is the same simplification the fill path made.
+///
+/// Black on no declaration is the §21.1.2.3 default, *not* a guess — but the
+/// count still separates the two, because the runs that land here are exactly
+/// the ones `p:style/a:fontRef` would colour.
+fn run_color(
+    props: &liteparse_ooxml::model::RunProperties,
+    ctx: &mut ShapeCtx<'_, '_>,
+) -> RgbColor {
+    let rgb = match props.drawing_color.as_ref() {
+        Some(declared) => {
+            *ctx.runs_colour_declared += 1;
+            let dc = DrawingColorContext::new(ctx.theme).with_color_map(ctx.color_map);
+            resolve_drawing_color(declared, &dc).to_rgb24()
+        }
+        None => {
+            *ctx.runs_colour_defaulted += 1;
+            0x000000
+        }
+    };
+    // Counted for *both* branches on purpose: a defaulted-black run on a dark
+    // backdrop is the exact failure this step exists to remove, and checking
+    // only the declared branch would report it as fixed.
+    if ctx.background_rgb == Some(rgb) {
+        *ctx.runs_invisible_on_background += 1;
+    }
+    rgb_from_u32(rgb)
+}
+
 fn collect_run_fragments(
     inlines: &[liteparse_ooxml::model::Inline],
     resolved: &ResolvedTextStyle,
@@ -1076,7 +1162,7 @@ fn collect_run_fragments(
                     spec_default_size(),
                     auto_fit,
                 );
-                let color = RgbColor { r: 0, g: 0, b: 0 };
+                let color = run_color(&props, ctx);
                 for element in &run.content {
                     match element {
                         RunElement::Text(text) => {

@@ -69,7 +69,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{Theme, Transform2D};
+use crate::model::{ColorMap, Theme, Transform2D};
 use crate::render::layout::draw_command::ResolvedFill;
 use crate::render::resolve::drawing_color::DrawingColorContext;
 use crate::render::resolve::shape_visuals::{resolve_background_fill, resolve_fill};
@@ -308,8 +308,15 @@ pub fn resolve_background<'a>(
 /// gives them a real fill from the wrong matrix.
 ///
 /// [`PresentationPackage::theme_for`]: crate::pptx::PresentationPackage::theme_for
-pub fn background_fill(bg: &Background, theme: Option<&Theme>) -> ResolvedFill {
-    let ctx = DrawingColorContext::new(theme);
+/// `color_map` is the slide's effective §19.3.1.6 map, without which a
+/// `<a:schemeClr val="bg1"/>` backdrop under a swapped master resolves to the
+/// wrong end of the theme's light/dark pair.
+pub fn background_fill(
+    bg: &Background,
+    theme: Option<&Theme>,
+    color_map: Option<ColorMap>,
+) -> ResolvedFill {
+    let ctx = DrawingColorContext::new(theme).with_color_map(color_map);
     match bg {
         Background::Properties(fill) => resolve_fill(fill, &ctx),
         Background::Reference(r) => resolve_background_fill(r, theme, &ctx),
@@ -584,7 +591,7 @@ mod tests {
         ] {
             let (src, bg) = resolve_background(slide, layout, master).expect("resolves");
             assert_eq!(src, want_src);
-            assert_eq!(solid_rgb(&background_fill(bg, None)), want_rgb);
+            assert_eq!(solid_rgb(&background_fill(bg, None, None)), want_rgb);
         }
     }
 
@@ -616,14 +623,20 @@ mod tests {
             idx: 1001,
             color: None,
         });
-        assert_eq!(solid_rgb(&background_fill(&bg, Some(&theme))), 0x00AA00);
+        assert_eq!(
+            solid_rgb(&background_fill(&bg, Some(&theme), None)),
+            0x00AA00
+        );
 
         // 1002 walks the same list, not off the end of the shape matrix.
         let bg2 = Background::Reference(StyleMatrixRef {
             idx: 1002,
             color: None,
         });
-        assert_eq!(solid_rgb(&background_fill(&bg2, Some(&theme))), 0x00BB00);
+        assert_eq!(
+            solid_rgb(&background_fill(&bg2, Some(&theme), None)),
+            0x00BB00
+        );
 
         // Below 1001 the shape matrix is correct — the spec allows both forms
         // even though the corpus only ever writes the offset one.
@@ -631,7 +644,10 @@ mod tests {
             idx: 2,
             color: None,
         });
-        assert_eq!(solid_rgb(&background_fill(&bg3, Some(&theme))), 0xBB0000);
+        assert_eq!(
+            solid_rgb(&background_fill(&bg3, Some(&theme), None)),
+            0xBB0000
+        );
     }
 
     /// `idx=0` is §20.1.4.2.19's no-reference sentinel: no background, as
@@ -643,7 +659,7 @@ mod tests {
             color: None,
         });
         assert!(matches!(
-            background_fill(&bg, Some(&Theme::default())),
+            background_fill(&bg, Some(&Theme::default()), None),
             ResolvedFill::None
         ));
     }
@@ -661,7 +677,7 @@ mod tests {
             color: None,
         });
         assert!(matches!(
-            background_fill(&bg, Some(&theme)),
+            background_fill(&bg, Some(&theme), None),
             ResolvedFill::None
         ));
     }

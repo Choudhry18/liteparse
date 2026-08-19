@@ -181,6 +181,9 @@ impl RPrXml {
             underline: self.u.and_then(resolve_underline),
             strike: resolve_strike(self.strike, self.dstrike),
             color: self.color.and_then(|c| c.val).map(Into::into),
+            // WordprocessingML has no `a:solidFill` on `w:rPr`; DrawingML text
+            // sets this instead of `color`.
+            drawing_color: None,
             highlight: self.highlight.map(Into::into),
             shading: self.shd.map(Into::into),
             vertical_align: self.vert_align.map(Into::into),

@@ -244,7 +244,11 @@ pub(super) fn extract_floating_shapes(
             wsp.style_line_ref.as_ref(),
             wsp.style_effect_ref.as_ref(),
             wsp.style_fill_ref.as_ref(),
-            ctx.resolved.theme.as_ref(),
+            // Word has no `p:clrMap`; scheme names keep resolving through
+            // `BgTxConvention`.
+            &crate::render::resolve::drawing_color::DrawingColorContext::new(
+                ctx.resolved.theme.as_ref(),
+            ),
         );
 
         // §20.1.7.6 transform attributes (rotation/flip) live on the shape's
