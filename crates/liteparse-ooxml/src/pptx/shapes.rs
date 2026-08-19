@@ -46,12 +46,17 @@ use serde::Deserialize;
 
 use crate::model::dimension::{Dimension, Emu};
 use crate::model::geometry::{Offset, Size};
-use crate::model::{DocProperties, NvPicProperties, Picture, ShapeProperties, Transform2D};
+use crate::model::{
+    BodyProperties, DocProperties, NvPicProperties, Picture, ShapeProperties, TextAnchoringType,
+    TextVerticalType, Transform2D,
+};
 
 use crate::docx::error::Result;
 use crate::docx::parse::drawing::schema::fill::BlipFillXml;
 use crate::docx::parse::drawing::schema::picture::{CNvPicPrXml, CNvPrXml};
-use crate::docx::parse::drawing::schema::shape::{ExtXml, OffXml, SpPrXml, XfrmXml};
+use crate::docx::parse::drawing::schema::shape::{
+    ExtXml, OffXml, SpPrXml, StTextAnchoringType, StTextVerticalType, XfrmXml,
+};
 use crate::docx::parse::serde_xml;
 
 use super::geometry::SlideRect;
@@ -269,6 +274,8 @@ pub struct TableCell {
     pub h_merge: bool,
     /// `@vMerge` — this cell is absorbed by a vertical merge above it.
     pub v_merge: bool,
+    /// `a:tcPr`, the text-relevant half. Declared on 603 of 608 corpus cells.
+    pub properties: TableCellProperties,
 }
 
 impl TableCell {
@@ -276,6 +283,69 @@ impl TableCell {
     /// occupy a slot in an occupancy grid.
     pub fn is_absorbed(&self) -> bool {
         self.h_merge || self.v_merge
+    }
+}
+
+/// §21.1.3.17 `a:tcPr` — the half of a cell's properties that decides where its
+/// text sits.
+///
+/// Fills, borders (`a:lnL`/`lnR`/`lnT`/`lnB`/`lnTlToBr`/`lnBlToTr`) and
+/// `@horzOverflow` are deliberately absent: the first two are paint, and the
+/// third is declared 0 times on the corpus. `@anchorCtr` is likewise unread —
+/// it centres the text *block* horizontally, which this model has no way to
+/// express, and no corpus cell sets it.
+///
+/// **A cell's own `a:bodyPr` is not an alternative source.** All 603 corpus
+/// cells carry one and every one of them is bare — no attributes, no children —
+/// because §21.1.3.16 puts the insets and the anchor here instead.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableCellProperties {
+    /// `@marL`, in EMU. `None` is the §21.1.3.17 default of 91440.
+    pub left_margin: Option<Dimension<Emu>>,
+    /// `@marT`. `None` is the default of 45720.
+    pub top_margin: Option<Dimension<Emu>>,
+    /// `@marR`. `None` is the default of 91440.
+    pub right_margin: Option<Dimension<Emu>>,
+    /// `@marB`. `None` is the default of 45720.
+    pub bottom_margin: Option<Dimension<Emu>>,
+    /// `@anchor` — where the text sits vertically in the cell.
+    ///
+    /// **Not a rare attribute**: 326 of 603 corpus cells declare a non-top
+    /// anchor (324 `ctr`, 2 `b`). Ignoring it tops every cell's text.
+    pub anchor: Option<TextAnchoringType>,
+    /// `@vert` — vertical text. Declared 0 times on the corpus, and carried
+    /// only so a consumer can tell "horizontal" from "not modelled".
+    pub vert: Option<TextVerticalType>,
+}
+
+impl TableCellProperties {
+    /// This cell's properties as the equivalent `a:bodyPr`, so a cell can be
+    /// laid out by the same DrawingML text-body code as a shape.
+    ///
+    /// The mapping is exact rather than approximate, and that is a fact about
+    /// the spec rather than a convenience: §21.1.3.17's four cell margins carry
+    /// the **same defaults** as §20.1.2.1.1's four insets (91440 EMU
+    /// horizontal, 45720 vertical), so an absent attribute means the same
+    /// length on both elements and `None` can be passed straight through.
+    ///
+    /// The four fields left `None` are ones a cell genuinely cannot declare —
+    /// a cell has no text rotation, wrap mode, or autofit — so their spec
+    /// defaults are the right reading and not a dropped value. `@vertOverflow`
+    /// is the one to keep an eye on: its default is `overflow`, which is what a
+    /// cell taller than its row does *after* the row has been grown to fit.
+    pub fn text_body_properties(&self) -> BodyProperties {
+        BodyProperties {
+            rotation: None,
+            vert: self.vert,
+            wrap: None,
+            left_inset: self.left_margin,
+            top_inset: self.top_margin,
+            right_inset: self.right_margin,
+            bottom_inset: self.bottom_margin,
+            anchor: self.anchor,
+            vert_overflow: None,
+            auto_fit: None,
+        }
     }
 }
 
@@ -802,6 +872,66 @@ struct TcXml {
     h_merge: Option<crate::docx::parse::primitives::toggles::AttrBool>,
     #[serde(rename = "@vMerge", default)]
     v_merge: Option<crate::docx::parse::primitives::toggles::AttrBool>,
+    #[serde(rename = "tcPr", default)]
+    tc_pr: Option<TcPrXml>,
+}
+
+/// §21.1.3.17 `a:tcPr`. Only the text-placement attributes are modelled; see
+/// [`TableCellProperties`] for what is left out and why.
+#[derive(Debug, Deserialize, Default)]
+struct TcPrXml {
+    // §21.1.3.17 margins are `ST_Coordinate32` (signed), same as `a:bodyPr`'s
+    // insets, so they take the same lenient signed deserializer and are not
+    // clamped.
+    #[serde(
+        rename = "@marL",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    mar_l: Option<Dimension<Emu>>,
+    #[serde(
+        rename = "@marT",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    mar_t: Option<Dimension<Emu>>,
+    #[serde(
+        rename = "@marR",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    mar_r: Option<Dimension<Emu>>,
+    #[serde(
+        rename = "@marB",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    mar_b: Option<Dimension<Emu>>,
+    #[serde(
+        rename = "@anchor",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    anchor: Option<StTextAnchoringType>,
+    #[serde(
+        rename = "@vert",
+        default,
+        deserialize_with = "crate::docx::parse::primitives::lenient::opt_attr"
+    )]
+    vert: Option<StTextVerticalType>,
+}
+
+impl From<TcPrXml> for TableCellProperties {
+    fn from(x: TcPrXml) -> Self {
+        Self {
+            left_margin: x.mar_l,
+            top_margin: x.mar_t,
+            right_margin: x.mar_r,
+            bottom_margin: x.mar_b,
+            anchor: x.anchor.map(Into::into),
+            vert: x.vert.map(Into::into),
+        }
+    }
 }
 
 // ── Lowering ─────────────────────────────────────────────────────────────────
@@ -983,6 +1113,7 @@ fn lower_table(tbl: TblXml) -> Table {
                         row_span: c.row_span.unwrap_or(1).max(1),
                         h_merge: flag(c.h_merge),
                         v_merge: flag(c.v_merge),
+                        properties: c.tc_pr.map(Into::into).unwrap_or_default(),
                     })
                     .collect(),
             })
@@ -1174,6 +1305,74 @@ mod tests {
         // grid where it is missing. A consumer that does not drop it emits a
         // phantom column.
         assert!(table.rows[0].cells[1].is_absorbed());
+    }
+
+    /// `a:tcPr` is where a cell's text placement lives, and it is not a rare
+    /// element: 603 of 608 corpus cells declare one, 375 of them with a
+    /// non-default margin and 326 with a non-top anchor.
+    #[test]
+    fn cell_properties_are_read_off_tc_pr() {
+        let shapes = tree(
+            r#"<p:graphicFrame>
+                 <p:nvGraphicFramePr><p:cNvPr id="3" name="t"/></p:nvGraphicFramePr>
+                 <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">
+                   <a:tbl>
+                     <a:tblGrid><a:gridCol w="100"/></a:tblGrid>
+                     <a:tr h="200">
+                       <a:tc><a:txBody><a:p/></a:txBody>
+                         <a:tcPr marL="0" marR="12700" marT="1" marB="2" anchor="ctr">
+                           <a:lnL/><a:solidFill/>
+                         </a:tcPr></a:tc>
+                     </a:tr>
+                     <a:tr h="200"><a:tc><a:txBody><a:p/></a:txBody></a:tc></a:tr>
+                   </a:tbl>
+                 </a:graphicData></a:graphic>
+               </p:graphicFrame>"#,
+        );
+        let ShapeKind::GraphicFrame(frame) = &shapes[0].kind else {
+            panic!("expected a graphic frame");
+        };
+        let GraphicFramePayload::Table(table) = &frame.payload else {
+            panic!("expected a table payload");
+        };
+
+        let pr = &table.rows[0].cells[0].properties;
+        // A declared 0 is a real value, not an absent attribute: reading it as
+        // `None` would put the spec's 7.2pt back and indent the text.
+        assert_eq!(pr.left_margin.expect("marL").raw(), 0);
+        assert_eq!(pr.right_margin.expect("marR").raw(), 12700);
+        assert_eq!(pr.anchor, Some(TextAnchoringType::Center));
+        assert_eq!(pr.vert, None);
+
+        // No `a:tcPr` at all resolves to the same spec defaults as an empty
+        // one, so the two need no distinction downstream.
+        let bare = &table.rows[1].cells[0].properties;
+        assert_eq!(*bare, TableCellProperties::default());
+        assert_eq!(bare.text_body_properties().left_inset, None);
+    }
+
+    /// The mapping onto `a:bodyPr` is only sound because the two elements share
+    /// their inset defaults, so an absent attribute can pass through as `None`.
+    /// If either default ever diverges, this is where it shows.
+    #[test]
+    fn cell_properties_map_onto_body_properties() {
+        let pr = TableCellProperties {
+            left_margin: Some(Dimension::new(1)),
+            top_margin: Some(Dimension::new(2)),
+            right_margin: Some(Dimension::new(3)),
+            bottom_margin: Some(Dimension::new(4)),
+            anchor: Some(TextAnchoringType::Bottom),
+            vert: None,
+        };
+        let bp = pr.text_body_properties();
+        assert_eq!(bp.left_inset.unwrap().raw(), 1);
+        assert_eq!(bp.top_inset.unwrap().raw(), 2);
+        assert_eq!(bp.right_inset.unwrap().raw(), 3);
+        assert_eq!(bp.bottom_inset.unwrap().raw(), 4);
+        assert_eq!(bp.anchor, Some(TextAnchoringType::Bottom));
+        // A cell declares no rotation, wrap or autofit — these are absent
+        // because the element cannot carry them, not because they were dropped.
+        assert!(bp.rotation.is_none() && bp.wrap.is_none() && bp.auto_fit.is_none());
     }
 
     /// SmartArt/OLE/chart frames are 66 of 102 on the corpus. Typing them as

@@ -54,7 +54,7 @@ use liteparse_ooxml::render::layout::fragment::{
 use liteparse_ooxml::render::layout::measurer::TextMeasurer;
 use liteparse_ooxml::render::layout::paragraph::{LineSpacingRule, ParagraphStyle};
 use liteparse_ooxml::render::layout::section::LayoutBlock;
-use liteparse_ooxml::render::layout::shape_body::layout_shape_body;
+use liteparse_ooxml::render::layout::shape_body::{layout_shape_body, measure_shape_body};
 use liteparse_ooxml::render::resolve::color::RgbColor;
 use liteparse_ooxml::render::resolve::fonts::resolve_font_set_themes;
 
@@ -89,11 +89,12 @@ pub struct SlideGeometry {
     /// a probe that re-derived the association would be re-deriving the thing
     /// under test.
     pub placements: Vec<Vec<ShapePlacement>>,
-    /// Table cells carrying text. Their rectangles come from `a:gridCol`
-    /// prefix sums and `a:tr@h`, not from a shape rect, which is a second
-    /// layout path — and `a:tcPr` (cell margins, per-cell anchor) is not
-    /// parsed at all today, so laying them out against spec defaults would put
-    /// every cell's text at the wrong inset.
+    /// Table cells whose text this pass placed.
+    pub placed_table_cells: usize,
+    /// Table cells carrying text that could not be placed: a frame with no
+    /// rectangle, or a table whose `a:tblGrid` gives its columns no width.
+    /// The markdown emitter still emits their text, so this is a geometry gap
+    /// for those cells rather than a content drop.
     pub unplaced_table_cells: usize,
     /// SmartArt text bodies. The frame has a rect, but the text lives in
     /// `ppt/diagrams/data*.xml` with its own layout algorithm; the markdown
@@ -102,9 +103,17 @@ pub struct SlideGeometry {
     pub unplaced_diagram_bodies: usize,
 }
 
-/// Where one text shape's items landed on its slide.
+/// Where one text body's items landed on its slide — a shape's, or a single
+/// table cell's.
 pub struct ShapePlacement {
-    /// The shape's unrotated rectangle in slide Pt: `(x, y, width, height)`.
+    /// Which of the two layout paths produced this box.
+    ///
+    /// Not decoration: a table cell's rectangle is *derived* (grid prefix sums,
+    /// grown rows) where a shape's is *declared*, so the two have different
+    /// failure modes and a check that pooled them would let a cell-only bug —
+    /// a dropped `a:tcPr` anchor, say — hide inside 4,938 correct shapes.
+    pub kind: PlacementKind,
+    /// The box's unrotated rectangle in slide Pt: `(x, y, width, height)`.
     pub rect: (f32, f32, f32, f32),
     /// Counter-clockwise degrees, matching [`TextItem::rotation`].
     pub rotation: f32,
@@ -112,6 +121,15 @@ pub struct ShapePlacement {
     pub shrunk: bool,
     /// Half-open range into the page's `text_items`.
     pub items: std::ops::Range<usize>,
+}
+
+/// Which layout path a [`ShapePlacement`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementKind {
+    /// A `p:sp` text body, in the rectangle the file declares for the shape.
+    Shape,
+    /// One `a:tc`, in a rectangle derived from the table's grid and rows.
+    TableCell,
 }
 
 /// Lay every slide out and return one [`Page`] per slide.
@@ -149,6 +167,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
     let mut out = SlideGeometry {
         pages: Vec::with_capacity(pkg.slides.len()),
         placements: Vec::with_capacity(pkg.slides.len()),
+        placed_table_cells: 0,
         unplaced_table_cells: 0,
         unplaced_diagram_bodies: 0,
     };
@@ -167,6 +186,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 registry,
                 items: &mut items,
                 placements: &mut placements,
+                placed_table_cells: &mut out.placed_table_cells,
                 unplaced_table_cells: &mut out.unplaced_table_cells,
                 unplaced_diagram_bodies: &mut out.unplaced_diagram_bodies,
             };
@@ -203,6 +223,7 @@ struct ShapeCtx<'a, 'r> {
     registry: &'a FontRegistry,
     items: &'a mut Vec<TextItem>,
     placements: &'a mut Vec<ShapePlacement>,
+    placed_table_cells: &'a mut usize,
     unplaced_table_cells: &'a mut usize,
     unplaced_diagram_bodies: &'a mut usize,
 }
@@ -223,14 +244,7 @@ fn layout_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
             }
         }
         ShapeKind::GraphicFrame(frame) => match &frame.payload {
-            pptx::GraphicFramePayload::Table(table) => {
-                *ctx.unplaced_table_cells += table
-                    .rows
-                    .iter()
-                    .flat_map(|r| r.cells.iter())
-                    .filter(|c| c.text.as_ref().is_some_and(|t| !t.is_empty()))
-                    .count();
-            }
+            pptx::GraphicFramePayload::Table(table) => layout_table(shape, table, ctx),
             pptx::GraphicFramePayload::Diagram { .. } => *ctx.unplaced_diagram_bodies += 1,
             pptx::GraphicFramePayload::Unsupported { .. } => {}
         },
@@ -291,51 +305,325 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
         return;
     }
 
-    // Convert through the DOCX path's own `DrawCommand` → `TextItem` code, on a
-    // synthetic page the size of the shape, so the two formats agree on how a
-    // baseline becomes a box (ascent above, descent below, width re-measured).
-    let shape_page = LayoutedPage {
+    let frame = Frame::new(slide_rect, extent);
+    let items = commands_to_items(commands, extent, ctx);
+    let first_item = ctx.items.len();
+    frame.push_items(items, (0.0, 0.0), ctx.items);
+
+    ctx.placements.push(ShapePlacement {
+        kind: PlacementKind::Shape,
+        rect: (
+            frame.origin.0,
+            frame.origin.1,
+            extent.width.raw(),
+            extent.height.raw(),
+        ),
+        rotation: frame.item_rotation(),
+        shrunk: auto_fit != ShapeAutoFit::NONE,
+        items: first_item..ctx.items.len(),
+    });
+}
+
+/// Convert a laid-out body's draw commands into [`TextItem`]s, in body-local Pt.
+///
+/// Goes through the DOCX path's own `DrawCommand` → `TextItem` code, on a
+/// synthetic page the size of the body's box, so the two formats agree on how a
+/// baseline becomes a box (ascent above, descent below, width re-measured).
+fn commands_to_items(
+    commands: Vec<liteparse_ooxml::render::layout::draw_command::DrawCommand>,
+    extent: PtSize,
+    ctx: &ShapeCtx<'_, '_>,
+) -> Vec<TextItem> {
+    if commands.is_empty() {
+        return Vec::new();
+    }
+    let page = LayoutedPage {
         commands,
         page_size: extent,
         block_starts: Vec::new(),
     };
-    let converted = docx_layout::layout_to_pages(&[shape_page], ctx.registry, false, false);
-    let Some(page) = converted.pages.into_iter().next() else {
-        return;
-    };
+    let converted = docx_layout::layout_to_pages(&[page], ctx.registry, false, false);
+    converted
+        .pages
+        .into_iter()
+        .next()
+        .map(|p| p.text_items)
+        .unwrap_or_default()
+}
 
-    let origin_x = emu_to_pt(slide_rect.rect.origin.x.raw()).raw();
-    let origin_y = emu_to_pt(slide_rect.rect.origin.y.raw()).raw();
-    // OOXML `@rot` is clockwise-positive; `TextItem::rotation` is
-    // counter-clockwise degrees.
-    let rot_deg = slide_rect.rotation.raw() as f32 / ANGLE_UNITS_PER_DEGREE;
-    let rotate = rot_deg != 0.0;
-    let (cx, cy) = (extent.width.raw() * 0.5, extent.height.raw() * 0.5);
-    let (sin, cos) = (rot_deg.to_radians().sin(), rot_deg.to_radians().cos());
+/// The rectangle a body's items are placed against: where it sits on the slide,
+/// and the rotation the whole frame carries.
+///
+/// A table needs this separated out from the body layout because one frame
+/// holds many boxes — every cell rotates about the **frame's** centre, not its
+/// own, or a rotated table would fan its cells apart.
+struct Frame {
+    origin: (f32, f32),
+    /// Frame-local centre of rotation.
+    centre: (f32, f32),
+    /// Clockwise degrees, as the file declares them.
+    rot_deg: f32,
+}
 
-    let first_item = ctx.items.len();
-    for mut item in page.text_items {
-        if rotate {
-            // Rotate the box's top-left about the shape centre, in shape-local
-            // space, then translate. The item keeps its unrotated width and
-            // height and states its angle, matching how the PDF path reports a
-            // rotated run — a rotated AABB would silently widen every box.
-            let (dx, dy) = (item.x - cx, item.y - cy);
-            item.x = cx + dx * cos - dy * sin;
-            item.y = cy + dx * sin + dy * cos;
-            item.rotation = -rot_deg;
+impl Frame {
+    fn new(slide_rect: liteparse_ooxml::pptx::SlideRect, extent: PtSize) -> Self {
+        Self {
+            origin: (
+                emu_to_pt(slide_rect.rect.origin.x.raw()).raw(),
+                emu_to_pt(slide_rect.rect.origin.y.raw()).raw(),
+            ),
+            centre: (extent.width.raw() * 0.5, extent.height.raw() * 0.5),
+            // OOXML `@rot` is clockwise-positive; `TextItem::rotation` is
+            // counter-clockwise degrees.
+            rot_deg: slide_rect.rotation.raw() as f32 / ANGLE_UNITS_PER_DEGREE,
         }
-        item.x += origin_x;
-        item.y += origin_y;
-        ctx.items.push(item);
     }
 
-    ctx.placements.push(ShapePlacement {
-        rect: (origin_x, origin_y, extent.width.raw(), extent.height.raw()),
-        rotation: -rot_deg,
-        shrunk: auto_fit != ShapeAutoFit::NONE,
-        items: first_item..ctx.items.len(),
-    });
+    /// The angle an item placed in this frame reports.
+    fn item_rotation(&self) -> f32 {
+        -self.rot_deg
+    }
+
+    /// Append `items` — in box-local Pt — onto the slide, where the box's own
+    /// top-left sits at `offset` within the frame.
+    fn push_items(&self, items: Vec<TextItem>, offset: (f32, f32), out: &mut Vec<TextItem>) {
+        let rotate = self.rot_deg != 0.0;
+        let (sin, cos) = (
+            self.rot_deg.to_radians().sin(),
+            self.rot_deg.to_radians().cos(),
+        );
+        for mut item in items {
+            item.x += offset.0;
+            item.y += offset.1;
+            if rotate {
+                // Rotate the box's top-left about the frame centre, in
+                // frame-local space, then translate. The item keeps its
+                // unrotated width and height and states its angle, matching how
+                // the PDF path reports a rotated run — a rotated AABB would
+                // silently widen every box.
+                let (dx, dy) = (item.x - self.centre.0, item.y - self.centre.1);
+                item.x = self.centre.0 + dx * cos - dy * sin;
+                item.y = self.centre.1 + dx * sin + dy * cos;
+                item.rotation = self.item_rotation();
+            }
+            item.x += self.origin.0;
+            item.y += self.origin.1;
+            out.push(item);
+        }
+    }
+}
+
+/// Lay a DrawingML table's cells out and append their items.
+///
+/// **The second layout path.** A cell's rectangle is not declared anywhere: it
+/// is derived from `a:gridCol` prefix sums across and `a:tr@h` down, both
+/// measured from the frame's own origin. Once the rectangle exists a cell is an
+/// ordinary DrawingML text body — `a:tcPr` carries the same four insets and the
+/// same anchor as an `a:bodyPr` — so everything below the rectangle is the
+/// shape path's code.
+///
+/// Two corpus facts decide the derivation, and both contradict the obvious
+/// implementation:
+///
+/// - **The frame's `@cx` is not the table's width.** It agrees with the grid on
+///   26 of 36 corpus tables; the other 10 are two decks whose producer writes a
+///   constant 236.2pt for every frame, up to 4x wrong. The grid is authoritative
+///   and the frame supplies only the origin.
+/// - **`a:tr@h` is a minimum, not a height** (§21.1.3.18). 16 corpus rows
+///   declare `h="0"`, which under a literal reading stacks every cell of the
+///   table at its top edge. So each row is grown to its tallest cell, which is
+///   why cells must be measured before any of them can be placed.
+fn layout_table(shape: &Shape, table: &pptx::Table, ctx: &mut ShapeCtx<'_, '_>) {
+    let text_cells = || {
+        table
+            .rows
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .filter(|c| !c.is_absorbed() && c.text.as_ref().is_some_and(|t| !t.is_empty()))
+            .count()
+    };
+    let Some(slide_rect) = shape.slide_rect else {
+        *ctx.unplaced_table_cells += text_cells();
+        return;
+    };
+    let col_edges = prefix_edges(table.grid.iter().map(|w| emu_to_pt(w.raw())));
+    if col_edges.len() < 2 || col_edges[col_edges.len() - 1] <= Pt::ZERO {
+        // No grid means no cell has a width to wrap in. Counted, not dropped
+        // silently — the markdown emitter still emits this table's text.
+        *ctx.unplaced_table_cells += text_cells();
+        return;
+    }
+
+    let default_family = theme_family(ctx.theme, false);
+    let line_height = ctx
+        .measurer
+        .default_line_height(&default_family, spec_default_size());
+
+    // Pass 1: build each cell's blocks and its width, and measure the height it
+    // needs. Blocks are kept because pass 2 stacks the very same ones — a
+    // rebuild would risk measuring one thing and placing another.
+    let mut cells: Vec<CellLayout> = Vec::new();
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        let mut col = 0usize;
+        for cell in &row.cells {
+            let span = cell.grid_span.max(1) as usize;
+            // An absorbed cell still holds its slot in the grid (§21.1.3.16),
+            // so the cursor advances past it even though nothing is drawn.
+            let start = col;
+            col += span;
+            if cell.is_absorbed() || start + 1 >= col_edges.len() {
+                continue;
+            }
+            let Some(body) = &cell.text else { continue };
+            let end = col.min(col_edges.len() - 1);
+            let width = col_edges[end] - col_edges[start];
+            if width <= Pt::ZERO {
+                *ctx.unplaced_table_cells += usize::from(!body.is_empty());
+                continue;
+            }
+
+            let body_pr = cell.properties.text_body_properties();
+            let blocks = cell_blocks(body, &default_family, ctx);
+            let needed = measure_shape_body(&blocks, width, Some(&body_pr), line_height);
+            cells.push(CellLayout {
+                row: row_idx,
+                row_span: cell.row_span.max(1) as usize,
+                left: col_edges[start],
+                width,
+                blocks,
+                body_pr,
+                needed,
+            });
+        }
+    }
+
+    let declared: Vec<Pt> = table
+        .rows
+        .iter()
+        .map(|r| {
+            r.height
+                .map_or(Pt::ZERO, |h| emu_to_pt(h.raw()))
+                .max(Pt::ZERO)
+        })
+        .collect();
+    let row_edges = prefix_edges(grown_row_heights(&declared, &cells).into_iter());
+
+    // Pass 2: place. Rotation is the frame's, about the frame's own centre.
+    let frame = Frame::new(
+        slide_rect,
+        PtSize {
+            width: emu_to_pt(slide_rect.rect.size.width.raw()),
+            height: emu_to_pt(slide_rect.rect.size.height.raw()),
+        },
+    );
+    for cell in cells {
+        let bottom = row_edges[(cell.row + cell.row_span).min(row_edges.len() - 1)];
+        let extent = PtSize {
+            width: cell.width,
+            height: bottom - row_edges[cell.row],
+        };
+        let commands = layout_shape_body(&cell.blocks, extent, Some(&cell.body_pr), line_height);
+        if commands.is_empty() {
+            continue;
+        }
+        let items = commands_to_items(commands, extent, ctx);
+        let offset = (cell.left.raw(), row_edges[cell.row].raw());
+        let first_item = ctx.items.len();
+        frame.push_items(items, offset, ctx.items);
+        if ctx.items.len() == first_item {
+            continue;
+        }
+        *ctx.placed_table_cells += 1;
+        // One placement per cell, not per table: the containment check is only
+        // worth anything against the box the text was actually wrapped in.
+        ctx.placements.push(ShapePlacement {
+            kind: PlacementKind::TableCell,
+            rect: (
+                frame.origin.0 + offset.0,
+                frame.origin.1 + offset.1,
+                extent.width.raw(),
+                extent.height.raw(),
+            ),
+            rotation: frame.item_rotation(),
+            shrunk: false,
+            items: first_item..ctx.items.len(),
+        });
+    }
+}
+
+/// Turn a run of lengths into the `n + 1` edges they define, starting at zero.
+///
+/// Both of a cell's coordinates come from one of these: `a:gridCol` widths
+/// across, grown row heights down. `edges[i]` is track `i`'s near edge, so a
+/// cell spanning `[i, i + span)` runs from `edges[i]` to `edges[i + span]` and a
+/// merge needs no special case.
+fn prefix_edges(lengths: impl Iterator<Item = Pt>) -> Vec<Pt> {
+    let mut edges = vec![Pt::ZERO];
+    let mut acc = Pt::ZERO;
+    for len in lengths {
+        acc += len;
+        edges.push(acc);
+    }
+    edges
+}
+
+/// §21.1.3.18: each row's declared `@h` raised to fit its tallest cell.
+///
+/// `@h` is a **minimum**, and treating it as the height is not a rounding
+/// error: 16 corpus rows declare `h="0"`, which stacks every cell of those
+/// tables at the table's top edge.
+///
+/// A row-spanning cell is deliberately excluded from its row's growth. Its
+/// content is shared across every row it covers, so charging the whole height
+/// to the first of them would push every later row down — the spanning cell
+/// instead takes the summed rectangle and may overflow it, which is what
+/// `@vertOverflow`'s default already describes.
+fn grown_row_heights(declared: &[Pt], cells: &[CellLayout]) -> Vec<Pt> {
+    let mut heights = declared.to_vec();
+    for cell in cells {
+        if cell.row_span == 1
+            && let Some(h) = heights.get_mut(cell.row)
+        {
+            *h = (*h).max(cell.needed);
+        }
+    }
+    heights
+}
+
+/// One table cell, measured and waiting for its row's height to be decided.
+struct CellLayout {
+    row: usize,
+    row_span: usize,
+    /// Frame-local left edge and the width the grid gives this cell.
+    left: Pt,
+    width: Pt,
+    blocks: Vec<LayoutBlock>,
+    body_pr: liteparse_ooxml::model::BodyProperties,
+    /// Height this cell's text needs at `width`, insets included.
+    needed: Pt,
+}
+
+/// A cell's paragraphs as layout blocks.
+///
+/// Resolved exactly as `pptx::cell_text` resolves them for markdown — the
+/// cell's own `a:lstStyle` as the shape rung and **no placeholder**, since a
+/// cell fills none. Diverging here would box text the emitter never wrote.
+fn cell_blocks(
+    body: &TextBody,
+    default_family: &str,
+    ctx: &mut ShapeCtx<'_, '_>,
+) -> Vec<LayoutBlock> {
+    let cascade = TextCascade {
+        shape: Some(&body.list_style),
+        ..ctx.cascade
+    };
+    body.paragraphs
+        .iter()
+        .map(|para| {
+            let resolved = cascade.resolve(&para.properties, None);
+            paragraph_block(para, &resolved, default_family, ShapeAutoFit::NONE, ctx)
+        })
+        .collect()
 }
 
 /// One `a:p` as a [`LayoutBlock::Paragraph`], with every run measured.
@@ -590,6 +878,69 @@ mod tests {
     fn emu_converts_at_12700_per_point() {
         assert_eq!(emu_to_pt(914_400), Pt::new(72.0));
         assert_eq!(emu_to_pt(0), Pt::ZERO);
+    }
+
+    fn cell(row: usize, row_span: usize, needed: f32) -> CellLayout {
+        CellLayout {
+            row,
+            row_span,
+            left: Pt::ZERO,
+            width: Pt::new(100.0),
+            blocks: Vec::new(),
+            body_pr: liteparse_ooxml::pptx::TableCellProperties::default().text_body_properties(),
+            needed: Pt::new(needed),
+        }
+    }
+
+    #[test]
+    fn prefix_edges_bracket_every_track() {
+        let e = prefix_edges([Pt::new(10.0), Pt::new(20.0), Pt::new(5.0)].into_iter());
+        assert_eq!(
+            e,
+            vec![Pt::ZERO, Pt::new(10.0), Pt::new(30.0), Pt::new(35.0)]
+        );
+        // A cell spanning columns 1..3 reads its span straight off the edges.
+        assert_eq!(e[3] - e[1], Pt::new(25.0));
+        // No tracks is one edge, not zero — the caller checks for `< 2`.
+        assert_eq!(prefix_edges(std::iter::empty()), vec![Pt::ZERO]);
+    }
+
+    #[test]
+    fn row_grows_to_its_tallest_cell_but_never_shrinks() {
+        // `@h` is a minimum (§21.1.3.18): a taller cell raises the row, a
+        // shorter one leaves the declared height alone.
+        let declared = vec![Pt::new(20.0), Pt::new(50.0)];
+        let grown = grown_row_heights(&declared, &[cell(0, 1, 35.0), cell(1, 1, 10.0)]);
+        assert_eq!(grown, vec![Pt::new(35.0), Pt::new(50.0)]);
+    }
+
+    #[test]
+    fn zero_declared_height_is_grown_not_taken_literally() {
+        // 16 corpus rows declare `h="0"`. Taken literally every row edge is
+        // zero and the whole table collapses onto its top edge — text that is
+        // still inside the frame, and therefore invisible to a containment
+        // check.
+        let grown = grown_row_heights(&[Pt::ZERO, Pt::ZERO], &[cell(0, 1, 18.0), cell(1, 1, 24.0)]);
+        assert_eq!(grown, vec![Pt::new(18.0), Pt::new(24.0)]);
+        let edges = prefix_edges(grown.into_iter());
+        assert_eq!(edges[1], Pt::new(18.0));
+        assert!(edges[2] > edges[1], "rows must not share an edge");
+    }
+
+    #[test]
+    fn a_row_spanning_cell_does_not_grow_the_row_it_starts_in() {
+        // Its content belongs to every row it covers, so charging the height to
+        // the first would push all the later rows down the slide.
+        let declared = vec![Pt::new(10.0), Pt::new(10.0)];
+        let grown = grown_row_heights(&declared, &[cell(0, 2, 500.0)]);
+        assert_eq!(grown, declared);
+    }
+
+    #[test]
+    fn a_cell_naming_a_row_off_the_end_is_ignored() {
+        // Malformed input must not panic or silently resize the table.
+        let declared = vec![Pt::new(10.0)];
+        assert_eq!(grown_row_heights(&declared, &[cell(7, 1, 99.0)]), declared);
     }
 
     #[test]

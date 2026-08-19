@@ -128,6 +128,41 @@ impl BodyAnchor {
     }
 }
 
+/// The height `blocks` need inside a body `extent_width` wide, insets included.
+///
+/// For the caller that must size a box *before* it can place text in it: a
+/// DrawingML table row is a minimum height that grows to fit its tallest cell
+/// (§21.1.3.18), so the row's rectangle is not known until every cell in it has
+/// been measured, and the cell cannot be laid out until the rectangle is.
+///
+/// Only the width is taken, because only the width changes the answer — height
+/// feeds the anchor and `@vertOverflow`, both of which move or drop lines that
+/// are already stacked. So this measures exactly what [`layout_shape_body`]
+/// will stack, without needing a provisional height to hand it.
+pub fn measure_shape_body(
+    blocks: &[LayoutBlock],
+    extent_width: Pt,
+    body_pr: Option<&crate::model::BodyProperties>,
+    line_height: Pt,
+) -> Pt {
+    let insets = BodyInsets::resolve(body_pr);
+    let content_width = (extent_width - insets.left - insets.right).max(Pt::ZERO);
+    if content_width <= Pt::ZERO {
+        // Nothing can wrap here, so the body contributes only its own insets.
+        // Returning zero would let a zero-width column collapse a row that
+        // still has to draw its borders.
+        return insets.top + insets.bottom;
+    }
+    let result = crate::render::layout::section::stack_blocks(
+        blocks,
+        content_width,
+        line_height,
+        None,
+        PageParity::Odd,
+    );
+    insets.top + result.height + insets.bottom
+}
+
 /// Lay `blocks` out inside a shape of size `extent`, honouring the body's
 /// insets, anchor and `@vertOverflow`.
 ///

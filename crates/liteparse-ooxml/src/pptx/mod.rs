@@ -24,7 +24,7 @@ pub use geometry::{GeometryStats, SlideRect, apply_slide_geometry};
 pub use package::{EMU_PER_POINT, Part, PresentationInfo, PresentationPackage, SlideParts, walk};
 pub use shapes::{
     AutoShape, Connector, GraphicFrame, GraphicFramePayload, Group, Placeholder, PlaceholderKind,
-    Shape, ShapeKind, Table, TableCell, TableRow, parse_shape_tree, visit_all,
+    Shape, ShapeKind, Table, TableCell, TableCellProperties, TableRow, parse_shape_tree, visit_all,
 };
 pub use text::{
     AutoNumberScheme, Bullet, ListStyle, Spacing, TextBody, TextParagraph, TextParagraphProperties,
