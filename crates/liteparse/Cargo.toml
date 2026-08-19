@@ -26,6 +26,14 @@ required-features = ["pptx-native"]
 name = "pptx_layout_probe"
 required-features = ["pptx-native"]
 
+[[example]]
+name = "pptx_paint_census"
+required-features = ["pptx-native"]
+
+[[example]]
+name = "pptx_raster_dump"
+required-features = ["pptx-native"]
+
 [features]
 default = ["tesseract", "docx-native", "pptx-native"]
 oar-ocr = ["dep:oar-ocr"]

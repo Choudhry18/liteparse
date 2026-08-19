@@ -67,6 +67,31 @@ pub enum PathVerb {
     Close,
 }
 
+/// §20.1.9.11's angle constants, in the `@stAng`/`@swAng` unit (60000ths of a
+/// degree). `QUARTER` is the spec's `cd4`, `HALF` its `cd2`, `THREE_QUARTER`
+/// its `3cd4` — named here because a preset generator writes them literally
+/// where a `custGeom` would reference the guide.
+pub mod turn {
+    pub const NONE: i64 = 0;
+    pub const QUARTER: i64 = 5_400_000;
+    pub const HALF: i64 = 10_800_000;
+    pub const THREE_QUARTER: i64 = 16_200_000;
+}
+
+/// One `<a:arcTo>`: a sweep of `swing` starting at `start`, from wherever the
+/// pen already is.
+///
+/// The angles pass through in OOXML's own units — the painter applies them
+/// directly to a clockwise-from-3-o'clock parametrisation, so converting here
+/// would only invite a second conversion downstream.
+pub(crate) fn arc(rx: Pt, ry: Pt, start: i64, swing: i64) -> PathVerb {
+    PathVerb::ArcTo {
+        radii: PtSize::new(rx, ry),
+        start_angle: Dimension::new(start),
+        swing_angle: Dimension::new(swing),
+    }
+}
+
 /// Build a `ShapePath` for a parsed `ShapeGeometry` given the shape's
 /// rendered extent.
 ///

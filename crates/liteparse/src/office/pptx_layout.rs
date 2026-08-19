@@ -37,6 +37,17 @@
 //! Reading order and the text cascade both come from [`super::pptx`], through
 //! `Deck::prepare`, so a `TextItem` is a box for exactly the text the markdown
 //! emitter saw, resolved the same way.
+//!
+//! # Two walks, one prepare
+//!
+//! Text is emitted in reading order; **fills and outlines are emitted in
+//! document order**, by [`paint_shapes`], because §19.3.1.45 makes document
+//! order z-order and the paint census measured 29.1% of the corpus pairs where
+//! that difference is observable coming out the wrong way round under reading
+//! order. The two walks share one `Deck::prepare`, so they cannot disagree
+//! about a rectangle or a cascade; what they deliberately do not share is the
+//! chrome filter, the traversal order, and the placement mechanism — a text
+//! body is bracketed, a path places itself.
 
 use liteparse_ooxml::model::{Alignment, Theme};
 use liteparse_ooxml::pptx::{
@@ -48,7 +59,7 @@ use liteparse_ooxml::render::fonts::FontRegistry;
 use liteparse_ooxml::render::geometry::{PtOffset, PtSize};
 use liteparse_ooxml::render::layout::ShapeAutoFit;
 use liteparse_ooxml::render::layout::draw_command::{
-    DrawCommand, LayoutedPage, ShapeTransform, TransformMark,
+    DrawCommand, LayoutedPage, ResolvedFill, ShapeTransform, TransformMark,
 };
 use liteparse_ooxml::render::layout::fragment::{
     Fragment, emit_run_fragments, font_props_from_run,
@@ -59,6 +70,10 @@ use liteparse_ooxml::render::layout::section::LayoutBlock;
 use liteparse_ooxml::render::layout::shape_body::{layout_shape_body, measure_shape_body};
 use liteparse_ooxml::render::resolve::color::RgbColor;
 use liteparse_ooxml::render::resolve::fonts::resolve_font_set_themes;
+use liteparse_ooxml::render::resolve::shape_geometry::build_geometry;
+use liteparse_ooxml::render::resolve::shape_visuals::resolve_shape_visuals;
+
+use std::collections::HashMap;
 
 use crate::error::LiteParseError;
 use crate::office::docx_layout;
@@ -113,6 +128,18 @@ pub struct SlideGeometry {
     /// emitter places the *frame* in reading order, which is a weaker claim
     /// than a per-run box.
     pub unplaced_diagram_bodies: usize,
+    /// Shapes the paint walk emitted a [`DrawCommand::Path`] for.
+    pub painted_shapes: usize,
+    /// Shapes that resolve to a fill or a stroke but whose geometry this pass
+    /// cannot build — an unimplemented preset, or none declared. Their text is
+    /// still laid out; only their ink is missing.
+    pub unpainted_shapes: usize,
+    /// Painted shapes whose `<a:ln>` names no colour of its own, so the shared
+    /// resolver defaults it to black where DrawingML would inherit
+    /// `p:style/a:lnRef`. The census put this at 7.7% of strokes; it is the one
+    /// place this pass paints something *wrong* rather than painting nothing,
+    /// and it is counted rather than hidden until `p:style` is parsed.
+    pub outlines_defaulted_black: usize,
 }
 
 /// Where one text body's items landed on its slide — a shape's, or a single
@@ -133,6 +160,15 @@ pub struct ShapePlacement {
     pub shrunk: bool,
     /// Half-open range into the page's `text_items`.
     pub items: std::ops::Range<usize>,
+    /// Index into the page's `commands` of the `Transform(Begin)` that placed
+    /// this box.
+    ///
+    /// An explicit link, not an ordinal one. The command list also carries the
+    /// paint walk's shapes — four in five of which have no text body at all —
+    /// so "the *n*th bracket is the *n*th placement" was only ever true by
+    /// accident of the text walk running alone, and a check built on it would
+    /// silently stop testing anything the moment a second producer appeared.
+    pub bracket: usize,
 }
 
 /// Which layout path a [`ShapePlacement`] came from.
@@ -160,13 +196,13 @@ pub fn slides_to_pages(
 }
 
 fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeometry {
-    // Parsed once per deck. `pkg.theme` is the first master's theme — a
-    // multi-master deck loses the per-master theme, which `pptx::walk` already
-    // documents as a known limit of the package walk rather than of this pass.
-    let theme = pkg
-        .theme
-        .as_ref()
-        .and_then(|bytes| liteparse_ooxml::docx::parse::theme::parse_theme(bytes).ok());
+    // Parsed once per *theme part*, not once per deck and not once per slide.
+    // A deck-wide theme was tolerable while the theme only supplied fonts; a
+    // fill resolves its colour through the theme's colour matrix, and a slide
+    // under a second master would then take a real, wrong colour from the
+    // first master's palette — which is worse than no colour at all, because
+    // nothing about the output says it came from the wrong place.
+    let mut themes: HashMap<String, Option<Theme>> = HashMap::new();
 
     let measurer = TextMeasurer::new(registry);
     let (slide_w, slide_h) = pkg.info.slide_size_pt();
@@ -183,19 +219,23 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         placed_table_cells: 0,
         unplaced_table_cells: 0,
         unplaced_diagram_bodies: 0,
+        painted_shapes: 0,
+        unpainted_shapes: 0,
+        outlines_defaulted_black: 0,
     };
 
     for (idx, slide) in pkg.slides.iter().enumerate() {
         let mut items = Vec::new();
         let mut placements = Vec::new();
         let mut commands = Vec::new();
+        let theme = slide_theme(pkg, slide, &mut themes);
         // A slide whose shape tree will not parse still yields a page. Page
         // count must equal slide count — a consumer indexes pages by slide.
         if let Some(prepared) = deck.prepare(slide) {
             let cascade = prepared.cascade();
             let mut ctx = ShapeCtx {
                 cascade,
-                theme: theme.as_ref(),
+                theme,
                 measurer: &measurer,
                 registry,
                 items: &mut items,
@@ -204,7 +244,13 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 placed_table_cells: &mut out.placed_table_cells,
                 unplaced_table_cells: &mut out.unplaced_table_cells,
                 unplaced_diagram_bodies: &mut out.unplaced_diagram_bodies,
+                painted_shapes: &mut out.painted_shapes,
+                unpainted_shapes: &mut out.unpainted_shapes,
+                outlines_defaulted_black: &mut out.outlines_defaulted_black,
             };
+            // Two walks over one `prepare`, in the order the raster wants
+            // them. See [`paint_shape`] for why they cannot be one walk.
+            paint_shapes(&prepared.shapes, &mut ctx);
             for shape in reading_order(&prepared.shapes) {
                 layout_shape(shape, &mut ctx);
             }
@@ -251,6 +297,9 @@ struct ShapeCtx<'a, 'r> {
     placed_table_cells: &'a mut usize,
     unplaced_table_cells: &'a mut usize,
     unplaced_diagram_bodies: &'a mut usize,
+    painted_shapes: &'a mut usize,
+    unpainted_shapes: &'a mut usize,
+    outlines_defaulted_black: &'a mut usize,
 }
 
 impl ShapeCtx<'_, '_> {
@@ -262,13 +311,139 @@ impl ShapeCtx<'_, '_> {
     /// bracket is the *only* place a slide coordinate is introduced, and the
     /// two consumers cannot drift apart by one of them shifting and the other
     /// not.
-    fn push_bracketed(&mut self, placement: ShapeTransform, commands: Vec<DrawCommand>) {
+    /// Returns the index of the `Begin` mark, which is the placement's link
+    /// back into the command list.
+    fn push_bracketed(&mut self, placement: ShapeTransform, commands: Vec<DrawCommand>) -> usize {
+        let at = self.commands.len();
         self.commands
             .push(DrawCommand::Transform(TransformMark::Begin(placement)));
         self.commands.extend(commands);
         self.commands
             .push(DrawCommand::Transform(TransformMark::End));
+        at
     }
+}
+
+/// Paint every shape on the slide, in document order.
+///
+/// **A second traversal, and it has to be.** The text walk uses
+/// [`reading_order`], which sorts shapes into bands and drops chrome; both
+/// halves are right for reading and wrong for painting. §19.3.1.45 makes
+/// document order z-order, and the paint census found that of the 1,263 corpus
+/// pairs where two fills overlap — i.e. where paint order is observable at all
+/// — reading order sequences **368 (29.1%)** the wrong way round, on 7.3% of
+/// slides. A backdrop panel authored last and read first would paint over the
+/// content it belongs under.
+///
+/// The two walks share one `Deck::prepare`, so the rectangles and the cascade
+/// they see are the same ones by construction. What is *not* shared is the
+/// chrome filter: this walk paints chrome, the text walk still drops it, and
+/// the 347 chrome shapes that carry text are a divergence this step leaves
+/// open rather than closes (see the module-level note in the plan).
+fn paint_shapes(shapes: &[Shape], ctx: &mut ShapeCtx<'_, '_>) {
+    for shape in shapes {
+        paint_shape(shape, ctx);
+        if let ShapeKind::Group(group) = &shape.kind {
+            // A group's own `grpSpPr` fill is not lowered to `ShapeProperties`
+            // at all, so a group paints nothing itself — its children carry
+            // every fill, in their own declaration order.
+            paint_shapes(&group.children, ctx);
+        }
+    }
+}
+
+/// One shape's fill and outline as a [`DrawCommand::Path`], if it puts ink on
+/// the slide.
+///
+/// Unlike a text body this needs no bracket: `Path` carries its own
+/// origin/rotation/flip/extent and the painter composes them, so the shape is
+/// self-placing. That also lets it carry the two flips, which a text bracket
+/// deliberately does not — §20.1.7.6 mirrors a shape's *geometry*, and
+/// PowerPoint does not mirror the text inside it.
+fn paint_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
+    let Some(props) = shape_properties(shape) else {
+        return;
+    };
+    // `p:style`'s `fillRef`/`lnRef`/`effectRef` are not parsed yet, so the
+    // three style arguments are `None` and 3,381 corpus shapes with no `spPr`
+    // fill element resolve to nothing. That is an *under*-paint: visible, but
+    // never misleading.
+    let visuals = resolve_shape_visuals(Some(props), None, None, None, ctx.theme);
+    let paints = !matches!(visuals.fill, ResolvedFill::None) || visuals.stroke.is_some();
+    if !paints {
+        return;
+    }
+
+    let Some(slide_rect) = shape.slide_rect else {
+        *ctx.unpainted_shapes += 1;
+        return;
+    };
+    // The *bounding* box, not the raw rect: `pptx::geometry` composes group
+    // transforms into `slide_rect`, and a rotated or skewed child's ink lives
+    // in the box that composition produced.
+    let box_ = slide_rect.bounding_box();
+    let extent = PtSize {
+        width: emu_to_pt(box_.size.width.raw()),
+        height: emu_to_pt(box_.size.height.raw()),
+    };
+    let Some(geometry) = props.geometry.as_ref() else {
+        *ctx.unpainted_shapes += 1;
+        return;
+    };
+    let Some(path) = build_geometry(geometry, extent) else {
+        // An unimplemented preset. Counted, never approximated by its bounding
+        // box: a `rect` drawn where a `cloud` was asked for is a wrong slide,
+        // not a coarse one.
+        *ctx.unpainted_shapes += 1;
+        return;
+    };
+
+    if visuals.stroke.is_some() && props.outline.as_ref().is_some_and(|o| o.fill.is_none()) {
+        *ctx.outlines_defaulted_black += 1;
+    }
+    *ctx.painted_shapes += 1;
+    ctx.commands.push(DrawCommand::Path {
+        origin: PtOffset::new(
+            emu_to_pt(box_.origin.x.raw()),
+            emu_to_pt(box_.origin.y.raw()),
+        ),
+        rotation: slide_rect.rotation,
+        flip_h: slide_rect.flip_h,
+        flip_v: slide_rect.flip_v,
+        extent,
+        paths: path.paths,
+        fill: visuals.fill,
+        stroke: visuals.stroke,
+        effects: visuals.effects,
+    });
+}
+
+/// The `spPr` a shape paints from. Groups and graphic frames have none of
+/// their own — a table's cell fills are `a:tcPr`, which this pass does not
+/// paint yet.
+fn shape_properties(shape: &Shape) -> Option<&liteparse_ooxml::model::ShapeProperties> {
+    match &shape.kind {
+        ShapeKind::AutoShape(sp) => sp.properties.as_ref(),
+        ShapeKind::Connector(c) => c.properties.as_ref(),
+        ShapeKind::Picture(p) => p.shape_properties.as_ref(),
+        ShapeKind::Group(_) | ShapeKind::GraphicFrame(_) => None,
+    }
+}
+
+/// The theme governing one slide, parsed once per theme *part*.
+fn slide_theme<'a>(
+    pkg: &PresentationPackage,
+    slide: &pptx::SlideParts,
+    cache: &'a mut HashMap<String, Option<Theme>>,
+) -> Option<&'a Theme> {
+    let path = slide.theme_path.clone()?;
+    cache
+        .entry(path)
+        .or_insert_with(|| {
+            pkg.theme_for(slide)
+                .and_then(|bytes| liteparse_ooxml::docx::parse::theme::parse_theme(bytes).ok())
+        })
+        .as_ref()
 }
 
 fn layout_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
@@ -349,7 +524,7 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
     }
 
     let frame = Frame::new(slide_rect, extent);
-    ctx.push_bracketed(frame.place((0.0, 0.0), extent), commands.clone());
+    let bracket = ctx.push_bracketed(frame.place((0.0, 0.0), extent), commands.clone());
     let items = commands_to_items(commands, extent, ctx);
     let first_item = ctx.items.len();
     frame.push_items(items, (0.0, 0.0), ctx.items);
@@ -365,6 +540,7 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
         rotation: frame.item_rotation(),
         shrunk: auto_fit != ShapeAutoFit::NONE,
         items: first_item..ctx.items.len(),
+        bracket,
     });
 }
 
@@ -617,7 +793,7 @@ fn layout_table(shape: &Shape, table: &pptx::Table, ctx: &mut ShapeCtx<'_, '_>) 
             continue;
         }
         let offset = (cell.left.raw(), row_edges[cell.row].raw());
-        ctx.push_bracketed(frame.place(offset, extent), commands.clone());
+        let bracket = ctx.push_bracketed(frame.place(offset, extent), commands.clone());
         let items = commands_to_items(commands, extent, ctx);
         let first_item = ctx.items.len();
         frame.push_items(items, offset, ctx.items);
@@ -638,6 +814,7 @@ fn layout_table(shape: &Shape, table: &pptx::Table, ctx: &mut ShapeCtx<'_, '_>) 
             rotation: frame.item_rotation(),
             shrunk: false,
             items: first_item..ctx.items.len(),
+            bracket,
         });
     }
 }

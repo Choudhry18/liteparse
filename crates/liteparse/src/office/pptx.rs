@@ -97,7 +97,8 @@ pub fn emit_with_sources(
 /// Both rungs are keyed by part *path* and rebuilt once per path, never once
 /// per slide. Every previous PPTX probe records this discipline because a deck
 /// with 60 slides sharing 3 layouts otherwise reparses those layouts 60 times.
-pub(crate) struct Deck {
+#[doc(hidden)]
+pub struct Deck {
     master_geo: HashMap<String, PlaceholderGeometry>,
     layout_geo: HashMap<String, PlaceholderGeometry>,
     master_text: HashMap<String, (PlaceholderTextStyles, DeckTextDefaults)>,
@@ -118,8 +119,9 @@ pub(crate) struct Deck {
 /// `TextItem` is only a faithful box for the markdown a reader sees if both
 /// came out of the same resolution. Two copies of this setup would compile,
 /// run, and disagree silently.
-pub(crate) struct PreparedSlide<'d> {
-    pub(crate) shapes: Vec<Shape>,
+#[doc(hidden)]
+pub struct PreparedSlide<'d> {
+    pub shapes: Vec<Shape>,
     layout_text: Option<&'d PlaceholderTextStyles>,
     master_text: Option<&'d PlaceholderTextStyles>,
     deck_defaults: &'d DeckTextDefaults,
@@ -128,7 +130,7 @@ pub(crate) struct PreparedSlide<'d> {
 impl<'d> PreparedSlide<'d> {
     /// The slide-level text cascade (rungs 4-7). Rung 2, the shape's own
     /// `a:lstStyle`, is layered on per text body by the caller.
-    pub(crate) fn cascade(&self) -> TextCascade<'d> {
+    pub fn cascade(&self) -> TextCascade<'d> {
         TextCascade {
             shape: None,
             layout: self.layout_text,
@@ -139,7 +141,7 @@ impl<'d> PreparedSlide<'d> {
 }
 
 impl Deck {
-    pub(crate) fn new(pkg: &PresentationPackage) -> Self {
+    pub fn new(pkg: &PresentationPackage) -> Self {
         // Rung 7. A deck whose presentation.xml will not parse still
         // resolves through the earlier rungs, so this degrades to empty
         // rather than failing the deck.
@@ -163,7 +165,7 @@ impl Deck {
     ///
     /// `None` when the shape tree will not parse — fail-open, the same slide
     /// is skipped by every walk.
-    pub(crate) fn prepare(&mut self, slide: &pptx::SlideParts) -> Option<PreparedSlide<'_>> {
+    pub fn prepare(&mut self, slide: &pptx::SlideParts) -> Option<PreparedSlide<'_>> {
         self.prime(slide);
 
         let mut shapes = pptx::parse_shape_tree(&slide.slide.xml).ok()?;
@@ -290,7 +292,13 @@ struct SlideCtx<'a> {
 /// A group is one unit. Its children are emitted in their own reading order
 /// within it, so a two-column group does not interleave with unrelated shapes
 /// elsewhere on the slide.
-pub(crate) fn reading_order(shapes: &[Shape]) -> Vec<&Shape> {
+///
+/// Public — and `doc(hidden)` — so that a probe or census can measure *this*
+/// order rather than a copy of it. A duplicate that drifted by one tie-break
+/// would report the production traversal as correct while measuring a
+/// different one.
+#[doc(hidden)]
+pub fn reading_order(shapes: &[Shape]) -> Vec<&Shape> {
     let mut v: Vec<&Shape> = shapes
         .iter()
         .filter(|s| !is_chrome(s.placeholder.as_ref()))
@@ -312,7 +320,8 @@ pub(crate) fn reading_order(shapes: &[Shape]) -> Vec<&Shape> {
     v
 }
 
-pub(crate) fn is_title(ph: Option<&Placeholder>) -> bool {
+#[doc(hidden)]
+pub fn is_title(ph: Option<&Placeholder>) -> bool {
     matches!(
         ph.map(|p| p.kind),
         Some(PlaceholderKind::Title | PlaceholderKind::CtrTitle)
@@ -327,7 +336,8 @@ pub(crate) fn is_title(ph: Option<&Placeholder>) -> bool {
 /// Dropping them wholesale is the conservative choice for now because a
 /// length test would also admit genuine repeated footer chrome on every
 /// slide of a 60-slide deck; revisit with a measurement, not a guess.
-fn is_chrome(ph: Option<&Placeholder>) -> bool {
+#[doc(hidden)]
+pub fn is_chrome(ph: Option<&Placeholder>) -> bool {
     matches!(
         ph.map(|p| p.kind),
         Some(
