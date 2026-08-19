@@ -13,6 +13,19 @@ pub struct Theme {
     /// `fill_styles[0]`. `phClr` inside the fill is substituted by the ref's
     /// color at resolve time.
     pub fill_styles: Vec<DrawingFill>,
+    /// §20.1.4.1.7 bgFillStyleLst — the *background* fill matrix, a list
+    /// distinct from [`Self::fill_styles`] and reached only through a
+    /// §19.3.1.3 `<p:bgRef>` whose `idx` is 1001 or greater (`idx - 1000`,
+    /// then 0-based here). A shape's `<a:fillRef>` never reaches it.
+    ///
+    /// Parsed because the corpus leaves no choice: **all 440 `bgRef`
+    /// backgrounds across the 45-deck PPTX corpus use `idx="1001"`, and not
+    /// one uses `fillStyleLst`.** Resolving those against `fill_styles` — a
+    /// 3-entry list — is an out-of-range lookup that yields `None` and
+    /// renders every one of them with no background at all, silently. All
+    /// 115 corpus themes declare a 3-entry `bgFillStyleLst`, so with this
+    /// field the same 440 resolve.
+    pub bg_fill_styles: Vec<DrawingFill>,
     /// §20.1.4.1.21 lnStyleLst — theme line styles referenced via
     /// `<a:lnRef idx="N">`. 0-based in storage — `lnRef idx="1"` is
     /// `line_styles[0]`.

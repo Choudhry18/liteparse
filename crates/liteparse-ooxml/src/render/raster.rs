@@ -41,7 +41,7 @@ use crate::render::fonts::{FontRegistry, FontStyle, TypefaceEntry};
 use crate::render::geometry::{PtOffset, PtRect};
 use crate::render::layout::draw_command::{
     DrawCommand, LayoutedPage, ResolvedDashPattern, ResolvedFill, ResolvedLineCap,
-    ResolvedLineJoin, ResolvedStroke,
+    ResolvedLineJoin, ResolvedStroke, TransformMark,
 };
 use crate::render::resolve::color::RgbColor;
 use crate::render::resolve::drawing_color::Rgba;
@@ -105,10 +105,26 @@ pub fn rasterize_page(
         RasterPass::Media,
         RasterPass::Ink,
     ] {
+        // The shape-local → page transform opened by the innermost
+        // `DrawCommand::Transform` bracket, or the identity outside one.
+        // Tracked per pass, and updated *before* the pass filter: every pass
+        // walks the whole command list, so a bracket skipped as "not my pass"
+        // would leave the pass that does paint inside it in the wrong space.
+        let mut local = Transform::identity();
         for cmd in &page.commands {
+            if let DrawCommand::Transform(mark) = cmd {
+                local = match mark {
+                    TransformMark::Begin(t) => {
+                        place_transform(t.origin, t.rotation, t.flip_h, t.flip_v, t.extent)
+                    }
+                    TransformMark::End => Transform::identity(),
+                };
+                continue;
+            }
             if raster_pass(cmd) != Some(pass) {
                 continue;
             }
+            let device = device.pre_concat(local);
             match cmd {
                 DrawCommand::Text {
                     position,
@@ -181,25 +197,9 @@ pub fn rasterize_page(
                     stroke,
                     effects: _, // shadow/glow: skipped at this tier
                 } => {
-                    // Shape-local Pt → page Pt: flips and rotation happen about
-                    // the shape's center, then the shape lands at `origin`.
-                    let (cx, cy) = (extent.width.raw() / 2.0, extent.height.raw() / 2.0);
-                    let mut place = Transform::from_translate(origin.x.raw(), origin.y.raw());
-                    let deg = rotation.raw() as f32 / 60_000.0;
-                    if deg != 0.0 {
-                        place = place.pre_concat(Transform::from_rotate_at(deg, cx, cy));
-                    }
-                    if *flip_h || *flip_v {
-                        let (sx, sy) = (
-                            if *flip_h { -1.0 } else { 1.0 },
-                            if *flip_v { -1.0 } else { 1.0 },
-                        );
-                        place = place
-                            .pre_concat(Transform::from_translate(cx, cy))
-                            .pre_concat(Transform::from_scale(sx, sy))
-                            .pre_concat(Transform::from_translate(-cx, -cy));
-                    }
-                    let transform = device.pre_concat(place);
+                    let transform = device.pre_concat(place_transform(
+                        *origin, *rotation, *flip_h, *flip_v, *extent,
+                    ));
                     for sub in paths {
                         draw_subpath(&mut pixmap, sub, fill, stroke.as_ref(), transform);
                     }
@@ -210,7 +210,8 @@ pub fn rasterize_page(
                 DrawCommand::LinkAnnotation { .. }
                 | DrawCommand::InternalLink { .. }
                 | DrawCommand::NamedDestination { .. }
-                | DrawCommand::Outline(_) => {}
+                | DrawCommand::Outline(_)
+                | DrawCommand::Transform(_) => {}
             }
         }
     }
@@ -250,8 +251,44 @@ fn raster_pass(cmd: &DrawCommand) -> Option<RasterPass> {
         DrawCommand::LinkAnnotation { .. }
         | DrawCommand::InternalLink { .. }
         | DrawCommand::NamedDestination { .. }
-        | DrawCommand::Outline(_) => None,
+        | DrawCommand::Outline(_)
+        // Handled before this filter runs — a bracket belongs to no single
+        // pass, it changes the space every pass paints the run in.
+        | DrawCommand::Transform(_) => None,
     }
+}
+
+/// Shape-local Pt → page Pt: flips and rotation happen about the shape's
+/// centre, then the shape lands at `origin`.
+///
+/// Shared by [`DrawCommand::Path`], which carries these fields inline, and by
+/// the [`TransformMark`] bracket, which carries the same five for a run of
+/// commands. One function so a bracketed text body and a shape's own geometry
+/// cannot land in different places on the same slide.
+fn place_transform(
+    origin: PtOffset,
+    rotation: crate::model::dimension::Dimension<crate::model::dimension::SixtieThousandthDeg>,
+    flip_h: bool,
+    flip_v: bool,
+    extent: crate::render::geometry::PtSize,
+) -> Transform {
+    let (cx, cy) = (extent.width.raw() / 2.0, extent.height.raw() / 2.0);
+    let mut place = Transform::from_translate(origin.x.raw(), origin.y.raw());
+    let deg = rotation.raw() as f32 / 60_000.0;
+    if deg != 0.0 {
+        place = place.pre_concat(Transform::from_rotate_at(deg, cx, cy));
+    }
+    if flip_h || flip_v {
+        let (sx, sy) = (
+            if flip_h { -1.0 } else { 1.0 },
+            if flip_v { -1.0 } else { 1.0 },
+        );
+        place = place
+            .pre_concat(Transform::from_translate(cx, cy))
+            .pre_concat(Transform::from_scale(sx, sy))
+            .pre_concat(Transform::from_translate(-cx, -cy));
+    }
+    place
 }
 
 // ─── Text ───────────────────────────────────────────────────────────────────
@@ -665,4 +702,121 @@ fn skia_rect(r: &PtRect) -> Option<tiny_skia::Rect> {
         r.size.width.raw(),
         r.size.height.raw(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::dimension::Dimension;
+    use crate::render::geometry::PtSize;
+    use crate::render::layout::draw_command::ShapeTransform;
+
+    /// A page with one black rect, wrapped in `bracket`.
+    fn bracketed_rect(bracket: ShapeTransform, rect: PtRect) -> LayoutedPage {
+        LayoutedPage {
+            commands: vec![
+                DrawCommand::Transform(TransformMark::Begin(bracket)),
+                DrawCommand::Rect {
+                    rect,
+                    color: RgbColor { r: 0, g: 0, b: 0 },
+                },
+                DrawCommand::Transform(TransformMark::End),
+            ],
+            page_size: PtSize::new(Pt::new(100.0), Pt::new(100.0)),
+            block_starts: Vec::new(),
+        }
+    }
+
+    fn place(origin: (f32, f32), deg: f32, extent: (f32, f32)) -> ShapeTransform {
+        ShapeTransform {
+            origin: PtOffset::new(Pt::new(origin.0), Pt::new(origin.1)),
+            rotation: Dimension::new((deg * 60_000.0) as i64),
+            flip_h: false,
+            flip_v: false,
+            extent: PtSize::new(Pt::new(extent.0), Pt::new(extent.1)),
+        }
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> PtRect {
+        PtRect::from_xywh(Pt::new(x), Pt::new(y), Pt::new(w), Pt::new(h))
+    }
+
+    /// Is the pixel at Pt `(x, y)` inked? Rasterized at 1 px/Pt, so the two
+    /// coordinate systems coincide.
+    fn inked(raster: &RasterPage, x: usize, y: usize) -> bool {
+        let i = (y * raster.width as usize + x) * 4;
+        raster.rgba[i] < 128
+    }
+
+    /// A bracketed command is in *shape-local* Pt: a rect at the local origin
+    /// must land where the bracket puts it, and nothing must land at the page
+    /// origin — which is exactly where a painter that ignored the bracket
+    /// would draw it.
+    #[test]
+    fn a_bracket_places_the_commands_it_opens() {
+        let page = bracketed_rect(
+            place((50.0, 50.0), 0.0, (20.0, 20.0)),
+            rect(0.0, 0.0, 10.0, 10.0),
+        );
+        let r = rasterize_page(&page, &FontRegistry::new(), 1.0).expect("raster");
+        assert!(inked(&r, 55, 55), "the rect lands at the bracket's origin");
+        assert!(!inked(&r, 5, 5), "and not at the page origin");
+    }
+
+    /// Rotation is about the shape's centre, not its origin — the same rule
+    /// `DrawCommand::Path` states. A quarter turn takes the body's top strip
+    /// to its right-hand one.
+    #[test]
+    fn a_bracket_rotates_about_the_shape_centre() {
+        let page = bracketed_rect(
+            place((50.0, 50.0), 90.0, (20.0, 20.0)),
+            rect(0.0, 0.0, 20.0, 10.0),
+        );
+        let r = rasterize_page(&page, &FontRegistry::new(), 1.0).expect("raster");
+        assert!(
+            inked(&r, 65, 60),
+            "top strip turned into the right-hand one"
+        );
+        assert!(!inked(&r, 55, 60), "the left half is now empty");
+    }
+
+    /// Every pass walks the whole command list, so bracket state has to be
+    /// tracked in each of them: a rect (shading pass) and a path (shape pass)
+    /// inside one bracket must both be placed by it.
+    #[test]
+    fn every_pass_honours_the_bracket() {
+        let mut page = bracketed_rect(
+            place((50.0, 50.0), 0.0, (20.0, 20.0)),
+            rect(0.0, 0.0, 10.0, 10.0),
+        );
+        let square = SubPath {
+            verbs: vec![
+                PathVerb::MoveTo(PtOffset::new(Pt::new(0.0), Pt::new(10.0))),
+                PathVerb::LineTo(PtOffset::new(Pt::new(10.0), Pt::new(10.0))),
+                PathVerb::LineTo(PtOffset::new(Pt::new(10.0), Pt::new(20.0))),
+                PathVerb::LineTo(PtOffset::new(Pt::new(0.0), Pt::new(20.0))),
+                PathVerb::Close,
+            ],
+            fill_mode: PathFillMode::Norm,
+            stroked: false,
+        };
+        page.commands.insert(
+            2,
+            DrawCommand::Path {
+                origin: PtOffset::new(Pt::ZERO, Pt::ZERO),
+                rotation: Dimension::new(0),
+                flip_h: false,
+                flip_v: false,
+                extent: PtSize::new(Pt::new(20.0), Pt::new(20.0)),
+                paths: vec![square],
+                fill: ResolvedFill::Solid(Rgba::BLACK),
+                stroke: None,
+                effects: Vec::new(),
+            },
+        );
+        let r = rasterize_page(&page, &FontRegistry::new(), 1.0).expect("raster");
+        assert!(inked(&r, 55, 55), "shading pass placed by the bracket");
+        assert!(inked(&r, 55, 65), "shape pass placed by the bracket too");
+        assert!(!inked(&r, 5, 15), "neither drew at the page origin");
+    }
 }

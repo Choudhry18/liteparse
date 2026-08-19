@@ -53,6 +53,53 @@ pub enum OutlineMark {
     End,
 }
 
+/// §20.1.7.6 `a:xfrm`: the placement that maps one shape's local coordinates
+/// onto the page.
+///
+/// The fields are exactly [`DrawCommand::Path`]'s placement fields, and mean
+/// the same thing — flips and rotation happen about the shape's centre, then
+/// the shape lands at `origin` — so a consumer builds the same matrix for both
+/// and `raster.rs` does.
+#[derive(Debug, Clone)]
+pub struct ShapeTransform {
+    /// Top-left placement anchor in page coordinates.
+    pub origin: PtOffset,
+    /// Rotation in 60000ths of a degree, clockwise, about the shape's centre.
+    pub rotation: Dimension<SixtieThousandthDeg>,
+    /// Mirror horizontally before placement.
+    pub flip_h: bool,
+    /// Mirror vertically before placement.
+    pub flip_v: bool,
+    /// Shape-local size — the box the bracketed commands were laid out in.
+    pub extent: PtSize,
+}
+
+/// The boundaries of one shape's commands, and the placement that puts them on
+/// the page.
+///
+/// **Commands between `Begin` and `End` are in shape-local Pt**, with the
+/// origin at the shape's top-left — the space `shape_body::layout_shape_body`
+/// emits in. A consumer that ignores the bracket reads them as page
+/// coordinates and places every one of them at the top-left corner.
+///
+/// A bracket rather than a field on [`DrawCommand::Text`] for the reason
+/// [`OutlineMark`] is one: `Text` is constructed at ~100 sites across this
+/// crate, so a field means editing every one of them to pass a value only PPTX
+/// ever sets. This variant is emitted by the PPTX path alone — the DOCX
+/// stacker shifts a text box's commands onto the page and rotates nothing, so
+/// its pages contain no brackets and are unaffected by this variant existing.
+///
+/// Nesting is flat: PPTX composes group transforms into `Shape::slide_rect`
+/// before layout, so each shape (or table cell) opens and closes its own
+/// bracket and none contains another.
+#[derive(Debug, Clone)]
+pub enum TransformMark {
+    /// Opens a shape-local coordinate space.
+    Begin(ShapeTransform),
+    /// Closes it, restoring page coordinates.
+    End,
+}
+
 /// A positioned drawing command — absolute page coordinates.
 #[derive(Debug, Clone)]
 pub enum DrawCommand {
@@ -134,6 +181,9 @@ pub enum DrawCommand {
     /// §17.3.1.19: brackets one heading paragraph's commands so the PDF
     /// outline can point at it. Draws nothing.
     Outline(OutlineMark),
+    /// §20.1.7.6: brackets one shape's commands with the placement that maps
+    /// them onto the page. Draws nothing. PPTX only — see [`TransformMark`].
+    Transform(TransformMark),
     /// §20.1.8 shape draw command — a resolved geometry with fill, stroke,
     /// and optional effects. `paths` are in shape-local Pt; the painter
     /// applies the placement transform (origin/rotation/flip).
@@ -304,6 +354,18 @@ impl DrawCommand {
             // destination is derived from the commands it brackets, which do
             // get shifted.
             DrawCommand::Outline(_) => {}
+            // The bracket's origin is the *only* page coordinate in the run it
+            // opens: the commands inside it are shape-local, so shifting them
+            // as well would apply the offset twice. Nothing shifts a bracketed
+            // page today — PPTX builds its pages in slide coordinates and the
+            // DOCX stacker, which is what calls `shift`, emits no brackets —
+            // so this arm keeps the two halves consistent rather than serving
+            // a live caller.
+            DrawCommand::Transform(TransformMark::Begin(t)) => {
+                t.origin.x += dx;
+                t.origin.y += dy;
+            }
+            DrawCommand::Transform(TransformMark::End) => {}
         }
     }
 
@@ -343,6 +405,11 @@ impl DrawCommand {
             | DrawCommand::InternalLink { .. }
             | DrawCommand::NamedDestination { .. }
             | DrawCommand::Outline(_) => None,
+            // Reporting the bracket's own band would be reporting it in a
+            // different space from the commands it brackets, which report
+            // theirs shape-locally. The one caller (`@vertOverflow="clip"`)
+            // works inside a single shape's body, where no bracket exists yet.
+            DrawCommand::Transform(_) => None,
         }
     }
 
@@ -496,7 +563,50 @@ mod tests {
             // there is nothing for `shift` to move. `shift_leaves_a_marker_be`
             // asserts that directly rather than through this helper.
             DrawCommand::Outline(_) => unreachable!("markers are tested separately"),
+            // §20.1.7.6: a bracket's origin *is* a coordinate and does shift,
+            // but its `End` half has none, so the pair is tested on its own in
+            // `shift_moves_only_a_brackets_origin`.
+            DrawCommand::Transform(_) => unreachable!("brackets are tested separately"),
         }
+    }
+
+    /// The bracket carries the one page coordinate in the run it opens, so
+    /// `shift` must move it — and must leave `End` alone, which has none.
+    #[test]
+    fn shift_moves_only_a_brackets_origin() {
+        let placement = ShapeTransform {
+            origin: PtOffset::new(Pt::new(10.0), Pt::new(20.0)),
+            rotation: Dimension::new(60_000),
+            flip_h: false,
+            flip_v: false,
+            extent: PtSize::new(Pt::new(4.0), Pt::new(6.0)),
+        };
+        let mut begin = DrawCommand::Transform(TransformMark::Begin(placement));
+        begin.shift(Pt::new(DX), Pt::new(DY));
+        let DrawCommand::Transform(TransformMark::Begin(moved)) = &begin else {
+            unreachable!()
+        };
+        assert_eq!(
+            (moved.origin.x.raw(), moved.origin.y.raw()),
+            (10.0 + DX, 20.0 + DY)
+        );
+        // The bracketed commands are shape-local, so the box they were laid
+        // out in must not move with the placement.
+        assert_eq!(
+            (moved.extent.width.raw(), moved.extent.height.raw()),
+            (4.0, 6.0)
+        );
+        assert_eq!(moved.rotation.raw(), 60_000, "shifting is not rotating");
+
+        let mut end = DrawCommand::Transform(TransformMark::End);
+        let before = format!("{end:?}");
+        end.shift(Pt::new(DX), Pt::new(DY));
+        assert_eq!(format!("{end:?}"), before);
+
+        // Neither half paints, and neither may report a band: the commands
+        // they bracket report theirs in a different (shape-local) space.
+        assert_eq!(begin.vertical_span(), None);
+        assert_eq!(end.vertical_span(), None);
     }
 
     /// The only variant `one_of_each` cannot carry, because it has no origin to

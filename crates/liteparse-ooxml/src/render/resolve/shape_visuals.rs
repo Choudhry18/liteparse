@@ -117,6 +117,49 @@ fn resolve_theme_fill(
     resolve_fill(fill, &fill_ctx)
 }
 
+/// §19.3.1.3: resolve a slide/layout/master `<p:bgRef>` against the theme.
+///
+/// **Deliberately not [`resolve_theme_fill`].** A `bgRef` indexes a different
+/// matrix under a different convention: `idx` 1..=999 selects
+/// `fillStyleLst[idx - 1]`, while **1001 and above select
+/// `bgFillStyleLst[idx - 1001]`**. Routing a `bgRef` through the shape path
+/// would look up index 1000 of a 3-entry list, miss, and return
+/// [`ResolvedFill::None`] — a slide with no background rather than an error.
+/// Every one of the 440 `bgRef` backgrounds on the PPTX corpus uses
+/// `idx="1001"`, so that miss would have been the *only* outcome, on 100% of
+/// them.
+///
+/// Kept as a separate entry point rather than a branch inside
+/// `resolve_theme_fill` so that a shape's `<a:fillRef>` — which has no
+/// 1000-offset form — cannot start silently accepting one.
+pub fn resolve_background_fill(
+    bg_ref: &StyleMatrixRef,
+    theme: Option<&Theme>,
+    ctx: &DrawingColorContext<'_>,
+) -> ResolvedFill {
+    // §20.1.4.2.19: 0 is the no-reference sentinel, here meaning "no
+    // background" rather than "inherit".
+    if bg_ref.idx == 0 {
+        return ResolvedFill::None;
+    }
+    let Some(theme) = theme else {
+        return ResolvedFill::None;
+    };
+    let fill = if bg_ref.idx > 1000 {
+        theme.bg_fill_styles.get((bg_ref.idx as usize) - 1001)
+    } else {
+        theme.fill_styles.get((bg_ref.idx as usize) - 1)
+    };
+    let Some(fill) = fill else {
+        return ResolvedFill::None;
+    };
+    let fill_ctx = match bg_ref.color.as_ref() {
+        Some(c) => ctx.with_placeholder(resolve_drawing_color(c, ctx)),
+        None => *ctx,
+    };
+    resolve_fill(fill, &fill_ctx)
+}
+
 /// Look up a theme line style by its 1-based `lnRef` index.
 fn theme_line_style<'a>(
     style_line_ref: Option<&StyleMatrixRef>,

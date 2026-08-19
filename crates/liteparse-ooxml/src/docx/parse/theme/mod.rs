@@ -46,6 +46,10 @@ struct ThemeElementsXml {
 struct FmtSchemeXml {
     #[serde(rename = "fillStyleLst", default)]
     fill_style_lst: Option<FillStyleLstXml>,
+    /// §20.1.4.1.7 bgFillStyleLst — same content model as `fillStyleLst`,
+    /// separate matrix. Only `<p:bgRef idx="1001+">` reads it.
+    #[serde(rename = "bgFillStyleLst", default)]
+    bg_fill_style_lst: Option<FillStyleLstXml>,
     #[serde(rename = "lnStyleLst", default)]
     ln_style_lst: Option<LnStyleLstXml>,
     #[serde(rename = "effectStyleLst", default)]
@@ -205,6 +209,9 @@ impl From<ThemeXml> for Theme {
             if let Some(fmt) = elements.fmt_scheme {
                 if let Some(list) = fmt.fill_style_lst {
                     theme.fill_styles = list.fills.into_iter().map(Into::into).collect();
+                }
+                if let Some(list) = fmt.bg_fill_style_lst {
+                    theme.bg_fill_styles = list.fills.into_iter().map(Into::into).collect();
                 }
                 if let Some(list) = fmt.ln_style_lst {
                     theme.line_styles = list.lines.into_iter().map(Outline::from).collect();
@@ -373,6 +380,50 @@ mod tests {
             &theme.fill_styles[2],
             crate::docx::model::DrawingFill::Solid(_)
         ));
+    }
+
+    /// `bgFillStyleLst` is a **separate matrix** from `fillStyleLst`, reached
+    /// only by a §19.3.1.3 `<p:bgRef idx="1001+">`. Parsing them into one list
+    /// would be worse than not parsing it: every PPTX background would resolve
+    /// to a shape fill of the same index, silently and plausibly.
+    ///
+    /// All 115 themes on the PPTX corpus declare both lists, with 3 entries
+    /// each.
+    #[test]
+    fn bg_fill_style_lst_is_a_separate_matrix_from_fill_style_lst() {
+        let xml = r#"<a:theme xmlns:a="urn:a"><a:themeElements><a:fmtScheme>
+            <a:fillStyleLst>
+                <a:solidFill><a:srgbClr val="AA0000"/></a:solidFill>
+            </a:fillStyleLst>
+            <a:bgFillStyleLst>
+                <a:solidFill><a:srgbClr val="00AA00"/></a:solidFill>
+                <a:gradFill><a:gsLst>
+                    <a:gs pos="0"><a:schemeClr val="phClr"/></a:gs>
+                </a:gsLst><a:lin ang="5400000"/></a:gradFill>
+            </a:bgFillStyleLst>
+        </a:fmtScheme></a:themeElements></a:theme>"#;
+        let theme = parse_theme(xml.as_bytes()).unwrap();
+        assert_eq!(theme.fill_styles.len(), 1);
+        assert_eq!(theme.bg_fill_styles.len(), 2);
+        assert!(matches!(
+            &theme.bg_fill_styles[1],
+            crate::docx::model::DrawingFill::Gradient(_)
+        ));
+    }
+
+    /// A theme with no `bgFillStyleLst` leaves the list empty rather than
+    /// borrowing `fillStyleLst`, so a `bgRef` against it resolves to nothing
+    /// instead of to a shape fill.
+    #[test]
+    fn absent_bg_fill_style_lst_does_not_fall_back_to_fill_styles() {
+        let xml = r#"<a:theme xmlns:a="urn:a"><a:themeElements><a:fmtScheme>
+            <a:fillStyleLst>
+                <a:solidFill><a:srgbClr val="AA0000"/></a:solidFill>
+            </a:fillStyleLst>
+        </a:fmtScheme></a:themeElements></a:theme>"#;
+        let theme = parse_theme(xml.as_bytes()).unwrap();
+        assert_eq!(theme.fill_styles.len(), 1);
+        assert!(theme.bg_fill_styles.is_empty());
     }
 
     #[test]

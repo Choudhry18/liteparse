@@ -69,9 +69,12 @@
 
 use std::collections::HashMap;
 
-use crate::model::Transform2D;
+use crate::model::{Theme, Transform2D};
+use crate::render::layout::draw_command::ResolvedFill;
+use crate::render::resolve::drawing_color::DrawingColorContext;
+use crate::render::resolve::shape_visuals::{resolve_background_fill, resolve_fill};
 
-use super::shapes::{Placeholder, PlaceholderKind, Shape};
+use super::shapes::{Background, Placeholder, PlaceholderKind, Shape};
 
 /// How a placeholder finds its counterpart on the part above it.
 ///
@@ -247,6 +250,70 @@ pub fn apply_slide(
         MatchRule::CollapsedKind,
     ));
     stats
+}
+
+// ── Background (§19.3.1.1) ───────────────────────────────────────────────────
+//
+// A second, much simpler cascade sharing the same slide → layout → master
+// chain. It needs none of the machinery above because a background is not
+// matched to a counterpart — there is at most one per part, so the rule is
+// "the nearest part that declares one wins" and no index is required.
+
+/// Which rung supplied a resolved background.
+///
+/// Carried because it is the probe's gate: the corpus split is **master 1,125
+/// / layout 95 / slide 58**, and a cascade that quietly stopped consulting the
+/// master would still resolve 153 slides and look like it worked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundSource {
+    Slide,
+    Layout,
+    Master,
+}
+
+/// Resolve the background in force on a slide.
+///
+/// First declaration down the chain wins. Returns `None` only when no part in
+/// the chain declares one — which **does not happen on the corpus** (0 of
+/// 1,278), so a `None` here is a signal worth looking at rather than a normal
+/// outcome.
+///
+/// Note the arguments are each part's *own* background, i.e.
+/// [`SlidePart::background`], not an already-inherited one. Unlike the
+/// geometry rungs there is nothing to pre-flatten: the chain is three
+/// pointers and a slide is resolved in three comparisons.
+///
+/// [`SlidePart::background`]: crate::pptx::SlidePart::background
+pub fn resolve_background<'a>(
+    slide: Option<&'a Background>,
+    layout: Option<&'a Background>,
+    master: Option<&'a Background>,
+) -> Option<(BackgroundSource, &'a Background)> {
+    slide
+        .map(|b| (BackgroundSource::Slide, b))
+        .or_else(|| layout.map(|b| (BackgroundSource::Layout, b)))
+        .or_else(|| master.map(|b| (BackgroundSource::Master, b)))
+}
+
+/// Turn a resolved [`Background`] into a painter-ready fill.
+///
+/// **The single correct way to colour a background**, and it exists as one
+/// function precisely so that no caller has to remember which of the two arms
+/// takes the 1000-offset style-matrix path. Dispatching by hand is how a
+/// `bgRef` ends up in [`resolve_fill`] and silently comes back `None`.
+///
+/// `theme` must be the theme of *this slide's own master*
+/// ([`PresentationPackage::theme_for`]), not the deck's first. 31 corpus
+/// slides resolve a `bgRef` under a non-first master, and the deck-wide theme
+/// gives them a real fill from the wrong matrix.
+///
+/// [`PresentationPackage::theme_for`]: crate::pptx::PresentationPackage::theme_for
+pub fn background_fill(bg: &Background, theme: Option<&Theme>) -> ResolvedFill {
+    let ctx = DrawingColorContext::new(theme);
+    match bg {
+        Background::Properties(fill) => resolve_fill(fill, &ctx),
+        Background::Reference(r) => resolve_background_fill(r, theme, &ctx),
+    }
 }
 
 #[cfg(test)]
@@ -471,5 +538,131 @@ mod tests {
         let stats = apply_inherited_geometry(&mut shapes, None, MatchRule::Idx);
         assert_eq!(stats.orphans, 1);
         assert_eq!(stats.unresolved, 0);
+    }
+
+    // ── Background ───────────────────────────────────────────────────────
+
+    use crate::model::{DrawingColor, DrawingFill, StyleMatrixRef};
+
+    fn srgb(rgb: u32) -> DrawingFill {
+        DrawingFill::Solid(DrawingColor::Srgb {
+            rgb,
+            transforms: Vec::new(),
+        })
+    }
+
+    fn solid(rgb: u32) -> Background {
+        Background::Properties(srgb(rgb))
+    }
+
+    /// Recover a 0xRRGGBB value from a resolved fill. `Rgba` is float
+    /// channels in 0..=1, so this rounds back to 8-bit rather than comparing
+    /// floats.
+    fn solid_rgb(f: &ResolvedFill) -> u32 {
+        match f {
+            ResolvedFill::Solid(c) => {
+                let ch = |v: f32| (v * 255.0).round() as u32;
+                (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b)
+            }
+            other => panic!("expected a solid fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nearest_declared_background_wins() {
+        let (s, l, m) = (solid(0x111111), solid(0x222222), solid(0x333333));
+        for (slide, layout, master, want_src, want_rgb) in [
+            (
+                Some(&s),
+                Some(&l),
+                Some(&m),
+                BackgroundSource::Slide,
+                0x111111,
+            ),
+            (None, Some(&l), Some(&m), BackgroundSource::Layout, 0x222222),
+            (None, None, Some(&m), BackgroundSource::Master, 0x333333),
+        ] {
+            let (src, bg) = resolve_background(slide, layout, master).expect("resolves");
+            assert_eq!(src, want_src);
+            assert_eq!(solid_rgb(&background_fill(bg, None)), want_rgb);
+        }
+    }
+
+    /// The corpus has no slide without a background, so `None` is a signal
+    /// rather than a normal outcome — but it must still be `None` and not a
+    /// guessed white.
+    #[test]
+    fn a_chain_declaring_nothing_resolves_to_none() {
+        assert!(resolve_background(None, None, None).is_none());
+    }
+
+    /// **The regression test for the bug this work was built around.**
+    ///
+    /// §19.3.1.3: a `bgRef@idx` of 1001 selects `bgFillStyleLst[0]`, not
+    /// `fillStyleLst[1000]`. Every one of the 440 `bgRef` backgrounds on the
+    /// corpus uses exactly 1001, so routing them at the shape path's
+    /// `fillStyleLst` is not an edge case — it silently blanks 100% of them.
+    /// The two lists here hold different colours precisely so that a wrong
+    /// route returns a *wrong colour* rather than nothing, and is caught even
+    /// if `fillStyleLst` were long enough to be indexable.
+    #[test]
+    fn bg_ref_1001_reads_the_background_matrix_not_the_shape_matrix() {
+        let theme = Theme {
+            fill_styles: vec![srgb(0xAA0000), srgb(0xBB0000), srgb(0xCC0000)],
+            bg_fill_styles: vec![srgb(0x00AA00), srgb(0x00BB00)],
+            ..Theme::default()
+        };
+        let bg = Background::Reference(StyleMatrixRef {
+            idx: 1001,
+            color: None,
+        });
+        assert_eq!(solid_rgb(&background_fill(&bg, Some(&theme))), 0x00AA00);
+
+        // 1002 walks the same list, not off the end of the shape matrix.
+        let bg2 = Background::Reference(StyleMatrixRef {
+            idx: 1002,
+            color: None,
+        });
+        assert_eq!(solid_rgb(&background_fill(&bg2, Some(&theme))), 0x00BB00);
+
+        // Below 1001 the shape matrix is correct — the spec allows both forms
+        // even though the corpus only ever writes the offset one.
+        let bg3 = Background::Reference(StyleMatrixRef {
+            idx: 2,
+            color: None,
+        });
+        assert_eq!(solid_rgb(&background_fill(&bg3, Some(&theme))), 0xBB0000);
+    }
+
+    /// `idx=0` is §20.1.4.2.19's no-reference sentinel: no background, as
+    /// opposed to an out-of-range index.
+    #[test]
+    fn bg_ref_zero_is_no_background() {
+        let bg = Background::Reference(StyleMatrixRef {
+            idx: 0,
+            color: None,
+        });
+        assert!(matches!(
+            background_fill(&bg, Some(&Theme::default())),
+            ResolvedFill::None
+        ));
+    }
+
+    /// An index past the end of the background matrix must resolve to nothing
+    /// rather than wrap around or panic.
+    #[test]
+    fn bg_ref_past_the_end_resolves_to_none() {
+        let theme = Theme {
+            bg_fill_styles: vec![srgb(0x00AA00)],
+            ..Theme::default()
+        };
+        let bg = Background::Reference(StyleMatrixRef {
+            idx: 1009,
+            color: None,
+        });
+        assert!(matches!(
+            background_fill(&bg, Some(&theme)),
+            ResolvedFill::None
+        ));
     }
 }

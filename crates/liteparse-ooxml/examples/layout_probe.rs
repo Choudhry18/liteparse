@@ -53,6 +53,7 @@ struct Census {
     internal_link: u64,
     named_dest: u64,
     outline: u64,
+    transform: u64,
     path: u64,
 }
 
@@ -130,6 +131,9 @@ fn run_one(path: &str) -> serde_json::Value {
                 DrawCommand::InternalLink { .. } => census.internal_link += 1,
                 DrawCommand::NamedDestination { .. } => census.named_dest += 1,
                 DrawCommand::Outline(_) => census.outline += 1,
+                // PPTX-only placement bracket; a DOCX layout emits none, so a
+                // non-zero count here means this probe was pointed at a slide.
+                DrawCommand::Transform(_) => census.transform += 1,
                 // No catch-all: the compiler confirming this match is
                 // exhaustive is how we know the census can't silently miss a
                 // command class.
@@ -164,6 +168,7 @@ fn run_one(path: &str) -> serde_json::Value {
             "internal_link": census.internal_link,
             "named_dest": census.named_dest,
             "outline": census.outline,
+            "transform": census.transform,
             "path": census.path,
 
         },

@@ -90,7 +90,10 @@ impl From<SpPrXml> for ShapeProperties {
     }
 }
 
-fn pick_fill(
+/// Collapse the six mutually-exclusive `EG_FillProperties` members into one
+/// [`DrawingFill`]. Shared with PresentationML's §19.3.1.2 `<p:bgPr>`, which
+/// has the same fill content model.
+pub(crate) fn pick_fill(
     no: Option<super::fill::Empty>,
     grp: Option<super::fill::Empty>,
     solid: Option<super::fill::SolidFillXml>,

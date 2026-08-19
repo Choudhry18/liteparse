@@ -474,6 +474,7 @@ mod tests {
             major_font: ThemeFontScheme::default(),
             minor_font: ThemeFontScheme::default(),
             fill_styles: vec![],
+            bg_fill_styles: vec![],
             line_styles: vec![],
             effect_styles: vec![],
         }

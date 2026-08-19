@@ -217,13 +217,22 @@ pub fn layout_to_pages(
                 // the ParseResult contract can hold it (the PDF path drops
                 // GoTo destinations the same way — annotations carry only the
                 // source rects).
+                //
+                // `Transform` is the PPTX placement bracket. This converter is
+                // only ever handed body-local pages — the DOCX stacker emits
+                // no brackets, and `pptx_layout` converts one shape body at a
+                // time and applies the placement to the items itself — so a
+                // bracket reaching here would mean a slide-wide page was
+                // converted without its placements, which is a caller bug this
+                // arm cannot repair.
                 DrawCommand::Underline { .. }
                 | DrawCommand::Line { .. }
                 | DrawCommand::Rect { .. }
                 | DrawCommand::Image { .. }
                 | DrawCommand::Path { .. }
                 | DrawCommand::InternalLink { .. }
-                | DrawCommand::NamedDestination { .. } => {}
+                | DrawCommand::NamedDestination { .. }
+                | DrawCommand::Transform(_) => {}
             }
         }
 

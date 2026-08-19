@@ -68,6 +68,9 @@ fn estimate_cursor_y(
             DrawCommand::Path { origin, extent, .. } => origin.y + extent.height,
             // §17.3.1.19: draws nothing, so it consumes no vertical space.
             DrawCommand::Outline(_) => continue,
+            // §20.1.7.6: a placement marker, and one this function never sees
+            // — it runs over DOCX section pages, which carry no brackets.
+            DrawCommand::Transform(_) => continue,
             // Annotations mark content that is already accounted for by the
             // command underneath them, and a named destination is a point.
             // Neither adds extent of its own.

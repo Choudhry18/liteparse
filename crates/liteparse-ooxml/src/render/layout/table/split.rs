@@ -401,6 +401,11 @@ fn command_primary_y(cmd: &DrawCommand) -> Pt {
         // heading whose paragraph splits keeps its outline entry on the page
         // it starts on, which is the same rule the paragraph splitter applies.
         DrawCommand::Outline(_) => Pt::ZERO,
+        // §20.1.7.6: a placement marker. A DOCX table's cell commands never
+        // contain one, so this arm exists for exhaustiveness; taking the top
+        // of the cell keeps a bracket with the half its shape starts in, the
+        // same rule the outline marker follows.
+        DrawCommand::Transform(_) => Pt::ZERO,
     }
 }
 

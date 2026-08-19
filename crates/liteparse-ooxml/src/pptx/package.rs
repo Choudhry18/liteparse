@@ -80,6 +80,13 @@ pub struct SlideParts {
     pub layout: Option<Part>,
     pub master: Option<Part>,
     pub notes: Option<Part>,
+    /// Package path of the theme reached through *this slide's own* master,
+    /// for [`PresentationPackage::themes`].
+    ///
+    /// A path rather than bytes because a theme is shared by every slide under
+    /// its master; cloning the XML per slide would copy it ~28 times on the
+    /// corpus's largest deck.
+    pub theme_path: Option<String>,
 }
 
 /// The whole deck, walked but not yet understood.
@@ -96,8 +103,18 @@ pub struct PresentationPackage {
     pub presentation: Part,
     /// Slides in **presentation order** — `<p:sldIdLst>`, not part order.
     pub slides: Vec<SlideParts>,
-    /// `ppt/theme/themeN.xml` for the first master, when present.
+    /// `ppt/theme/themeN.xml` for the **first** master, when present.
+    ///
+    /// Adequate for font resolution, which is what it was added for. **Not
+    /// adequate for colour**: 12 of the 45 corpus decks reach more than one
+    /// theme from their slides, covering 138 slides, and 31 of those resolve a
+    /// `<p:bgRef>` background out of the theme's style matrix — which would
+    /// come from the wrong theme, and therefore silently the wrong colour.
+    /// Use [`Self::theme_for`] wherever the answer is a colour.
     pub theme: Option<Vec<u8>>,
+    /// Every theme in the package, keyed by normalized part path. Indexed by
+    /// [`SlideParts::theme_path`].
+    pub themes: std::collections::HashMap<String, Vec<u8>>,
     /// The notes master, shared by every notes slide.
     pub notes_master: Option<Part>,
     /// Raw media parts, keyed by normalized package path.
@@ -171,31 +188,59 @@ pub fn walk(data: &[u8]) -> Result<PresentationPackage> {
             .resolve_rel_of_type(&RelationshipType::NotesSlide)
             .and_then(|p| load_part(&package, &p));
 
+        // The theme hangs off the master, so it is per-slide in exactly the
+        // way the master is. Resolved here rather than once for the deck: 12
+        // corpus decks reach more than one.
+        let theme_path = master
+            .as_ref()
+            .and_then(|m| m.resolve_rel_of_type(&RelationshipType::Theme));
+
         slides.push(SlideParts {
             slide,
             layout,
             master,
             notes,
+            theme_path,
         });
     }
 
-    // Theme comes off the first master. Decks with multiple masters can
-    // carry multiple themes; resolving per-master is a colour-fidelity
-    // concern deferred until `phClr` substitution lands.
+    let mut themes = std::collections::HashMap::new();
+    for path in slides.iter().filter_map(|s| s.theme_path.clone()) {
+        if let std::collections::hash_map::Entry::Vacant(e) = themes.entry(path)
+            && let Some(bytes) = package.get_part(e.key())
+        {
+            let bytes = bytes.to_vec();
+            e.insert(bytes);
+        }
+    }
+
+    // Retained for font resolution, which does not vary by master in any way
+    // the corpus shows. See the field docs for why colour must not use it.
     let theme = slides
         .iter()
-        .find_map(|s| s.master.as_ref())
-        .and_then(|m| m.resolve_rel_of_type(&RelationshipType::Theme))
-        .and_then(|p| package.get_part(&p).map(|b| b.to_vec()));
+        .find_map(|s| s.theme_path.as_deref())
+        .and_then(|p| themes.get(p).cloned());
 
     Ok(PresentationPackage {
         info,
         presentation: pres,
         slides,
         theme,
+        themes,
         notes_master,
         package,
     })
+}
+
+impl PresentationPackage {
+    /// The theme XML governing one slide, following its own master.
+    ///
+    /// Prefer this to [`Self::theme`] for anything colour-valued.
+    pub fn theme_for(&self, slide: &SlideParts) -> Option<&[u8]> {
+        self.themes
+            .get(slide.theme_path.as_deref()?)
+            .map(|v| &v[..])
+    }
 }
 
 impl Part {

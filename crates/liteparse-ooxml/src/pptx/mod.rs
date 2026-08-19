@@ -18,13 +18,15 @@ pub mod text;
 pub mod textcascade;
 
 pub use cascade::{
-    CascadeStats, MatchRule, PlaceholderGeometry, apply_inherited_geometry, apply_slide,
+    BackgroundSource, CascadeStats, MatchRule, PlaceholderGeometry, apply_inherited_geometry,
+    apply_slide, background_fill, resolve_background,
 };
 pub use geometry::{GeometryStats, SlideRect, apply_slide_geometry};
 pub use package::{EMU_PER_POINT, Part, PresentationInfo, PresentationPackage, SlideParts, walk};
 pub use shapes::{
-    AutoShape, Connector, GraphicFrame, GraphicFramePayload, Group, Placeholder, PlaceholderKind,
-    Shape, ShapeKind, Table, TableCell, TableCellProperties, TableRow, parse_shape_tree, visit_all,
+    AutoShape, Background, Connector, GraphicFrame, GraphicFramePayload, Group, Placeholder,
+    PlaceholderKind, Shape, ShapeKind, SlidePart, Table, TableCell, TableCellProperties, TableRow,
+    parse_shape_tree, parse_slide_part, visit_all,
 };
 pub use text::{
     AutoNumberScheme, Bullet, ListStyle, Spacing, TextBody, TextParagraph, TextParagraphProperties,

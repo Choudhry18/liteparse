@@ -45,9 +45,11 @@ use liteparse_ooxml::pptx::{
 };
 use liteparse_ooxml::render::dimension::Pt;
 use liteparse_ooxml::render::fonts::FontRegistry;
-use liteparse_ooxml::render::geometry::PtSize;
+use liteparse_ooxml::render::geometry::{PtOffset, PtSize};
 use liteparse_ooxml::render::layout::ShapeAutoFit;
-use liteparse_ooxml::render::layout::draw_command::LayoutedPage;
+use liteparse_ooxml::render::layout::draw_command::{
+    DrawCommand, LayoutedPage, ShapeTransform, TransformMark,
+};
 use liteparse_ooxml::render::layout::fragment::{
     Fragment, emit_run_fragments, font_props_from_run,
 };
@@ -79,6 +81,16 @@ pub struct SlideGeometry {
     /// One page per slide, in presentation order. Page count always equals
     /// slide count, so a page index is a slide index.
     pub pages: Vec<Page>,
+    /// The same slides as draw commands rather than boxes — one page per
+    /// slide, parallel to `pages`, ready for `render::raster::rasterize_page`.
+    ///
+    /// Not a second derivation: each shape contributes the *same*
+    /// `layout_shape_body` output that became its [`TextItem`]s, bracketed by
+    /// the `DrawCommand::Transform` that places it on the slide. So a
+    /// screenshot and the geometry it would highlight come from one layout, by
+    /// construction — which is the property the LibreOffice screenshot path
+    /// could never offer.
+    pub layouts: Vec<LayoutedPage>,
     /// Per page, the shape each run of items came from. Parallel to `pages`.
     ///
     /// Derived geometry has no external oracle — PPTX declares no coordinate
@@ -166,6 +178,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
     let mut deck = Deck::new(pkg);
     let mut out = SlideGeometry {
         pages: Vec::with_capacity(pkg.slides.len()),
+        layouts: Vec::with_capacity(pkg.slides.len()),
         placements: Vec::with_capacity(pkg.slides.len()),
         placed_table_cells: 0,
         unplaced_table_cells: 0,
@@ -175,6 +188,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
     for (idx, slide) in pkg.slides.iter().enumerate() {
         let mut items = Vec::new();
         let mut placements = Vec::new();
+        let mut commands = Vec::new();
         // A slide whose shape tree will not parse still yields a page. Page
         // count must equal slide count — a consumer indexes pages by slide.
         if let Some(prepared) = deck.prepare(slide) {
@@ -185,6 +199,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 measurer: &measurer,
                 registry,
                 items: &mut items,
+                commands: &mut commands,
                 placements: &mut placements,
                 placed_table_cells: &mut out.placed_table_cells,
                 unplaced_table_cells: &mut out.unplaced_table_cells,
@@ -196,6 +211,13 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         }
 
         out.placements.push(placements);
+        out.layouts.push(LayoutedPage {
+            commands,
+            page_size,
+            // A DOCX-only side-channel: it indexes the flattened body blocks a
+            // page starts, and a slide is one page with no such flattening.
+            block_starts: Vec::new(),
+        });
         let content_bounds = union_bounds(&items);
         out.pages.push(Page {
             page_number: idx + 1,
@@ -222,10 +244,31 @@ struct ShapeCtx<'a, 'r> {
     measurer: &'a TextMeasurer<'r>,
     registry: &'a FontRegistry,
     items: &'a mut Vec<TextItem>,
+    /// The slide's draw commands, in slide coordinates once each shape's run
+    /// is read through the bracket that opens it.
+    commands: &'a mut Vec<DrawCommand>,
     placements: &'a mut Vec<ShapePlacement>,
     placed_table_cells: &'a mut usize,
     unplaced_table_cells: &'a mut usize,
     unplaced_diagram_bodies: &'a mut usize,
+}
+
+impl ShapeCtx<'_, '_> {
+    /// Add one body's commands to the slide, wrapped in the bracket that
+    /// places them.
+    ///
+    /// `commands` stay in the body-local space `layout_shape_body` emitted
+    /// them in — the same values that go on to become [`TextItem`]s — so the
+    /// bracket is the *only* place a slide coordinate is introduced, and the
+    /// two consumers cannot drift apart by one of them shifting and the other
+    /// not.
+    fn push_bracketed(&mut self, placement: ShapeTransform, commands: Vec<DrawCommand>) {
+        self.commands
+            .push(DrawCommand::Transform(TransformMark::Begin(placement)));
+        self.commands.extend(commands);
+        self.commands
+            .push(DrawCommand::Transform(TransformMark::End));
+    }
 }
 
 fn layout_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
@@ -306,6 +349,7 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
     }
 
     let frame = Frame::new(slide_rect, extent);
+    ctx.push_bracketed(frame.place((0.0, 0.0), extent), commands.clone());
     let items = commands_to_items(commands, extent, ctx);
     let first_item = ctx.items.len();
     frame.push_items(items, (0.0, 0.0), ctx.items);
@@ -363,6 +407,11 @@ struct Frame {
     centre: (f32, f32),
     /// Clockwise degrees, as the file declares them.
     rot_deg: f32,
+    /// The same angle unconverted, for the draw-command bracket — which takes
+    /// 60000ths of a degree, exactly as `a:xfrm@rot` states them.
+    rotation: liteparse_ooxml::model::dimension::Dimension<
+        liteparse_ooxml::model::dimension::SixtieThousandthDeg,
+    >,
 }
 
 impl Frame {
@@ -376,6 +425,47 @@ impl Frame {
             // OOXML `@rot` is clockwise-positive; `TextItem::rotation` is
             // counter-clockwise degrees.
             rot_deg: slide_rect.rotation.raw() as f32 / ANGLE_UNITS_PER_DEGREE,
+            rotation: slide_rect.rotation,
+        }
+    }
+
+    /// The placement bracket for a box of size `extent` whose top-left sits at
+    /// `offset` within this frame.
+    ///
+    /// A rotation about the *frame's* centre is not a rotation about the
+    /// box's, and a table is where the difference shows: every cell turns with
+    /// the table, so charging each one its own centre would fan them apart.
+    /// A rigid motion decomposes, though — rotate the box about its own centre
+    /// by the frame's angle, then put that centre where the frame's rotation
+    /// sends it — and the second half is all this computes. For a shape,
+    /// `offset` is `(0, 0)` and the two centres coincide, so it reduces to the
+    /// frame origin.
+    ///
+    /// **Flips are deliberately not carried.** `a:xfrm@flipH/@flipV` mirror a
+    /// shape's *geometry*; PowerPoint does not mirror the text inside it, and
+    /// the item path ignores them for the same reason.
+    fn place(&self, offset: (f32, f32), extent: PtSize) -> ShapeTransform {
+        let (half_w, half_h) = (extent.width.raw() * 0.5, extent.height.raw() * 0.5);
+        let (cx, cy) = (offset.0 + half_w, offset.1 + half_h);
+        let (rx, ry) = if self.rot_deg == 0.0 {
+            (cx, cy)
+        } else {
+            let (sin, cos) = self.rot_deg.to_radians().sin_cos();
+            let (dx, dy) = (cx - self.centre.0, cy - self.centre.1);
+            (
+                self.centre.0 + dx * cos - dy * sin,
+                self.centre.1 + dx * sin + dy * cos,
+            )
+        };
+        ShapeTransform {
+            origin: PtOffset::new(
+                Pt::new(self.origin.0 + rx - half_w),
+                Pt::new(self.origin.1 + ry - half_h),
+            ),
+            rotation: self.rotation,
+            flip_h: false,
+            flip_v: false,
+            extent,
         }
     }
 
@@ -526,8 +616,9 @@ fn layout_table(shape: &Shape, table: &pptx::Table, ctx: &mut ShapeCtx<'_, '_>) 
         if commands.is_empty() {
             continue;
         }
-        let items = commands_to_items(commands, extent, ctx);
         let offset = (cell.left.raw(), row_edges[cell.row].raw());
+        ctx.push_bracketed(frame.place(offset, extent), commands.clone());
+        let items = commands_to_items(commands, extent, ctx);
         let first_item = ctx.items.len();
         frame.push_items(items, offset, ctx.items);
         if ctx.items.len() == first_item {
@@ -941,6 +1032,82 @@ mod tests {
         // Malformed input must not panic or silently resize the table.
         let declared = vec![Pt::new(10.0)];
         assert_eq!(grown_row_heights(&declared, &[cell(7, 1, 99.0)]), declared);
+    }
+
+    // ── the placement bracket ────────────────────────────────────────────
+
+    fn frame(x: f32, y: f32, w: f32, h: f32, deg: f32) -> Frame {
+        use liteparse_ooxml::model::geometry::{Offset, Rect, Size};
+        let emu = |pt: f32| Dimension::new((pt * EMU_PER_POINT) as i64);
+        let slide_rect = liteparse_ooxml::pptx::SlideRect {
+            rect: Rect::new(Offset::new(emu(x), emu(y)), Size::new(emu(w), emu(h))),
+            rotation: Dimension::new((deg * ANGLE_UNITS_PER_DEGREE) as i64),
+            flip_h: false,
+            flip_v: false,
+            skewed: false,
+        };
+        Frame::new(slide_rect, size(w, h))
+    }
+
+    fn size(w: f32, h: f32) -> PtSize {
+        PtSize {
+            width: Pt::new(w),
+            height: Pt::new(h),
+        }
+    }
+
+    /// An unrotated shape's bracket is its own rectangle — the commands inside
+    /// it are body-local, so the origin is where the body starts.
+    #[test]
+    fn an_unrotated_shape_brackets_at_its_own_origin() {
+        let placed = frame(100.0, 50.0, 200.0, 80.0, 0.0).place((0.0, 0.0), size(200.0, 80.0));
+        assert_eq!(
+            (placed.origin.x.raw(), placed.origin.y.raw()),
+            (100.0, 50.0)
+        );
+        assert_eq!(placed.rotation.raw(), 0);
+        assert_eq!(placed.extent.width, Pt::new(200.0));
+    }
+
+    /// A rotated shape turns about its own centre, so its origin does not move
+    /// — only the space inside the bracket rotates. Rotating the origin as
+    /// well would slide every rotated body off its shape.
+    #[test]
+    fn a_rotated_shape_keeps_its_origin() {
+        let placed = frame(100.0, 50.0, 200.0, 80.0, 90.0).place((0.0, 0.0), size(200.0, 80.0));
+        assert_eq!(
+            (placed.origin.x.raw(), placed.origin.y.raw()),
+            (100.0, 50.0)
+        );
+        assert_eq!(placed.rotation.raw(), 5_400_000, "the bracket carries @rot");
+    }
+
+    /// A cell turns with its **table**: its centre lands where the frame's
+    /// rotation sends it. Charging each cell its own centre would leave every
+    /// cell in place and fan the table apart instead of turning it.
+    #[test]
+    fn a_cell_rotates_about_the_frame_centre_not_its_own() {
+        // A 40x20 cell in the top-left of a 200x80 frame: centre (20, 10)
+        // against the frame's (100, 40). A quarter turn sends the offset
+        // (-80, -30) to (30, -80), so the cell's centre lands at (130, -40)
+        // and its box origin half a cell up and left of that.
+        let placed = frame(0.0, 0.0, 200.0, 80.0, 90.0).place((0.0, 0.0), size(40.0, 20.0));
+        assert_eq!(
+            (placed.origin.x.raw(), placed.origin.y.raw()),
+            (110.0, -50.0)
+        );
+
+        // Unrotated, the same cell is simply at its offset in the frame.
+        let flat = frame(0.0, 0.0, 200.0, 80.0, 0.0).place((5.0, 7.0), size(40.0, 20.0));
+        assert_eq!((flat.origin.x.raw(), flat.origin.y.raw()), (5.0, 7.0));
+    }
+
+    /// §20.1.7.6 flips mirror a shape's *geometry*; PowerPoint does not mirror
+    /// the text inside it, and the item path ignores them for the same reason.
+    #[test]
+    fn a_bracket_never_carries_a_flip() {
+        let placed = frame(0.0, 0.0, 10.0, 10.0, 0.0).place((0.0, 0.0), size(10.0, 10.0));
+        assert!(!placed.flip_h && !placed.flip_v);
     }
 
     #[test]

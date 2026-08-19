@@ -47,15 +47,16 @@ use serde::Deserialize;
 use crate::model::dimension::{Dimension, Emu};
 use crate::model::geometry::{Offset, Size};
 use crate::model::{
-    BodyProperties, DocProperties, NvPicProperties, Picture, ShapeProperties, TextAnchoringType,
-    TextVerticalType, Transform2D,
+    BodyProperties, DocProperties, DrawingFill, NvPicProperties, Picture, ShapeProperties,
+    StyleMatrixRef, TextAnchoringType, TextVerticalType, Transform2D,
 };
 
 use crate::docx::error::Result;
 use crate::docx::parse::drawing::schema::fill::BlipFillXml;
 use crate::docx::parse::drawing::schema::picture::{CNvPicPrXml, CNvPrXml};
 use crate::docx::parse::drawing::schema::shape::{
-    ExtXml, OffXml, SpPrXml, StTextAnchoringType, StTextVerticalType, XfrmXml,
+    ExtXml, OffXml, SpPrXml, StTextAnchoringType, StTextVerticalType, StyleMatrixRefXml, XfrmXml,
+    pick_fill,
 };
 use crate::docx::parse::serde_xml;
 
@@ -418,6 +419,58 @@ impl PlaceholderKind {
     }
 }
 
+/// §19.3.1.1 `<p:bg>` — the background of one slide, layout or master.
+///
+/// The two arms are the element's own `xsd:choice` and they resolve against
+/// different things, which is why this is an enum rather than a struct with
+/// two `Option`s: [`Self::Properties`] is self-contained, while
+/// [`Self::Reference`] is an index into the *theme*, and under a convention
+/// that is not the one a shape's `<a:fillRef>` uses. See
+/// [`resolve_background_fill`] for that trap.
+///
+/// [`resolve_background_fill`]: crate::render::resolve::shape_visuals::resolve_background_fill
+///
+/// Corpus (45 decks, 1,278 slides, counting the *effective* background after
+/// inheritance): 739 `bgPr` solid, 63 `bgPr` blip, 36 `bgPr` none, 440
+/// `bgRef`. **Zero slides resolve to no background at all.**
+#[derive(Clone, Debug)]
+pub enum Background {
+    /// §19.3.1.2 `<p:bgPr>` — an explicit fill.
+    ///
+    /// Its `EG_EffectProperties` sibling is **not** modelled: 579 corpus
+    /// backgrounds carry an `<a:effectLst>`, and the rasterizer renders no
+    /// effects at this tier, so keeping the field would only misreport
+    /// coverage. `a:scene3d`/`a:sp3d` and `@shadeToTitle` are dropped for the
+    /// same reason.
+    Properties(DrawingFill),
+    /// §19.3.1.3 `<p:bgRef>` — an index into the theme's style matrix.
+    Reference(StyleMatrixRef),
+}
+
+impl Background {
+    fn from_xml(x: BgXml) -> Option<Self> {
+        // §19.3.1.1 is a choice, so at most one arm is present. `bgPr` is
+        // checked first only to give a malformed both-present element a
+        // deterministic reading.
+        if let Some(pr) = x.bg_pr {
+            // A `<p:bgPr>` with no recognized fill child is malformed (the
+            // spec requires one). Treat it as "declares nothing" so the
+            // cascade keeps looking upward, rather than as an opaque
+            // transparent background that would mask the master's.
+            return pick_fill(
+                pr.no_fill,
+                pr.grp_fill,
+                pr.solid_fill,
+                pr.grad_fill,
+                pr.blip_fill,
+                pr.patt_fill,
+            )
+            .map(Background::Properties);
+        }
+        x.bg_ref.map(|r| Background::Reference(r.into()))
+    }
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /// Parse the shape tree out of a slide, layout, master or notes-slide part.
@@ -429,12 +482,44 @@ impl PlaceholderKind {
 ///
 /// A part with no shape tree yields an empty `Vec` rather than an error: the
 /// fail-open posture `ATTRIBUTION.md` records for this vendor.
+///
+/// Reads only `p:spTree`. Callers that also need the part's background — the
+/// painter does; the markdown emitter does not — want [`parse_slide_part`],
+/// which returns both from a single deserialization.
 pub fn parse_shape_tree(data: &[u8]) -> Result<Vec<Shape>> {
+    Ok(parse_slide_part(data)?.shapes)
+}
+
+/// A `p:cSld`'s two payloads: its shape tree and its background.
+///
+/// One struct rather than two entry points because both come out of the same
+/// `p:cSld`, and parsing the part twice to get them would double the cost of
+/// the deck walk for a field that is one element wide.
+#[derive(Clone, Debug, Default)]
+pub struct SlidePart {
+    pub shapes: Vec<Shape>,
+    /// §19.3.1.1 `<p:bg>`, when *this* part declares one. `None` means "not
+    /// declared here", **not** "no background" — the value is inherited, and
+    /// resolving it is [`crate::pptx::cascade::resolve_background`]'s job.
+    /// Only 58 of the corpus's 1,278 slides declare their own; 1,125 inherit
+    /// from the master.
+    pub background: Option<Background>,
+}
+
+/// Parse a slide, layout, master or notes-slide part into its shapes and its
+/// own (uninherited) background.
+pub fn parse_slide_part(data: &[u8]) -> Result<SlidePart> {
     let part: SlidePartXml = serde_xml::from_xml(data)?;
-    let Some(tree) = part.c_sld.and_then(|c| c.sp_tree) else {
-        return Ok(Vec::new());
+    let Some(c_sld) = part.c_sld else {
+        return Ok(SlidePart::default());
     };
-    Ok(lower_children(tree.children))
+    Ok(SlidePart {
+        shapes: c_sld
+            .sp_tree
+            .map(|t| lower_children(t.children))
+            .unwrap_or_default(),
+        background: c_sld.bg.and_then(Background::from_xml),
+    })
 }
 
 // ── Schema ───────────────────────────────────────────────────────────────────
@@ -451,8 +536,41 @@ struct SlidePartXml {
 
 #[derive(Deserialize)]
 struct CSldXml {
+    /// §19.3.1.1 — precedes `spTree` in the content model.
+    #[serde(rename = "bg", default)]
+    bg: Option<BgXml>,
     #[serde(rename = "spTree", default)]
     sp_tree: Option<SpTreeXml>,
+}
+
+/// §19.3.1.1 CT_Background — `xsd:choice` of `bgPr` and `bgRef`.
+#[derive(Deserialize)]
+struct BgXml {
+    #[serde(rename = "bgPr", default)]
+    bg_pr: Option<BgPrXml>,
+    #[serde(rename = "bgRef", default)]
+    bg_ref: Option<StyleMatrixRefXml>,
+}
+
+/// §19.3.1.2 CT_BackgroundProperties.
+///
+/// The six fill members are spelled out and routed through the DrawingML
+/// [`pick_fill`] rather than re-derived, because this is the same
+/// `EG_FillProperties` group `<a:spPr>` carries — see [`SpPrXml`].
+#[derive(Deserialize, Default)]
+struct BgPrXml {
+    #[serde(rename = "noFill", default)]
+    no_fill: Option<crate::docx::parse::drawing::schema::fill::Empty>,
+    #[serde(rename = "solidFill", default)]
+    solid_fill: Option<crate::docx::parse::drawing::schema::fill::SolidFillXml>,
+    #[serde(rename = "gradFill", default)]
+    grad_fill: Option<crate::docx::parse::drawing::schema::fill::GradFillXml>,
+    #[serde(rename = "blipFill", default)]
+    blip_fill: Option<crate::docx::parse::drawing::schema::fill::BlipFillXml>,
+    #[serde(rename = "pattFill", default)]
+    patt_fill: Option<crate::docx::parse::drawing::schema::fill::PattFillXml>,
+    #[serde(rename = "grpFill", default)]
+    grp_fill: Option<crate::docx::parse::drawing::schema::fill::Empty>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1582,5 +1700,102 @@ mod tests {
             sp("<p:spPr/>")
         ));
         assert_eq!(shapes.len(), 1);
+    }
+
+    // ── Background (§19.3.1.1) ───────────────────────────────────────────
+
+    /// Same namespace scaffolding as [`tree`], but with a `p:bg` sibling
+    /// ahead of the shape tree, which is where the content model puts it.
+    fn part_with_bg(bg: &str) -> SlidePart {
+        let xml = format!(
+            r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                      xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                 <p:cSld>
+                   {bg}
+                   <p:spTree>
+                     <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+                     <p:grpSpPr/>
+                   </p:spTree>
+                 </p:cSld>
+               </p:sld>"#
+        );
+        parse_slide_part(xml.as_bytes()).expect("parses")
+    }
+
+    #[test]
+    fn bg_pr_solid_fill_is_read() {
+        let part = part_with_bg(
+            r#"<p:bg><p:bgPr><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>
+                 <a:effectLst/></p:bgPr></p:bg>"#,
+        );
+        match part.background {
+            Some(Background::Properties(DrawingFill::Solid(_))) => {}
+            other => panic!("expected a solid bgPr, got {other:?}"),
+        }
+    }
+
+    /// `bgRef@idx` must survive as declared. 1001 is not a typo and not a
+    /// cosmetic index: it selects the theme's *background* fill matrix, and
+    /// every `bgRef` on the corpus uses it. Clamping or defaulting it here
+    /// would push the bug down into the resolver.
+    #[test]
+    fn bg_ref_keeps_its_thousand_offset_index() {
+        let part =
+            part_with_bg(r#"<p:bg><p:bgRef idx="1001"><a:schemeClr val="bg1"/></p:bgRef></p:bg>"#);
+        match part.background {
+            Some(Background::Reference(r)) => {
+                assert_eq!(r.idx, 1001);
+                assert!(r.color.is_some(), "the phClr substitute must survive");
+            }
+            other => panic!("expected a bgRef, got {other:?}"),
+        }
+    }
+
+    /// A part that declares no background yields `None`, which the cascade
+    /// reads as "look further up" — not as "transparent".
+    #[test]
+    fn absent_bg_is_none() {
+        assert!(part_with_bg("").background.is_none());
+    }
+
+    /// A `<p:bgPr>` with no fill child is malformed. It must read as "declares
+    /// nothing" so the cascade keeps walking, rather than as an opaque
+    /// nothing that would mask the master's real background.
+    #[test]
+    fn bg_pr_without_a_fill_declares_nothing() {
+        let part = part_with_bg(r#"<p:bg><p:bgPr><a:effectLst/></p:bgPr></p:bg>"#);
+        assert!(part.background.is_none());
+    }
+
+    /// `<a:noFill>` is a real declaration — an explicitly transparent
+    /// background — and must be distinguishable from the absent case above.
+    #[test]
+    fn bg_pr_no_fill_is_a_declaration_not_an_absence() {
+        let part = part_with_bg(r#"<p:bg><p:bgPr><a:noFill/></p:bgPr></p:bg>"#);
+        assert!(matches!(
+            part.background,
+            Some(Background::Properties(DrawingFill::None))
+        ));
+    }
+
+    /// The background lives beside the shape tree, so reading one must not
+    /// cost the other.
+    #[test]
+    fn background_and_shapes_come_from_one_parse() {
+        let xml = r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                            xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+             <p:cSld>
+               <p:bg><p:bgPr><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></p:bgPr></p:bg>
+               <p:spTree>
+                 <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+                 <p:grpSpPr/>
+                 <p:sp><p:nvSpPr><p:cNvPr id="2" name="s"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+                   <p:spPr/></p:sp>
+               </p:spTree>
+             </p:cSld></p:sld>"#;
+        let part = parse_slide_part(xml.as_bytes()).expect("parses");
+        assert_eq!(part.shapes.len(), 1);
+        assert!(part.background.is_some());
     }
 }
