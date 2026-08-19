@@ -496,7 +496,7 @@ pub fn parse_shape_tree(data: &[u8]) -> Result<Vec<Shape>> {
 /// One struct rather than two entry points because both come out of the same
 /// `p:cSld`, and parsing the part twice to get them would double the cost of
 /// the deck walk for a field that is one element wide.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SlidePart {
     pub shapes: Vec<Shape>,
     /// §19.3.1.1 `<p:bg>`, when *this* part declares one. `None` means "not
@@ -512,6 +512,29 @@ pub struct SlidePart {
     /// — and a `p:clrMapOvr` holding `a:masterClrMapping` is a `None`, because
     /// that element's entire content is "inherit".
     pub color_map: Option<ColorMap>,
+    /// §19.2.1.32 `p:sld/@showMasterSp` and §19.3.1.39 `p:sldLayout`'s — "draw
+    /// the shapes the rung above this one supplies". Defaults to **true**, per
+    /// both elements' schema.
+    ///
+    /// A `bool` rather than an `Option`, because unlike `background` and
+    /// `color_map` this attribute does not cascade: it is a statement about
+    /// *this* part's own rendering, and a slide that says nothing shows its
+    /// layout's shapes whatever the layout says about the master's.
+    ///
+    /// Corpus: 25 of 415 layouts and 4 of 1,278 slides opt out. A master's root
+    /// has no such attribute and always reads `true`.
+    pub show_inherited_shapes: bool,
+}
+
+impl Default for SlidePart {
+    fn default() -> Self {
+        Self {
+            shapes: Vec::new(),
+            background: None,
+            color_map: None,
+            show_inherited_shapes: true,
+        }
+    }
 }
 
 /// Parse a slide, layout, master or notes-slide part into its shapes and its
@@ -524,9 +547,13 @@ pub fn parse_slide_part(data: &[u8]) -> Result<SlidePart> {
         .clr_map
         .or_else(|| part.clr_map_ovr.and_then(|o| o.override_clr_mapping))
         .map(ClrMapXml::into_color_map);
+    // Also a sibling of `p:cSld`, and read before the early return for the same
+    // reason as the colour map.
+    let show_inherited_shapes = part.show_master_sp.is_none_or(|b| b.0);
     let Some(c_sld) = part.c_sld else {
         return Ok(SlidePart {
             color_map,
+            show_inherited_shapes,
             ..Default::default()
         });
     };
@@ -537,6 +564,7 @@ pub fn parse_slide_part(data: &[u8]) -> Result<SlidePart> {
             .unwrap_or_default(),
         background: c_sld.bg.and_then(Background::from_xml),
         color_map,
+        show_inherited_shapes,
     })
 }
 
@@ -557,6 +585,11 @@ struct SlidePartXml {
     /// part's content model allows the two elements together.
     #[serde(rename = "clrMapOvr", default)]
     clr_map_ovr: Option<ClrMapOvrXml>,
+    /// §19.2.1.32 / §19.3.1.39 `@showMasterSp`, on `p:sld` and `p:sldLayout`.
+    /// Absent on `p:sldMaster` and `p:notes`, which is why it is an `Option`
+    /// collapsed to the schema default of `true` by the caller.
+    #[serde(rename = "@showMasterSp", default)]
+    show_master_sp: Option<crate::docx::parse::primitives::toggles::AttrBool>,
 }
 
 /// §19.3.1.6 CT_ColorMapping. Every attribute is *required* by the schema, but
@@ -1984,5 +2017,34 @@ mod tests {
         let part = parse_slide_part(xml.as_bytes()).expect("parses");
         assert_eq!(part.shapes.len(), 1);
         assert!(part.background.is_some());
+    }
+
+    fn show_inherited(root_attrs: &str) -> bool {
+        let xml = format!(
+            r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                      xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                      {root_attrs}>
+                 <p:cSld><p:spTree>
+                   <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+                   <p:grpSpPr/>
+                 </p:spTree></p:cSld>
+               </p:sld>"#
+        );
+        parse_slide_part(xml.as_bytes())
+            .expect("parses")
+            .show_inherited_shapes
+    }
+
+    /// The schema default is `true`, and it is the *absence* of the attribute
+    /// that carries it — a part that says nothing inherits its rung's shapes.
+    #[test]
+    fn show_master_sp_defaults_to_true() {
+        assert!(show_inherited(""));
+    }
+
+    #[test]
+    fn show_master_sp_is_read_when_stated() {
+        assert!(!show_inherited(r#"showMasterSp="0""#));
+        assert!(show_inherited(r#"showMasterSp="1""#));
     }
 }

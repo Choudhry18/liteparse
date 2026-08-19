@@ -180,6 +180,36 @@ pub struct SlideGeometry {
     /// a shape-level text colour this pass does not parse — 2,043 of the
     /// corpus's 2,181 `p:style` elements carry one.
     pub runs_colour_defaulted: usize,
+    /// Shapes painted from a *layout* or *master* part rather than the slide's
+    /// own tree — the panels, rules and logo strips a deck authors once and
+    /// every slide under that rung inherits.
+    ///
+    /// Counted apart from `painted_shapes` rather than pooled with it, because
+    /// the two answer different questions: this one is per *slide occurrence*,
+    /// so one layout panel over 40 slides is 40 here and 1 in its part. Pooling
+    /// them would make the slide-level number move whenever a deck happened to
+    /// reuse a layout more.
+    pub inherited_shapes_painted: usize,
+    /// Inherited shapes that resolve to ink but whose geometry cannot be built
+    /// — the same class as `unpainted_shapes`, counted separately for the same
+    /// reason as above.
+    pub inherited_shapes_unpainted: usize,
+    /// Occurrences of an inherited shape that **carries text this pass does not
+    /// lay out**: 237 layout and 15 master shapes on the corpus, 13.7k
+    /// characters between them.
+    ///
+    /// A measured gap, deliberately left open. Emitting it would put text on a
+    /// page that the markdown emitter — which walks the slide's tree only —
+    /// does not emit, and the two must agree: a `TextItem` is a faithful box
+    /// only for markdown a reader actually gets. Closing it means teaching both
+    /// walks at once, which is its own step.
+    pub inherited_shapes_with_text: usize,
+    /// Slides that decline an inherited rung via `@showMasterSp="0"` — 4 slides
+    /// declining their layout's shapes and, through 25 layouts, the slides that
+    /// decline their master's. Counted because "painted nothing here" and
+    /// "asked to paint nothing here" are different claims.
+    pub slides_declining_layout: usize,
+    pub slides_declining_master: usize,
     /// Runs whose resolved colour is **exactly the colour of the slide's own
     /// background**, i.e. text that cannot be read.
     ///
@@ -270,6 +300,11 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         painted_shapes: 0,
         unpainted_shapes: 0,
         outlines_defaulted_black: 0,
+        inherited_shapes_painted: 0,
+        inherited_shapes_unpainted: 0,
+        inherited_shapes_with_text: 0,
+        slides_declining_layout: 0,
+        slides_declining_master: 0,
         background_commands: Vec::with_capacity(pkg.slides.len()),
         painted_backgrounds: 0,
         transparent_backgrounds: 0,
@@ -305,6 +340,9 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 painted_shapes: &mut out.painted_shapes,
                 unpainted_shapes: &mut out.unpainted_shapes,
                 outlines_defaulted_black: &mut out.outlines_defaulted_black,
+                inherited_shapes_painted: &mut out.inherited_shapes_painted,
+                inherited_shapes_unpainted: &mut out.inherited_shapes_unpainted,
+                inherited_shapes_with_text: &mut out.inherited_shapes_with_text,
                 painted_backgrounds: &mut out.painted_backgrounds,
                 transparent_backgrounds: &mut out.transparent_backgrounds,
                 unrenderable_backgrounds: &mut out.unrenderable_backgrounds,
@@ -318,10 +356,19 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
             // them. See [`paint_shape`] for why they cannot be one walk. The
             // background goes first because the command list *is* the z-order.
             background_at = paint_background(prepared.background.as_ref(), page_size, &mut ctx);
-            paint_shapes(&prepared.shapes, &mut ctx);
+            // ...and so is this: master under layout under slide. §19.3.1.39
+            // builds the page by drawing each rung over the one it inherits
+            // from, which is why an inherited panel is a backdrop for the
+            // slide's own shapes rather than a lid over them.
+            for rung in prepared.inherited {
+                paint_shapes(rung, Rung::Inherited, &mut ctx);
+            }
+            paint_shapes(&prepared.shapes, Rung::Slide, &mut ctx);
             for shape in reading_order(&prepared.shapes) {
                 layout_shape(shape, &mut ctx);
             }
+            out.slides_declining_master += usize::from(prepared.declined[0]);
+            out.slides_declining_layout += usize::from(prepared.declined[1]);
         }
 
         out.placements.push(placements);
@@ -374,6 +421,9 @@ struct ShapeCtx<'a, 'r> {
     painted_shapes: &'a mut usize,
     unpainted_shapes: &'a mut usize,
     outlines_defaulted_black: &'a mut usize,
+    inherited_shapes_painted: &'a mut usize,
+    inherited_shapes_unpainted: &'a mut usize,
+    inherited_shapes_with_text: &'a mut usize,
     painted_backgrounds: &'a mut usize,
     transparent_backgrounds: &'a mut usize,
     unrenderable_backgrounds: &'a mut usize,
@@ -386,7 +436,32 @@ struct ShapeCtx<'a, 'r> {
     runs_invisible_on_background: &'a mut usize,
 }
 
+/// Which part a painted shape came from.
+///
+/// Threaded as an argument rather than kept as a flag on [`ShapeCtx`], because
+/// a flag would have to be set and cleared around each walk and the failure
+/// mode of forgetting is a tally that silently attributes a layout's panels to
+/// the slide.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rung {
+    /// The slide's own `p:spTree`.
+    Slide,
+    /// A layout's or master's, drawn under it.
+    Inherited,
+}
+
 impl ShapeCtx<'_, '_> {
+    /// Record one shape's outcome against the rung it came from.
+    fn tally(&mut self, rung: Rung, painted: bool) {
+        let counter = match (rung, painted) {
+            (Rung::Slide, true) => &mut *self.painted_shapes,
+            (Rung::Slide, false) => &mut *self.unpainted_shapes,
+            (Rung::Inherited, true) => &mut *self.inherited_shapes_painted,
+            (Rung::Inherited, false) => &mut *self.inherited_shapes_unpainted,
+        };
+        *counter += 1;
+    }
+
     /// Add one body's commands to the slide, wrapped in the bracket that
     /// places them.
     ///
@@ -501,14 +576,14 @@ fn paint_background(
 /// chrome filter: this walk paints chrome, the text walk still drops it, and
 /// the 347 chrome shapes that carry text are a divergence this step leaves
 /// open rather than closes (see the module-level note in the plan).
-fn paint_shapes(shapes: &[Shape], ctx: &mut ShapeCtx<'_, '_>) {
+fn paint_shapes(shapes: &[Shape], rung: Rung, ctx: &mut ShapeCtx<'_, '_>) {
     for shape in shapes {
-        paint_shape(shape, ctx);
+        paint_shape(shape, rung, ctx);
         if let ShapeKind::Group(group) = &shape.kind {
             // A group's own `grpSpPr` fill is not lowered to `ShapeProperties`
             // at all, so a group paints nothing itself — its children carry
             // every fill, in their own declaration order.
-            paint_shapes(&group.children, ctx);
+            paint_shapes(&group.children, rung, ctx);
         }
     }
 }
@@ -521,10 +596,17 @@ fn paint_shapes(shapes: &[Shape], ctx: &mut ShapeCtx<'_, '_>) {
 /// self-placing. That also lets it carry the two flips, which a text bracket
 /// deliberately does not — §20.1.7.6 mirrors a shape's *geometry*, and
 /// PowerPoint does not mirror the text inside it.
-fn paint_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
+fn paint_shape(shape: &Shape, rung: Rung, ctx: &mut ShapeCtx<'_, '_>) {
     let Some(props) = shape_properties(shape) else {
         return;
     };
+    // Counted before the paint decision, not after: the text is missing
+    // whether or not the shape also puts ink down, and a 237-shape gap that
+    // only reported itself on shapes that happened to have a fill would be a
+    // number that under-reports exactly where it matters.
+    if rung == Rung::Inherited && shape_text_len(shape) > 0 {
+        *ctx.inherited_shapes_with_text += 1;
+    }
     // `p:style`'s `fillRef`/`lnRef`/`effectRef` are not parsed yet, so the
     // three style arguments are `None` and 3,381 corpus shapes with no `spPr`
     // fill element resolve to nothing. That is an *under*-paint: visible, but
@@ -542,7 +624,7 @@ fn paint_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
     }
 
     let Some(slide_rect) = shape.slide_rect else {
-        *ctx.unpainted_shapes += 1;
+        ctx.tally(rung, false);
         return;
     };
     // The *bounding* box, not the raw rect: `pptx::geometry` composes group
@@ -554,21 +636,21 @@ fn paint_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
         height: emu_to_pt(box_.size.height.raw()),
     };
     let Some(geometry) = props.geometry.as_ref() else {
-        *ctx.unpainted_shapes += 1;
+        ctx.tally(rung, false);
         return;
     };
     let Some(path) = build_geometry(geometry, extent) else {
         // An unimplemented preset. Counted, never approximated by its bounding
         // box: a `rect` drawn where a `cloud` was asked for is a wrong slide,
         // not a coarse one.
-        *ctx.unpainted_shapes += 1;
+        ctx.tally(rung, false);
         return;
     };
 
     if visuals.stroke.is_some() && props.outline.as_ref().is_some_and(|o| o.fill.is_none()) {
         *ctx.outlines_defaulted_black += 1;
     }
-    *ctx.painted_shapes += 1;
+    ctx.tally(rung, true);
     ctx.commands.push(DrawCommand::Path {
         origin: PtOffset::new(
             emu_to_pt(box_.origin.x.raw()),
@@ -583,6 +665,21 @@ fn paint_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
         stroke: visuals.stroke,
         effects: visuals.effects,
     });
+}
+
+/// How much text an inherited shape carries that this pass will not lay out.
+///
+/// Only `p:sp` bodies are counted. A `p:graphicFrame`'s table is a second gap
+/// of a different shape, and 2 of them appear in layout parts against 237
+/// `p:sp`s — folding the two would make the number harder to act on, not more
+/// complete.
+fn shape_text_len(shape: &Shape) -> usize {
+    let ShapeKind::AutoShape(sp) = &shape.kind else {
+        return 0;
+    };
+    sp.text.as_ref().map_or(0, |body| {
+        body.paragraphs.iter().map(|p| p.text().len()).sum()
+    })
 }
 
 /// The `spPr` a shape paints from. Groups and graphic frames have none of

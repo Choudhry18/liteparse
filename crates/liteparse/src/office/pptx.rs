@@ -116,6 +116,17 @@ pub struct Deck {
     /// states no map of its own.
     master_clr_map: HashMap<String, Option<ColorMap>>,
     layout_clr_map: HashMap<String, Option<ColorMap>>,
+    /// The **non-placeholder** shapes each rung contributes to every slide
+    /// under it, geometry already composed. See [`inherited_shapes`] for why
+    /// the placeholders are dropped here rather than skipped at paint time.
+    ///
+    /// Cached beside the other rungs for the same reason, and it matters more
+    /// here than anywhere else: this is a whole shape tree, not one element.
+    master_shapes: HashMap<String, Vec<Shape>>,
+    layout_shapes: HashMap<String, Vec<Shape>>,
+    /// §19.3.1.39 `p:sldLayout/@showMasterSp` — whether slides under this
+    /// layout draw the master's shapes. 25 of the corpus's 415 layouts say no.
+    layout_shows_master: HashMap<String, bool>,
     default_text_style: ListStyle,
     /// The rung-7-only defaults a slide falls back to when its master has no
     /// entry. Stored on the deck rather than built as a local in the walk so
@@ -156,6 +167,26 @@ pub struct PreparedSlide<'d> {
     /// tell "stated" from "assumed", which is exactly the 30-of-70 masters the
     /// census found.
     pub color_map: Option<ColorMap>,
+    /// The master's and then the layout's own shapes, in the order they paint:
+    /// **under** everything in `shapes`, master first. Empty when the rung
+    /// contributes none, or when a `@showMasterSp="0"` turns it off.
+    ///
+    /// Borrowed, not cloned: unlike `background` this is a whole shape tree per
+    /// part, shared by every slide under it.
+    ///
+    /// Read by the geometry pass only. The markdown emitter deliberately
+    /// ignores it — see the module note on why layout text is a measured gap
+    /// rather than something this field quietly fixes.
+    pub inherited: [&'d [Shape]; 2],
+    /// Whether each arm of `inherited` is empty because it was **declined**
+    /// rather than because the part had nothing to give: `[master, layout]`,
+    /// parallel to `inherited`.
+    ///
+    /// The distinction is the whole reason `@showMasterSp` is parsed. Both
+    /// cases paint nothing, so without this a deck that correctly honoured 25
+    /// opt-outs and a deck whose layout parse silently failed would report the
+    /// same numbers.
+    pub declined: [bool; 2],
     layout_text: Option<&'d PlaceholderTextStyles>,
     master_text: Option<&'d PlaceholderTextStyles>,
     deck_defaults: &'d DeckTextDefaults,
@@ -190,6 +221,9 @@ impl Deck {
             layout_bg: HashMap::new(),
             master_clr_map: HashMap::new(),
             layout_clr_map: HashMap::new(),
+            master_shapes: HashMap::new(),
+            layout_shapes: HashMap::new(),
+            layout_shows_master: HashMap::new(),
             fallback_defaults: DeckTextDefaults {
                 master_styles: TextStyles::default(),
                 default_text_style: default_text_style.clone(),
@@ -251,6 +285,37 @@ impl Deck {
         pptx::apply_inherited_geometry(&mut shapes, layout_geo, MatchRule::Idx);
         pptx::apply_slide_geometry(&mut shapes);
 
+        // §19.2.1.32: the slide's own `@showMasterSp` turns off *everything*
+        // the rungs above supply, so it gates the master arm as well as the
+        // layout's — a slide that declines its layout's design does not then
+        // take the master's, which the layout was itself drawing over.
+        // §19.3.1.39: the layout's gates only the master's.
+        let layout = slide.layout.as_ref();
+        let shows_layout = part.show_inherited_shapes;
+        let shows_master = shows_layout
+            && layout
+                .and_then(|l| self.layout_shows_master.get(&l.path))
+                .copied()
+                .unwrap_or(true);
+        let inherited = [
+            if shows_master {
+                slide
+                    .master
+                    .as_ref()
+                    .and_then(|m| self.master_shapes.get(&m.path))
+                    .map_or(&[][..], Vec::as_slice)
+            } else {
+                &[]
+            },
+            if shows_layout {
+                layout
+                    .and_then(|l| self.layout_shapes.get(&l.path))
+                    .map_or(&[][..], Vec::as_slice)
+            } else {
+                &[]
+            },
+        ];
+
         let master = slide
             .master
             .as_ref()
@@ -259,6 +324,8 @@ impl Deck {
             shapes,
             background,
             color_map,
+            inherited,
+            declined: [!shows_master, !shows_layout],
             layout_text: slide
                 .layout
                 .as_ref()
@@ -308,6 +375,8 @@ impl Deck {
             // twice would double the cost of priming for a one-element field.
             let part = pptx::parse_slide_part(&master.xml).unwrap_or_default();
             let shapes = part.shapes;
+            self.master_shapes
+                .insert(master.path.clone(), inherited_shapes(&shapes));
             self.master_bg.insert(master.path.clone(), part.background);
             self.master_clr_map
                 .insert(master.path.clone(), part.color_map);
@@ -339,7 +408,16 @@ impl Deck {
             self.layout_bg.insert(layout.path.clone(), part.background);
             self.layout_clr_map
                 .insert(layout.path.clone(), part.color_map);
+            self.layout_shows_master
+                .insert(layout.path.clone(), part.show_inherited_shapes);
             pptx::apply_inherited_geometry(&mut shapes, master_geo, MatchRule::CollapsedKind);
+            // After the placeholder cascade, before `from_layout` indexes it:
+            // both read `Shape::transform`, which neither this nor the
+            // composition below touches, so the order between them is free —
+            // but the cascade above must come first, since a placeholder with
+            // no rectangle of its own has nothing to compose.
+            self.layout_shapes
+                .insert(layout.path.clone(), inherited_shapes(&shapes));
             self.layout_geo.insert(
                 layout.path.clone(),
                 PlaceholderGeometry::from_layout(&shapes, master_geo),
@@ -350,6 +428,35 @@ impl Deck {
             );
         }
     }
+}
+
+/// The shapes a layout or master part contributes to every slide beneath it:
+/// its **non-placeholder** shapes, with their group transforms composed.
+///
+/// PowerPoint draws a layout's ordinary shapes — the full-bleed panel, the
+/// rule, the logo strip — on every slide that uses the layout. It does *not*
+/// draw the layout's placeholders: those are prototypes, and the slide's own
+/// placeholder is the thing that renders. Painting them would put every
+/// layout's "Click to edit Master title style" prompt on the deck, and would
+/// double-paint the fill of every placeholder a slide does use.
+///
+/// So the filter is the correctness rule, not an optimisation, and it is
+/// applied here rather than at paint time so that the cache holds exactly what
+/// the painter may draw. Top-level only, matching
+/// `PlaceholderGeometry::index`: a placeholder never appears inside a group.
+///
+/// Corpus: 1,567 of 4,432 layout shapes and 179 of 395 master shapes survive.
+fn inherited_shapes(shapes: &[Shape]) -> Vec<Shape> {
+    let mut kept: Vec<Shape> = shapes
+        .iter()
+        .filter(|s| s.placeholder.is_none())
+        .cloned()
+        .collect();
+    // These shapes never reach `Deck::prepare`'s composition pass — they are
+    // not the slide's — so they compose here, once per part rather than once
+    // per slide using it.
+    pptx::apply_slide_geometry(&mut kept);
+    kept
 }
 
 struct SlideCtx<'a> {
