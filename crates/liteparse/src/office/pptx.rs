@@ -14,9 +14,10 @@
 
 use liteparse_ooxml::model::{Inline, RunElement, RunProperties, StrikeStyle};
 use liteparse_ooxml::pptx::{
-    self, AutoNumberScheme, Bullet, DeckTextDefaults, GraphicFramePayload, ListStyle, MatchRule,
-    Placeholder, PlaceholderGeometry, PlaceholderKind, PlaceholderTextStyles, PresentationPackage,
-    ResolvedTextStyle, Shape, ShapeKind, Table, TextBody, TextCascade, TextParagraph, TextStyles,
+    self, AutoNumberScheme, Background, BackgroundSource, Bullet, DeckTextDefaults,
+    GraphicFramePayload, ListStyle, MatchRule, Placeholder, PlaceholderGeometry, PlaceholderKind,
+    PlaceholderTextStyles, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Table,
+    TextBody, TextCascade, TextParagraph, TextStyles,
 };
 use std::collections::HashMap;
 
@@ -103,6 +104,13 @@ pub struct Deck {
     layout_geo: HashMap<String, PlaceholderGeometry>,
     master_text: HashMap<String, (PlaceholderTextStyles, DeckTextDefaults)>,
     layout_text: HashMap<String, PlaceholderTextStyles>,
+    /// Each part's **own** `<p:bg>`, uninherited — the two upper rungs of the
+    /// background cascade, cached beside the geometry and text rungs and for
+    /// the same reason: a deck with 60 slides over 3 layouts must not reparse
+    /// them 60 times. `None` in the map means "this part declares none", which
+    /// is not the same as "no background": see [`pptx::resolve_background`].
+    master_bg: HashMap<String, Option<Background>>,
+    layout_bg: HashMap<String, Option<Background>>,
     default_text_style: ListStyle,
     /// The rung-7-only defaults a slide falls back to when its master has no
     /// entry. Stored on the deck rather than built as a local in the walk so
@@ -122,6 +130,18 @@ pub struct Deck {
 #[doc(hidden)]
 pub struct PreparedSlide<'d> {
     pub shapes: Vec<Shape>,
+    /// The background in force on this slide, already resolved down the
+    /// slide → layout → master chain, with the rung it came from.
+    ///
+    /// Owned rather than borrowed because the winner may be the slide's own,
+    /// which is parsed here and outlives nothing. Cloning one `p:bg` per slide
+    /// is a fill descriptor, not a shape tree.
+    ///
+    /// Still **uncoloured**: turning it into a fill needs the theme of this
+    /// slide's own master, which the emitter does not load and the geometry
+    /// pass does. `None` means no part in the chain declared one, which does
+    /// not happen on the corpus (0 of 1,278) and is therefore a signal.
+    pub background: Option<(BackgroundSource, Background)>,
     layout_text: Option<&'d PlaceholderTextStyles>,
     master_text: Option<&'d PlaceholderTextStyles>,
     deck_defaults: &'d DeckTextDefaults,
@@ -152,6 +172,8 @@ impl Deck {
             layout_geo: HashMap::new(),
             master_text: HashMap::new(),
             layout_text: HashMap::new(),
+            master_bg: HashMap::new(),
+            layout_bg: HashMap::new(),
             fallback_defaults: DeckTextDefaults {
                 master_styles: TextStyles::default(),
                 default_text_style: default_text_style.clone(),
@@ -168,7 +190,22 @@ impl Deck {
     pub fn prepare(&mut self, slide: &pptx::SlideParts) -> Option<PreparedSlide<'_>> {
         self.prime(slide);
 
-        let mut shapes = pptx::parse_shape_tree(&slide.slide.xml).ok()?;
+        let part = pptx::parse_slide_part(&slide.slide.xml).ok()?;
+        let mut shapes = part.shapes;
+        let background = pptx::resolve_background(
+            part.background.as_ref(),
+            slide
+                .layout
+                .as_ref()
+                .and_then(|l| self.layout_bg.get(&l.path))
+                .and_then(Option::as_ref),
+            slide
+                .master
+                .as_ref()
+                .and_then(|m| self.master_bg.get(&m.path))
+                .and_then(Option::as_ref),
+        )
+        .map(|(src, bg)| (src, bg.clone()));
         let layout_geo = slide
             .layout
             .as_ref()
@@ -184,6 +221,7 @@ impl Deck {
             .and_then(|m| self.master_text.get(&m.path));
         Some(PreparedSlide {
             shapes,
+            background,
             layout_text: slide
                 .layout
                 .as_ref()
@@ -228,7 +266,12 @@ impl Deck {
         if let Some(master) = &slide.master
             && !self.master_geo.contains_key(&master.path)
         {
-            let shapes = pptx::parse_shape_tree(&master.xml).unwrap_or_default();
+            // One deserialization for both payloads: the background lives
+            // beside the shape tree in the same `p:cSld`, so parsing the part
+            // twice would double the cost of priming for a one-element field.
+            let part = pptx::parse_slide_part(&master.xml).unwrap_or_default();
+            let shapes = part.shapes;
+            self.master_bg.insert(master.path.clone(), part.background);
             self.master_geo.insert(
                 master.path.clone(),
                 PlaceholderGeometry::from_master(&shapes),
@@ -252,7 +295,9 @@ impl Deck {
         if let Some(layout) = &slide.layout
             && !self.layout_geo.contains_key(&layout.path)
         {
-            let mut shapes = pptx::parse_shape_tree(&layout.xml).unwrap_or_default();
+            let part = pptx::parse_slide_part(&layout.xml).unwrap_or_default();
+            let mut shapes = part.shapes;
+            self.layout_bg.insert(layout.path.clone(), part.background);
             pptx::apply_inherited_geometry(&mut shapes, master_geo, MatchRule::CollapsedKind);
             self.layout_geo.insert(
                 layout.path.clone(),

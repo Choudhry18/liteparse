@@ -49,7 +49,10 @@
 //! chrome filter, the traversal order, and the placement mechanism — a text
 //! body is bracketed, a path places itself.
 
-use liteparse_ooxml::model::{Alignment, Theme};
+use liteparse_ooxml::model::dimension::Dimension;
+use liteparse_ooxml::model::{
+    Alignment, DrawingFill, PresetGeometryDef, PresetShapeType, ShapeGeometry, Theme,
+};
 use liteparse_ooxml::pptx::{
     self, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Spacing, TextBody, TextCascade,
     TextParagraph,
@@ -140,6 +143,34 @@ pub struct SlideGeometry {
     /// place this pass paints something *wrong* rather than painting nothing,
     /// and it is counted rather than hidden until `p:style` is parsed.
     pub outlines_defaulted_black: usize,
+    /// Per page, the command index of the full-slide background
+    /// [`DrawCommand::Path`], when one was emitted. Parallel to `pages`.
+    ///
+    /// An explicit link for the same reason [`ShapePlacement::bracket`] is
+    /// one: the background is a `Path` among the painter's other `Path`s, and
+    /// a consumer that wanted to separate "the slide has a backdrop" from "the
+    /// shapes put ink on it" would otherwise have to guess by position and
+    /// extent. It also makes the z-order claim checkable — a present index
+    /// that is not 0 is a background painted over its own slide.
+    pub background_commands: Vec<Option<usize>>,
+    /// Slides that emitted a full-slide background [`DrawCommand::Path`].
+    pub painted_backgrounds: usize,
+    /// Slides whose resolved background is deliberately transparent
+    /// (`<a:noFill/>`, 36 on the corpus). Not a gap: nothing is the correct
+    /// paint, and it is separated from the next two so that "no ink" and
+    /// "could not make ink" stay different claims.
+    pub transparent_backgrounds: usize,
+    /// Slides that declare a background this pass cannot colour: `blip` (63 on
+    /// the corpus), `pattern`, or a `bgRef` into a matrix entry of one of
+    /// those kinds. Distinguished from the transparent case on the *declared*
+    /// arm, because `resolve_fill` collapses all of them to
+    /// [`ResolvedFill::None`] — so the resolved fill alone would report a
+    /// missing photograph as a slide that correctly has no backdrop.
+    pub unrenderable_backgrounds: usize,
+    /// Slides where no part in the slide → layout → master chain declares a
+    /// background at all. 0 on the corpus, so any number here is a signal
+    /// about the package rather than a normal outcome.
+    pub undeclared_backgrounds: usize,
 }
 
 /// Where one text body's items landed on its slide — a shape's, or a single
@@ -222,12 +253,18 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         painted_shapes: 0,
         unpainted_shapes: 0,
         outlines_defaulted_black: 0,
+        background_commands: Vec::with_capacity(pkg.slides.len()),
+        painted_backgrounds: 0,
+        transparent_backgrounds: 0,
+        unrenderable_backgrounds: 0,
+        undeclared_backgrounds: 0,
     };
 
     for (idx, slide) in pkg.slides.iter().enumerate() {
         let mut items = Vec::new();
         let mut placements = Vec::new();
         let mut commands = Vec::new();
+        let mut background_at = None;
         let theme = slide_theme(pkg, slide, &mut themes);
         // A slide whose shape tree will not parse still yields a page. Page
         // count must equal slide count — a consumer indexes pages by slide.
@@ -247,9 +284,15 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 painted_shapes: &mut out.painted_shapes,
                 unpainted_shapes: &mut out.unpainted_shapes,
                 outlines_defaulted_black: &mut out.outlines_defaulted_black,
+                painted_backgrounds: &mut out.painted_backgrounds,
+                transparent_backgrounds: &mut out.transparent_backgrounds,
+                unrenderable_backgrounds: &mut out.unrenderable_backgrounds,
+                undeclared_backgrounds: &mut out.undeclared_backgrounds,
             };
             // Two walks over one `prepare`, in the order the raster wants
-            // them. See [`paint_shape`] for why they cannot be one walk.
+            // them. See [`paint_shape`] for why they cannot be one walk. The
+            // background goes first because the command list *is* the z-order.
+            background_at = paint_background(prepared.background.as_ref(), page_size, &mut ctx);
             paint_shapes(&prepared.shapes, &mut ctx);
             for shape in reading_order(&prepared.shapes) {
                 layout_shape(shape, &mut ctx);
@@ -257,6 +300,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         }
 
         out.placements.push(placements);
+        out.background_commands.push(background_at);
         out.layouts.push(LayoutedPage {
             commands,
             page_size,
@@ -300,6 +344,10 @@ struct ShapeCtx<'a, 'r> {
     painted_shapes: &'a mut usize,
     unpainted_shapes: &'a mut usize,
     outlines_defaulted_black: &'a mut usize,
+    painted_backgrounds: &'a mut usize,
+    transparent_backgrounds: &'a mut usize,
+    unrenderable_backgrounds: &'a mut usize,
+    undeclared_backgrounds: &'a mut usize,
 }
 
 impl ShapeCtx<'_, '_> {
@@ -322,6 +370,80 @@ impl ShapeCtx<'_, '_> {
             .push(DrawCommand::Transform(TransformMark::End));
         at
     }
+}
+
+/// The slide's background, as a full-slide [`DrawCommand::Path`] at the head
+/// of the command list.
+///
+/// **First, and unconditionally first.** §19.3.1.1 puts `p:bg` before
+/// `p:spTree` in `p:cSld` for the same reason this call precedes
+/// [`paint_shapes`]: the command list is the z-order, and a background emitted
+/// anywhere else paints over the slide it is supposed to sit under.
+///
+/// The rectangle is the *page*, not any shape's box. A background is not a
+/// shape — it has no `a:xfrm`, no rotation and no geometry of its own — so it
+/// is built as a `rect` preset at the slide's full extent, through the same
+/// [`build_geometry`] every shape uses rather than by hand-rolling four verbs.
+///
+/// The cascade and the colour lookup are both already shared and neither is
+/// re-derived here: [`Deck::prepare`] resolves which of slide/layout/master
+/// wins, and [`pptx::background_fill`] is the single place that knows a
+/// `bgRef@idx` of 1001 selects `bgFillStyleLst[0]` and not `fillStyleLst`.
+/// `ctx.theme` is this slide's own master's theme, which is what makes the
+/// 31 corpus slides that resolve a `bgRef` under a second master come out in
+/// their own palette.
+///
+/// [`Deck::prepare`]: crate::office::pptx::Deck::prepare
+fn paint_background(
+    background: Option<&(pptx::BackgroundSource, pptx::Background)>,
+    page_size: PtSize,
+    ctx: &mut ShapeCtx<'_, '_>,
+) -> Option<usize> {
+    let Some((_, bg)) = background else {
+        *ctx.undeclared_backgrounds += 1;
+        return None;
+    };
+    let fill = pptx::background_fill(bg, ctx.theme);
+    if matches!(fill, ResolvedFill::None) {
+        // Two very different slides land here, and the resolved fill cannot
+        // tell them apart: `resolve_fill` collapses blip, pattern and `grpFill`
+        // to `None` alongside a genuine `<a:noFill/>`. Splitting them on the
+        // *declared* arm is the difference between "this slide has no
+        // backdrop, correctly" (36 on the corpus) and "this slide's photograph
+        // backdrop is missing" (63) — reporting the second as the first is
+        // exactly the silent-wrongness this pass counts its way out of.
+        if matches!(bg, pptx::Background::Properties(DrawingFill::None)) {
+            *ctx.transparent_backgrounds += 1;
+        } else {
+            *ctx.unrenderable_backgrounds += 1;
+        }
+        return None;
+    }
+    // The only way a `rect` fails to build is a zero-extent page, which has no
+    // slide to be the backdrop of. Uncounted for that reason.
+    let path = build_geometry(
+        &ShapeGeometry::Preset(PresetGeometryDef {
+            preset: PresetShapeType::Rect,
+            adjust_values: Vec::new(),
+        }),
+        page_size,
+    )?;
+    *ctx.painted_backgrounds += 1;
+    let at = ctx.commands.len();
+    ctx.commands.push(DrawCommand::Path {
+        origin: PtOffset::new(Pt::ZERO, Pt::ZERO),
+        rotation: Dimension::ZERO,
+        flip_h: false,
+        flip_v: false,
+        extent: page_size,
+        paths: path.paths,
+        fill,
+        // A background has no `a:ln`. The `rect` preset marks its subpath
+        // stroked, so passing anything here would outline the whole slide.
+        stroke: None,
+        effects: Vec::new(),
+    });
+    Some(at)
 }
 
 /// Paint every shape on the slide, in document order.
