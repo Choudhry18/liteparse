@@ -60,7 +60,7 @@ use liteparse_ooxml::pptx::{
 };
 use liteparse_ooxml::render::dimension::Pt;
 use liteparse_ooxml::render::fonts::FontRegistry;
-use liteparse_ooxml::render::geometry::{PtOffset, PtSize};
+use liteparse_ooxml::render::geometry::{PtOffset, PtRect, PtSize};
 use liteparse_ooxml::render::layout::ShapeAutoFit;
 use liteparse_ooxml::render::layout::draw_command::{
     DrawCommand, LayoutedPage, ResolvedFill, ShapeTransform, TransformMark,
@@ -1045,6 +1045,16 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
     if extent.width <= Pt::ZERO || extent.height <= Pt::ZERO {
         return;
     }
+    // §20.1.9.18: the shape's box is not its *text* box. Every preset carries
+    // an `<a:rect>` naming where its text goes, and for anything that is not a
+    // plain rectangle that rectangle is inset — a `roundRect` by the sagitta of
+    // its corner arc, a `cloud` by a third of its width in each direction. 310
+    // of the corpus's 4,969 laid-out bodies sit in one, keeping a mean 78% of
+    // the room they are given today; all 310 shrink and none grows, so this
+    // only ever wraps text sooner, never later.
+    let body_box = body_rect(shape, extent);
+    let body_extent = body_box.size;
+    let offset = (body_box.origin.x.raw(), body_box.origin.y.raw());
 
     let title = is_title(shape.placeholder.as_ref());
     // Rung 2 is the shape's own list style, exactly as the markdown emitter
@@ -1076,30 +1086,74 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
             .default_line_height(&default_family, spec_default_size()),
     );
 
-    let commands = layout_shape_body(&blocks, extent, body.body_pr.as_ref(), line_height);
+    let commands = layout_shape_body(&blocks, body_extent, body.body_pr.as_ref(), line_height);
     if commands.is_empty() {
         return;
     }
 
+    // The frame is still the *shape's*, not the text rect's: a rotation turns
+    // the whole shape about the shape's centre, and an inset body rides along
+    // rather than turning about its own — the same reason a table's cells all
+    // rotate about the table's centre. `offset` is what puts it back where it
+    // belongs, exactly as a cell's is.
     let frame = Frame::new(slide_rect, extent);
-    let bracket = ctx.push_bracketed(frame.place((0.0, 0.0), extent), commands.clone());
-    let items = commands_to_items(commands, extent, ctx);
+    let bracket = ctx.push_bracketed(frame.place(offset, body_extent), commands.clone());
+    let items = commands_to_items(commands, body_extent, ctx);
     let first_item = ctx.items.len();
-    frame.push_items(items, (0.0, 0.0), ctx.items);
+    frame.push_items(items, offset, ctx.items);
 
     ctx.placements.push(ShapePlacement {
         kind: PlacementKind::Shape,
         rect: (
-            frame.origin.0,
-            frame.origin.1,
-            extent.width.raw(),
-            extent.height.raw(),
+            frame.origin.0 + offset.0,
+            frame.origin.1 + offset.1,
+            body_extent.width.raw(),
+            body_extent.height.raw(),
         ),
         rotation: frame.item_rotation(),
         shrunk: auto_fit != ShapeAutoFit::NONE,
         items: first_item..ctx.items.len(),
         bracket,
     });
+}
+
+/// The rectangle a shape's text body is laid out in — its geometry's
+/// `<a:rect>` (§20.1.9.18) when that geometry names one, and the shape's whole
+/// box otherwise.
+///
+/// Built here rather than shared with the paint walk, which resolves the same
+/// geometry a few lines earlier. The two cannot share: the painter builds in
+/// `slide_rect.bounding_box()`, because a rotated child's ink lives in the box
+/// group composition produced, while text is laid out in `slide_rect.rect` and
+/// turned about the frame's centre afterwards. On 187 of the corpus's
+/// laid-out bodies those two extents differ, and a shared build would give one
+/// of the two walks a rectangle scaled for the other. The build itself is
+/// ~0.5µs of guide evaluation.
+///
+/// Falls back to the full box in three cases, none of which occurs on the
+/// corpus but each of which is a silent text drop if taken literally:
+///
+/// * no geometry declared (886 bodies — the schema's default is a rectangle,
+///   whose text rect *is* the box, so the fallback is also the right answer),
+/// * an unbuildable preset, i.e. a name §20.1.9.18 does not define,
+/// * a degenerate rect. A body given no width lays nothing out, and dropping a
+///   shape's text on a guide that evaluated to zero would be a worse answer
+///   than the box it came in.
+fn body_rect(shape: &Shape, extent: PtSize) -> PtRect {
+    let whole = PtRect {
+        origin: PtOffset::new(Pt::ZERO, Pt::ZERO),
+        size: extent,
+    };
+    let Some(geometry) = shape_properties(shape).and_then(|p| p.geometry.as_ref()) else {
+        return whole;
+    };
+    let Some(rect) = build_geometry(geometry, extent).and_then(|path| path.text_rect) else {
+        return whole;
+    };
+    if rect.size.width <= Pt::ZERO || rect.size.height <= Pt::ZERO {
+        return whole;
+    }
+    rect
 }
 
 /// Convert a laid-out body's draw commands into [`TextItem`]s, in body-local Pt.
@@ -1936,5 +1990,105 @@ mod tests {
         let r = union_bounds(&[item(10.0, 20.0, 5.0, 5.0), item(3.0, 40.0, 2.0, 2.0)]).unwrap();
         assert_eq!((r.x, r.y), (3.0, 20.0));
         assert_eq!((r.width, r.height), (12.0, 22.0));
+    }
+
+    /// A shape carrying `geometry` and nothing else — `body_rect` reads only
+    /// the geometry off `spPr`, and every other field is noise to it.
+    fn shape_with(geometry: Option<liteparse_ooxml::model::ShapeGeometry>) -> Shape {
+        Shape {
+            non_visual: liteparse_ooxml::model::DocProperties {
+                id: 1,
+                name: String::new(),
+                description: None,
+                hidden: None,
+                title: None,
+            },
+            placeholder: None,
+            transform: None,
+            transform_inherited: false,
+            slide_rect: None,
+            style: None,
+            kind: ShapeKind::AutoShape(Box::new(liteparse_ooxml::pptx::AutoShape {
+                properties: Some(liteparse_ooxml::model::ShapeProperties {
+                    bw_mode: None,
+                    transform: None,
+                    geometry,
+                    fill: None,
+                    outline: None,
+                    effect_list: None,
+                }),
+                text: None,
+                is_text_box: false,
+            })),
+        }
+    }
+
+    fn preset(
+        preset: liteparse_ooxml::model::PresetShapeType,
+    ) -> Option<liteparse_ooxml::model::ShapeGeometry> {
+        Some(liteparse_ooxml::model::ShapeGeometry::Preset(
+            liteparse_ooxml::model::PresetGeometryDef {
+                preset,
+                adjust_values: Vec::new(),
+            },
+        ))
+    }
+
+    /// §20.1.9.22: a `roundRect`'s text rect is inset by 29.289% of its corner
+    /// radius — the sagitta of the 45° arc — on every side. With the default
+    /// 16.667% adjustment on a 100x100 box that is 4.88pt, and the point of the
+    /// test is that it is *neither* zero (the rect's answer) nor the full
+    /// 16.667pt radius (what the retired hand-written generator returned).
+    #[test]
+    fn a_round_rect_lays_its_body_out_inside_its_corner_arcs() {
+        let r = body_rect(
+            &shape_with(preset(liteparse_ooxml::model::PresetShapeType::RoundRect)),
+            size(100.0, 100.0),
+        );
+        let inset = r.origin.x.raw();
+        assert!(
+            (inset - 4.88).abs() < 0.05,
+            "expected the 29.289% sagitta, got {inset}"
+        );
+        assert!((r.origin.y.raw() - inset).abs() < 0.01);
+        assert!((r.size.width.raw() - (100.0 - 2.0 * inset)).abs() < 0.05);
+        assert!((r.size.height.raw() - (100.0 - 2.0 * inset)).abs() < 0.05);
+    }
+
+    /// The 72% case: a plain rectangle's text rect *is* its box, so the
+    /// substitution has to be a no-op for it rather than a near-miss.
+    #[test]
+    fn a_plain_rect_gets_its_whole_box() {
+        let r = body_rect(
+            &shape_with(preset(liteparse_ooxml::model::PresetShapeType::Rect)),
+            size(100.0, 60.0),
+        );
+        assert_eq!((r.origin.x.raw(), r.origin.y.raw()), (0.0, 0.0));
+        assert_eq!((r.size.width.raw(), r.size.height.raw()), (100.0, 60.0));
+    }
+
+    /// 886 corpus bodies declare no geometry at all. The schema's default is a
+    /// rectangle, so the whole box is the right answer and not merely a
+    /// fallback — laying such a body out in nothing would drop its text.
+    #[test]
+    fn a_shape_declaring_no_geometry_gets_its_whole_box() {
+        let r = body_rect(&shape_with(None), size(80.0, 40.0));
+        assert_eq!((r.size.width.raw(), r.size.height.raw()), (80.0, 40.0));
+    }
+
+    /// A `prst` §20.1.9.18 does not define builds nothing. The paint walk
+    /// refuses to approximate it by its bounding box — a `rect` drawn where a
+    /// `cloud` was asked for is a wrong slide. Text is the opposite trade: the
+    /// box is where the text already lands today, and refusing it would lose
+    /// the text rather than draw it coarsely.
+    #[test]
+    fn an_undefined_preset_still_gets_its_box_to_lay_text_out_in() {
+        let r = body_rect(
+            &shape_with(preset(liteparse_ooxml::model::PresetShapeType::Other(
+                "nonesuch".into(),
+            ))),
+            size(80.0, 40.0),
+        );
+        assert_eq!((r.size.width.raw(), r.size.height.raw()), (80.0, 40.0));
     }
 }
