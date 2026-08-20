@@ -357,6 +357,57 @@ async fn test_parse_docx_native_integration() {
     );
 }
 
+/// §17.17.1 text-box content reaches markdown, exactly once, in reading order.
+///
+/// The fixture's two callouts are `<wp:inline>` `wps:wsp` shapes wrapped in an
+/// `mc:AlternateContent` whose `mc:Fallback` is a VML `v:textbox` carrying
+/// **the same text** — so the walk must commit to one branch or emit the box
+/// twice. Before the text-box tap, the structure walk descended into neither
+/// and 1,213 chars of instructional prose were absent from native markdown
+/// while the LibreOffice path kept them.
+#[cfg(feature = "docx-native")]
+#[tokio::test]
+#[serial]
+async fn test_parse_docx_native_text_box_integration() {
+    let path = "../../docx_files/enterprise/epa_swppp_template.docx";
+    let lit = LiteParse::new(LiteParseConfig {
+        output_format: liteparse::config::OutputFormat::Markdown,
+        quiet: true,
+        ..Default::default()
+    });
+    let md = lit.parse(path).await.expect("native parse succeeds").text;
+
+    // The `mc:Choice`/`mc:Fallback` pair holds one copy of the text between
+    // them; two hits would mean both branches were walked.
+    assert_eq!(
+        md.matches("equipment/vehicle washing practices").count(),
+        1,
+        "text box emitted exactly once (one MC branch)"
+    );
+    assert_eq!(
+        md.matches("types of building products, materials, and wastes")
+            .count(),
+        1,
+    );
+
+    // Sibling blocks, not fused into the host paragraph: the box's own header
+    // and its bullets keep their structure, and land after the section heading
+    // the box follows in the document.
+    let heading = md
+        .find("5.4 Washing of Equipment and Vehicles")
+        .expect("host heading present");
+    let header = md
+        .find("**Instructions (see CGP Parts 2.3.2 and 7.2.6):**")
+        .expect("box header emitted as its own bold block");
+    let bullet = md
+        .find("- Describe equipment/vehicle washing practices")
+        .expect("box body emitted as list items");
+    assert!(
+        heading < header && header < bullet,
+        "box content reads after its host heading, header before bullets"
+    );
+}
+
 /// Native image extraction: original embedded bytes surface on
 /// `ParseResult.images` with platform naming, markdown carries matching
 /// figure refs for body images, and repeated media (the per-page header

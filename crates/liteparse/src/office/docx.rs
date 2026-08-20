@@ -14,9 +14,9 @@ use std::collections::{HashMap, VecDeque};
 
 use liteparse_ooxml::field::FieldInstruction;
 use liteparse_ooxml::model::{
-    Block as DocxBlock, HyperlinkTarget, Inline, NoteId, NumId, NumberFormat, OutlineLevel,
-    Paragraph, ParagraphProperties, RunElement, RunProperties, StrikeStyle, StyleId, Table,
-    VerticalMerge,
+    Block as DocxBlock, GraphicContent, HyperlinkTarget, Inline, NoteId, NumId, NumberFormat,
+    OutlineLevel, Paragraph, ParagraphProperties, RunElement, RunProperties, StrikeStyle, StyleId,
+    Table, VerticalMerge,
 };
 use liteparse_ooxml::render::resolve::ResolvedDocument;
 
@@ -147,7 +147,20 @@ struct Emitter<'a> {
     /// are inline in the model but block-level in markdown, same as the PDF
     /// path's y-interleaved figures.
     pending_figures: Vec<(String, String)>,
+    /// Blocks harvested from text boxes met during the current paragraph/table
+    /// walk, flushed after the enclosing block. §17.17.1 `wps:txbx` and
+    /// §14.1.2.22 `v:textbox` hold *block* content — the corpus's boxes are
+    /// multi-paragraph callouts with their own heading and bullets — so they
+    /// cannot be folded into the host paragraph's chunk stream without fusing
+    /// that structure into one line.
+    pending_boxes: Vec<Block>,
+    /// Recursion guard: a text box can hold a shape that holds a text box.
+    box_depth: u8,
 }
+
+/// Nesting depth past which a text box's interior is not walked. No corpus
+/// document nests at all; this only bounds a pathological or cyclic file.
+const MAX_TEXT_BOX_DEPTH: u8 = 4;
 
 impl<'a> Emitter<'a> {
     fn new(doc: &'a ResolvedDocument, opts: EmitOptions) -> Self {
@@ -158,14 +171,20 @@ impl<'a> Emitter<'a> {
             links: opts.links,
             figures: opts.figures,
             pending_figures: Vec::new(),
+            pending_boxes: Vec::new(),
+            box_depth: 0,
         }
     }
 
-    /// Drain figures gathered while walking the current block's inlines.
-    fn flush_figures(&mut self, out: &mut Vec<Block>) {
+    /// Drain the figures and text-box blocks gathered while walking the current
+    /// block's inlines. Figures first: an image and a text box in the same
+    /// paragraph is a captioned-figure shape, and the caption reads after the
+    /// picture.
+    fn flush_pending(&mut self, out: &mut Vec<Block>) {
         for (id, format) in self.pending_figures.drain(..) {
             out.push(Block::Figure { id, format });
         }
+        out.append(&mut self.pending_boxes);
     }
 
     fn style_run(&self, id: Option<&StyleId>) -> Option<&RunProperties> {
@@ -333,10 +352,119 @@ impl<'a> Emitter<'a> {
                     {
                         self.pending_figures.push(fig);
                     }
+                    // §14.5 wps:wsp — a shape's `wps:txbx` body. Reached for
+                    // both placements: an inline box and an anchored callout
+                    // are the same content to a reader, and markdown has no
+                    // float to distinguish them with.
+                    if let Some(GraphicContent::WordProcessingShape(wsp)) = img.graphic.as_ref() {
+                        self.harvest_text_box(&wsp.txbx_content);
+                    }
+                }
+                // §17.3.3.19: legacy VML drawing. Every primitive variant
+                // admits a `<v:textbox>`, so the walk is over `common()`
+                // rather than the `Shape` variant alone — the same rule
+                // `fragment::collect` applies on the layout side.
+                Inline::Pict(pict) => {
+                    for primitive in &pict.primitives {
+                        if let Some(tb) = primitive.common().text_box.as_ref() {
+                            self.harvest_text_box(&tb.content);
+                        }
+                    }
+                }
+                // MCE §M.2.1. A shape is normally written as a `wps` choice
+                // with a VML fallback carrying *the same text*, so exactly one
+                // branch may be walked or the box is emitted twice.
+                Inline::AlternateContent(ac) => {
+                    let before = self.pending_boxes.len();
+                    for choice in &ac.choices {
+                        self.harvest_boxes(&choice.content);
+                        if self.pending_boxes.len() > before {
+                            break;
+                        }
+                    }
+                    if self.pending_boxes.len() == before
+                        && let Some(fallback) = ac.fallback.as_ref()
+                    {
+                        self.harvest_boxes(fallback);
+                    }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Text boxes only, for the interior of an `mc:AlternateContent`.
+    ///
+    /// Deliberately *not* `collect`: a branch's runs and images are left alone.
+    /// Run text inside a choice is already rendered by whichever branch the
+    /// layout picked, and popping a figure id here would desync the queue,
+    /// which pairs the nth structure occurrence with the nth *drawn* placement
+    /// and does not walk `mc:AlternateContent` at all. No corpus document has a
+    /// picture inside one (0 of 32 elements across 165 documents), so this
+    /// costs nothing measurable and keeps the figure pairing provably
+    /// unchanged.
+    fn harvest_boxes(&mut self, content: &[Inline]) {
+        for inline in content {
+            match inline {
+                Inline::Image(img) => {
+                    if let Some(GraphicContent::WordProcessingShape(wsp)) = img.graphic.as_ref() {
+                        self.harvest_text_box(&wsp.txbx_content);
+                    }
+                }
+                Inline::Pict(pict) => {
+                    for primitive in &pict.primitives {
+                        if let Some(tb) = primitive.common().text_box.as_ref() {
+                            self.harvest_text_box(&tb.content);
+                        }
+                    }
+                }
+                Inline::Hyperlink(h) => self.harvest_boxes(&h.content),
+                Inline::Field(f) => self.harvest_boxes(&f.content),
+                Inline::AlternateContent(ac) => {
+                    let before = self.pending_boxes.len();
+                    for choice in &ac.choices {
+                        self.harvest_boxes(&choice.content);
+                        if self.pending_boxes.len() > before {
+                            break;
+                        }
+                    }
+                    if self.pending_boxes.len() == before
+                        && let Some(fallback) = ac.fallback.as_ref()
+                    {
+                        self.harvest_boxes(fallback);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Emit a text box's block content onto `pending_boxes`.
+    ///
+    /// The interior is a full block walk — a box holding a table emits a table
+    /// — but it runs with figure emission **off**: figure ids come from the
+    /// layout's draw order, which does not queue a box's interior images, so a
+    /// pop here would shift every later image's id by one. A picture inside a
+    /// text box therefore stays absent from markdown, as it is today.
+    fn harvest_text_box(&mut self, content: &[DocxBlock]) {
+        if content.is_empty() || self.box_depth >= MAX_TEXT_BOX_DEPTH {
+            return;
+        }
+        self.box_depth += 1;
+        let figures = self.figures.take();
+        // The nested walk runs `paragraph`/`table`, which flush. Park the host
+        // block's queues so the box's interior cannot drain them into itself.
+        let outer_figures = std::mem::take(&mut self.pending_figures);
+        let outer_boxes = std::mem::take(&mut self.pending_boxes);
+
+        let mut inner = Vec::new();
+        self.blocks(content, &mut inner);
+
+        self.pending_figures = outer_figures;
+        self.pending_boxes = outer_boxes;
+        self.figures = figures;
+        self.box_depth -= 1;
+        self.pending_boxes.extend(inner);
     }
 
     fn paragraph(&mut self, para: &Paragraph, out: &mut Vec<Block>) {
@@ -345,7 +473,7 @@ impl<'a> Emitter<'a> {
         if chunks.iter().all(|c| c.text.trim().is_empty()) {
             // An image in its own paragraph is the common case: no text, but
             // the walk collected figures that must still be emitted.
-            self.flush_figures(out);
+            self.flush_pending(out);
             return;
         }
 
@@ -362,7 +490,7 @@ impl<'a> Emitter<'a> {
                 level: OutlineLevel::value(lvl).clamp(1, 6) as u8,
                 text: self.escape(text.trim()),
             });
-            self.flush_figures(out);
+            self.flush_pending(out);
             return;
         }
 
@@ -400,12 +528,12 @@ impl<'a> Emitter<'a> {
                 bold,
                 italic,
             });
-            self.flush_figures(out);
+            self.flush_pending(out);
             return;
         }
 
         out.push(Block::Paragraph { text, bold, italic });
-        self.flush_figures(out);
+        self.flush_pending(out);
     }
 
     /// Emit a table as [`Block::MergedTable`], which is the whole point of the
@@ -488,7 +616,7 @@ impl<'a> Emitter<'a> {
         // Figures found inside cells (bubbled up by `cell_text`) land after
         // the table: both table dialects are text-only per cell, so an image
         // reference inside one would be mangled by the cell escaping.
-        self.flush_figures(out);
+        self.flush_pending(out);
     }
 
     /// Flatten a cell's block content to a single line of inline markdown.
