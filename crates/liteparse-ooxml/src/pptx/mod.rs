@@ -12,6 +12,7 @@
 
 pub mod cascade;
 pub mod geometry;
+pub mod media;
 pub mod package;
 pub mod shapes;
 pub mod text;
@@ -22,6 +23,7 @@ pub use cascade::{
     apply_slide, background_fill, resolve_background,
 };
 pub use geometry::{GeometryStats, SlideRect, apply_slide_geometry};
+pub use media::MediaCache;
 pub use package::{EMU_PER_POINT, Part, PresentationInfo, PresentationPackage, SlideParts, walk};
 pub use shapes::{
     AutoShape, Background, Connector, GraphicFrame, GraphicFramePayload, Group, Placeholder,

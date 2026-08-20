@@ -19,6 +19,23 @@ pub struct MediaEntry {
     pub format: ImageFormat,
 }
 
+/// The media one package part can reach, keyed by the `r:embed` ids **that
+/// part itself declares**.
+///
+/// Per part, not per package, and that is the load-bearing half rather than a
+/// caching detail. A slide, its layout and its master each carry their own
+/// `.rels`, and `rId1` in all three routinely names three different images —
+/// so an inherited picture resolved against the *slide's* table returns a real
+/// photograph from the wrong relationship. That is the same failure class as
+/// `bgRef@idx` reading `fillStyleLst` and as a deck-wide theme colouring a
+/// second master's slides: a well-typed answer that is wrong, and invisible to
+/// any gate that only asks whether resolution succeeded.
+///
+/// A missing key means "this part declares no such relationship, or it points
+/// outside the package" (`r:link`), which the caller reports rather than
+/// silently painting nothing.
+pub type PartMedia = std::collections::HashMap<RelId, MediaEntry>;
+
 /// Extract the embedded image relationship ID from a DrawingML Image.
 /// Navigates: Image → graphic → Picture → blip_fill → blip → embed.
 pub fn extract_image_rel_id(image: &Image) -> Option<&RelId> {

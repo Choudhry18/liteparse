@@ -74,8 +74,9 @@ use liteparse_ooxml::render::layout::shape_body::{layout_shape_body, measure_sha
 use liteparse_ooxml::render::resolve::color::{RgbColor, rgb_from_u32};
 use liteparse_ooxml::render::resolve::drawing_color::{DrawingColorContext, resolve_drawing_color};
 use liteparse_ooxml::render::resolve::fonts::resolve_font_set_themes;
+use liteparse_ooxml::render::resolve::images::PartMedia;
 use liteparse_ooxml::render::resolve::shape_geometry::build_geometry;
-use liteparse_ooxml::render::resolve::shape_visuals::resolve_shape_visuals;
+use liteparse_ooxml::render::resolve::shape_visuals::{resolve_blip_fill, resolve_shape_visuals};
 
 use std::collections::HashMap;
 
@@ -210,6 +211,26 @@ pub struct SlideGeometry {
     /// "asked to paint nothing here" are different claims.
     pub slides_declining_layout: usize,
     pub slides_declining_master: usize,
+    /// `p:pic` shapes the paint walk reached, on any rung.
+    pub pictures_seen: usize,
+    /// Pictures whose blip resolves to no image: an empty picture placeholder
+    /// (157 on the corpus, all in layouts and masters — correct, not a gap),
+    /// an external `r:link`, or media with no decoder (39 EMF/WMF references).
+    ///
+    /// Pooled deliberately with the correct cases, because the *ratio* is the
+    /// claim this pass can make honestly; splitting it further would need the
+    /// resolver to report a reason, which is its own change.
+    pub pictures_unresolved: usize,
+    /// Pictures that declare no `prstGeom` and took the schema's implicit
+    /// `rect`. 41 on the corpus.
+    pub pictures_implicit_rect: usize,
+    /// Shapes painted with an image fill — pictures and `spPr` blip fills
+    /// together. The number that says the emitter put photographs on slides,
+    /// as opposed to merely resolving them.
+    pub blips_painted: usize,
+    /// Slides whose background is an image this pass now paints. Carved out of
+    /// `unrenderable_backgrounds`, which was 63 before this step.
+    pub blip_backgrounds_painted: usize,
     /// Runs whose resolved colour is **exactly the colour of the slide's own
     /// background**, i.e. text that cannot be read.
     ///
@@ -313,6 +334,11 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         runs_colour_declared: 0,
         runs_colour_defaulted: 0,
         runs_invisible_on_background: 0,
+        pictures_seen: 0,
+        pictures_unresolved: 0,
+        pictures_implicit_rect: 0,
+        blips_painted: 0,
+        blip_backgrounds_painted: 0,
     };
 
     for (idx, slide) in pkg.slides.iter().enumerate() {
@@ -323,7 +349,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         let theme = slide_theme(pkg, slide, &mut themes);
         // A slide whose shape tree will not parse still yields a page. Page
         // count must equal slide count — a consumer indexes pages by slide.
-        if let Some(prepared) = deck.prepare(slide) {
+        if let Some(prepared) = deck.prepare(pkg, slide) {
             let cascade = prepared.cascade();
             let mut ctx = ShapeCtx {
                 cascade,
@@ -351,19 +377,29 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 runs_colour_declared: &mut out.runs_colour_declared,
                 runs_colour_defaulted: &mut out.runs_colour_defaulted,
                 runs_invisible_on_background: &mut out.runs_invisible_on_background,
+                pictures_seen: &mut out.pictures_seen,
+                pictures_unresolved: &mut out.pictures_unresolved,
+                pictures_implicit_rect: &mut out.pictures_implicit_rect,
+                blips_painted: &mut out.blips_painted,
+                blip_backgrounds_painted: &mut out.blip_backgrounds_painted,
             };
             // Two walks over one `prepare`, in the order the raster wants
             // them. See [`paint_shape`] for why they cannot be one walk. The
             // background goes first because the command list *is* the z-order.
-            background_at = paint_background(prepared.background.as_ref(), page_size, &mut ctx);
+            background_at = paint_background(
+                prepared.background.as_ref(),
+                prepared.background_media,
+                page_size,
+                &mut ctx,
+            );
             // ...and so is this: master under layout under slide. §19.3.1.39
             // builds the page by drawing each rung over the one it inherits
             // from, which is why an inherited panel is a backdrop for the
             // slide's own shapes rather than a lid over them.
-            for rung in prepared.inherited {
-                paint_shapes(rung, Rung::Inherited, &mut ctx);
+            for (rung, media) in prepared.inherited.into_iter().zip(prepared.inherited_media) {
+                paint_shapes(rung, Source::inherited(media), &mut ctx);
             }
-            paint_shapes(&prepared.shapes, Rung::Slide, &mut ctx);
+            paint_shapes(&prepared.shapes, Source::slide(prepared.media), &mut ctx);
             for shape in reading_order(&prepared.shapes) {
                 layout_shape(shape, &mut ctx);
             }
@@ -434,6 +470,11 @@ struct ShapeCtx<'a, 'r> {
     runs_colour_declared: &'a mut usize,
     runs_colour_defaulted: &'a mut usize,
     runs_invisible_on_background: &'a mut usize,
+    pictures_seen: &'a mut usize,
+    pictures_unresolved: &'a mut usize,
+    pictures_implicit_rect: &'a mut usize,
+    blips_painted: &'a mut usize,
+    blip_backgrounds_painted: &'a mut usize,
 }
 
 /// Which part a painted shape came from.
@@ -448,6 +489,34 @@ enum Rung {
     Slide,
     /// A layout's or master's, drawn under it.
     Inherited,
+}
+
+/// The part a paint walk is reading, and the media that part can reach.
+///
+/// The two travel together because they are answers about the *same* part, and
+/// separating them is how an inherited picture ends up resolved against the
+/// slide's relationship table — a real image from the wrong `rId1`, which no
+/// count in the probe could distinguish from the right one.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    rung: Rung,
+    media: &'a PartMedia,
+}
+
+impl<'a> Source<'a> {
+    fn slide(media: &'a PartMedia) -> Self {
+        Self {
+            rung: Rung::Slide,
+            media,
+        }
+    }
+
+    fn inherited(media: &'a PartMedia) -> Self {
+        Self {
+            rung: Rung::Inherited,
+            media,
+        }
+    }
 }
 
 impl ShapeCtx<'_, '_> {
@@ -507,6 +576,7 @@ impl ShapeCtx<'_, '_> {
 /// [`Deck::prepare`]: crate::office::pptx::Deck::prepare
 fn paint_background(
     background: Option<&(pptx::BackgroundSource, pptx::Background)>,
+    media: &PartMedia,
     page_size: PtSize,
     ctx: &mut ShapeCtx<'_, '_>,
 ) -> Option<usize> {
@@ -514,7 +584,7 @@ fn paint_background(
         *ctx.undeclared_backgrounds += 1;
         return None;
     };
-    let fill = pptx::background_fill(bg, ctx.theme, ctx.color_map);
+    let fill = pptx::background_fill(bg, ctx.theme, ctx.color_map, Some(media));
     if matches!(fill, ResolvedFill::None) {
         // Two very different slides land here, and the resolved fill cannot
         // tell them apart: `resolve_fill` collapses blip, pattern and `grpFill`
@@ -540,6 +610,9 @@ fn paint_background(
         page_size,
     )?;
     *ctx.painted_backgrounds += 1;
+    if matches!(fill, ResolvedFill::Blip(_)) {
+        *ctx.blip_backgrounds_painted += 1;
+    }
     if let ResolvedFill::Solid(rgba) = fill {
         ctx.background_rgb = Some(rgba.to_rgb24());
     }
@@ -576,14 +649,14 @@ fn paint_background(
 /// chrome filter: this walk paints chrome, the text walk still drops it, and
 /// the 347 chrome shapes that carry text are a divergence this step leaves
 /// open rather than closes (see the module-level note in the plan).
-fn paint_shapes(shapes: &[Shape], rung: Rung, ctx: &mut ShapeCtx<'_, '_>) {
+fn paint_shapes(shapes: &[Shape], from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) {
     for shape in shapes {
-        paint_shape(shape, rung, ctx);
+        paint_shape(shape, from, ctx);
         if let ShapeKind::Group(group) = &shape.kind {
             // A group's own `grpSpPr` fill is not lowered to `ShapeProperties`
             // at all, so a group paints nothing itself — its children carry
             // every fill, in their own declaration order.
-            paint_shapes(&group.children, rung, ctx);
+            paint_shapes(&group.children, from, ctx);
         }
     }
 }
@@ -596,7 +669,7 @@ fn paint_shapes(shapes: &[Shape], rung: Rung, ctx: &mut ShapeCtx<'_, '_>) {
 /// self-placing. That also lets it carry the two flips, which a text bracket
 /// deliberately does not — §20.1.7.6 mirrors a shape's *geometry*, and
 /// PowerPoint does not mirror the text inside it.
-fn paint_shape(shape: &Shape, rung: Rung, ctx: &mut ShapeCtx<'_, '_>) {
+fn paint_shape(shape: &Shape, from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) {
     let Some(props) = shape_properties(shape) else {
         return;
     };
@@ -604,27 +677,45 @@ fn paint_shape(shape: &Shape, rung: Rung, ctx: &mut ShapeCtx<'_, '_>) {
     // whether or not the shape also puts ink down, and a 237-shape gap that
     // only reported itself on shapes that happened to have a fill would be a
     // number that under-reports exactly where it matters.
-    if rung == Rung::Inherited && shape_text_len(shape) > 0 {
+    if from.rung == Rung::Inherited && shape_text_len(shape) > 0 {
         *ctx.inherited_shapes_with_text += 1;
     }
     // `p:style`'s `fillRef`/`lnRef`/`effectRef` are not parsed yet, so the
     // three style arguments are `None` and 3,381 corpus shapes with no `spPr`
     // fill element resolve to nothing. That is an *under*-paint: visible, but
     // never misleading.
-    let visuals = resolve_shape_visuals(
+    let mut visuals = resolve_shape_visuals(
         Some(props),
         None,
         None,
         None,
         &DrawingColorContext::new(ctx.theme).with_color_map(ctx.color_map),
+        Some(from.media),
     );
+    // §19.3.1.37: a `p:pic`'s image is its own `p:blipFill`, a sibling of
+    // `spPr` — not an `spPr` fill element. So the picture's fill has to be
+    // resolved separately and take precedence; reading `shape_properties`
+    // alone finds the frame's *background* (usually absent) and never the
+    // photograph.
+    if let ShapeKind::Picture(pic) = &shape.kind {
+        *ctx.pictures_seen += 1;
+        let blip = resolve_blip_fill(&pic.blip_fill, Some(from.media));
+        if matches!(blip, ResolvedFill::None) {
+            // An empty picture placeholder, an `r:link`, or media we cannot
+            // decode (39 EMF/WMF references on the corpus). Counted rather
+            // than silently falling back to the frame's own fill.
+            *ctx.pictures_unresolved += 1;
+        } else {
+            visuals.fill = blip;
+        }
+    }
     let paints = !matches!(visuals.fill, ResolvedFill::None) || visuals.stroke.is_some();
     if !paints {
         return;
     }
 
     let Some(slide_rect) = shape.slide_rect else {
-        ctx.tally(rung, false);
+        ctx.tally(from.rung, false);
         return;
     };
     // The *bounding* box, not the raw rect: `pptx::geometry` composes group
@@ -635,22 +726,44 @@ fn paint_shape(shape: &Shape, rung: Rung, ctx: &mut ShapeCtx<'_, '_>) {
         width: emu_to_pt(box_.size.width.raw()),
         height: emu_to_pt(box_.size.height.raw()),
     };
-    let Some(geometry) = props.geometry.as_ref() else {
-        ctx.tally(rung, false);
-        return;
+    // §19.3.1.37: a picture frame with no `prstGeom` is a rectangle — the
+    // image fills its box. 41 corpus pictures declare none.
+    //
+    // This is **not** the "never approximate an unbuildable preset by its
+    // bounding box" rule being relaxed. That rule is about a `cloud` we cannot
+    // build, where any substitute is a guess at a shape the file named. Here
+    // the file names no shape at all, and the schema supplies the default.
+    let implicit_rect;
+    let geometry = match props.geometry.as_ref() {
+        Some(g) => g,
+        None if matches!(shape.kind, ShapeKind::Picture(_)) => {
+            implicit_rect = ShapeGeometry::Preset(PresetGeometryDef {
+                preset: PresetShapeType::Rect,
+                adjust_values: Vec::new(),
+            });
+            *ctx.pictures_implicit_rect += 1;
+            &implicit_rect
+        }
+        None => {
+            ctx.tally(from.rung, false);
+            return;
+        }
     };
     let Some(path) = build_geometry(geometry, extent) else {
         // An unimplemented preset. Counted, never approximated by its bounding
         // box: a `rect` drawn where a `cloud` was asked for is a wrong slide,
         // not a coarse one.
-        ctx.tally(rung, false);
+        ctx.tally(from.rung, false);
         return;
     };
 
     if visuals.stroke.is_some() && props.outline.as_ref().is_some_and(|o| o.fill.is_none()) {
         *ctx.outlines_defaulted_black += 1;
     }
-    ctx.tally(rung, true);
+    ctx.tally(from.rung, true);
+    if matches!(visuals.fill, ResolvedFill::Blip(_)) {
+        *ctx.blips_painted += 1;
+    }
     ctx.commands.push(DrawCommand::Path {
         origin: PtOffset::new(
             emu_to_pt(box_.origin.x.raw()),

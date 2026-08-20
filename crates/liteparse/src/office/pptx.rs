@@ -19,6 +19,7 @@ use liteparse_ooxml::pptx::{
     PlaceholderTextStyles, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Table,
     TextBody, TextCascade, TextParagraph, TextStyles,
 };
+use liteparse_ooxml::render::resolve::images::PartMedia;
 use std::collections::HashMap;
 
 use crate::error::LiteParseError;
@@ -127,6 +128,11 @@ pub struct Deck {
     /// §19.3.1.39 `p:sldLayout/@showMasterSp` — whether slides under this
     /// layout draw the master's shapes. 25 of the corpus's 415 layouts say no.
     layout_shows_master: HashMap<String, bool>,
+    /// Image relationships per part, over one shared pool of bytes. On the
+    /// deck for the same reason the other rungs are: a layout's media table is
+    /// rebuilt 60 times otherwise, and its `Arc`s must be the *same* `Arc`s
+    /// each time or the rasterizer's bitmap cache misses on every slide.
+    media: pptx::MediaCache,
     default_text_style: ListStyle,
     /// The rung-7-only defaults a slide falls back to when its master has no
     /// entry. Stored on the deck rather than built as a local in the walk so
@@ -187,6 +193,21 @@ pub struct PreparedSlide<'d> {
     /// opt-outs and a deck whose layout parse silently failed would report the
     /// same numbers.
     pub declined: [bool; 2],
+    /// The slide's own `r:embed` table, and its master's and layout's in the
+    /// same `[master, layout]` order as `inherited`.
+    ///
+    /// Three tables rather than one because an `r:id` is scoped to the part
+    /// that writes it: a layout picture's `rId1` and the slide's `rId1` are
+    /// unrelated relationships that regularly name different images, so a
+    /// single merged table would paint real photographs in the wrong places.
+    pub media: &'d PartMedia,
+    pub inherited_media: [&'d PartMedia; 2],
+    /// The table for the part the **background** came from, which is the
+    /// master's on 1,125 corpus slides and the slide's own on 58. Carried
+    /// separately rather than derived by the caller, because the rung is
+    /// already known here (`BackgroundSource`) and re-deriving it at the paint
+    /// site is how the two would drift.
+    pub background_media: &'d PartMedia,
     layout_text: Option<&'d PlaceholderTextStyles>,
     master_text: Option<&'d PlaceholderTextStyles>,
     deck_defaults: &'d DeckTextDefaults,
@@ -224,6 +245,7 @@ impl Deck {
             master_shapes: HashMap::new(),
             layout_shapes: HashMap::new(),
             layout_shows_master: HashMap::new(),
+            media: pptx::MediaCache::new(),
             fallback_defaults: DeckTextDefaults {
                 master_styles: TextStyles::default(),
                 default_text_style: default_text_style.clone(),
@@ -237,8 +259,21 @@ impl Deck {
     ///
     /// `None` when the shape tree will not parse — fail-open, the same slide
     /// is skipped by every walk.
-    pub fn prepare(&mut self, slide: &pptx::SlideParts) -> Option<PreparedSlide<'_>> {
+    pub fn prepare(
+        &mut self,
+        pkg: &PresentationPackage,
+        slide: &pptx::SlideParts,
+    ) -> Option<PreparedSlide<'_>> {
         self.prime(slide);
+        // Primed before anything borrows, because building a table needs
+        // `&mut self` and the three that come out of it are held at once.
+        self.media.part_media(pkg, &slide.slide);
+        for part in [slide.layout.as_ref(), slide.master.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            self.media.part_media(pkg, part);
+        }
 
         let part = pptx::parse_slide_part(&slide.slide.xml).ok()?;
         let mut shapes = part.shapes;
@@ -320,12 +355,27 @@ impl Deck {
             .master
             .as_ref()
             .and_then(|m| self.master_text.get(&m.path));
+        let layout_path = slide.layout.as_ref().map(|l| l.path.as_str());
+        let master_path = slide.master.as_ref().map(|m| m.path.as_str());
+        // The background's own rung, not the slide's. `resolve_background`
+        // already decided which part won; asking it again here is the whole
+        // point of carrying `BackgroundSource` on the result.
+        let background_media = self
+            .media
+            .get(match background.as_ref().map(|(src, _)| src) {
+                Some(BackgroundSource::Layout) => layout_path,
+                Some(BackgroundSource::Master) => master_path,
+                _ => Some(slide.slide.path.as_str()),
+            });
         Some(PreparedSlide {
             shapes,
             background,
             color_map,
             inherited,
             declined: [!shows_master, !shows_layout],
+            media: self.media.get(Some(slide.slide.path.as_str())),
+            inherited_media: [self.media.get(master_path), self.media.get(layout_path)],
+            background_media,
             layout_text: slide
                 .layout
                 .as_ref()
@@ -339,7 +389,7 @@ impl Deck {
         let mut out = Vec::new();
 
         for (idx, slide) in pkg.slides.iter().enumerate() {
-            let Some(prepared) = self.prepare(slide) else {
+            let Some(prepared) = self.prepare(pkg, slide) else {
                 continue;
             };
             let shapes = &prepared.shapes;

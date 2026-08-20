@@ -9,17 +9,18 @@
 
 use crate::model::dimension::{Dimension, Emu};
 use crate::model::{
-    DrawingFill, Effect, GlowEffect, InnerShadowEffect, LineCap, LineDash, LineJoin,
+    BlipFillKind, DrawingFill, Effect, GlowEffect, InnerShadowEffect, LineCap, LineDash, LineJoin,
     OuterShadowEffect, Outline, PathFillMode, PresetShadowEffect, ReflectionEffect,
     ShapeProperties, SoftEdgeEffect, StyleMatrixRef, Theme,
 };
 use crate::render::dimension::Pt;
 use crate::render::geometry::PtOffset;
 use crate::render::layout::draw_command::{
-    ResolvedDashPattern, ResolvedEffect, ResolvedFill, ResolvedLineCap, ResolvedLineJoin,
-    ResolvedStroke,
+    ResolvedBlip, ResolvedDashPattern, ResolvedEffect, ResolvedFill, ResolvedLineCap,
+    ResolvedLineJoin, ResolvedStroke,
 };
 use crate::render::resolve::drawing_color::{DrawingColorContext, Rgba, resolve_drawing_color};
+use crate::render::resolve::images::{PartMedia, relative_rect_to_fraction};
 
 /// Resolved bundle for one shape.
 pub struct ResolvedVisuals {
@@ -47,6 +48,7 @@ pub fn resolve_shape_visuals(
     style_effect_ref: Option<&StyleMatrixRef>,
     style_fill_ref: Option<&StyleMatrixRef>,
     ctx: &DrawingColorContext<'_>,
+    media: Option<&PartMedia>,
 ) -> ResolvedVisuals {
     let theme = ctx.theme;
     let props = match props {
@@ -54,7 +56,7 @@ pub fn resolve_shape_visuals(
         None => {
             // No spPr, but a bare `<wps:style>` may still carry a fillRef.
             return ResolvedVisuals {
-                fill: resolve_theme_fill(style_fill_ref, theme, ctx),
+                fill: resolve_theme_fill(style_fill_ref, theme, ctx, media),
                 stroke: None,
                 effects: Vec::new(),
             };
@@ -64,8 +66,8 @@ pub fn resolve_shape_visuals(
     // §20.1.4.1.13: a direct spPr fill wins; otherwise fall back to the theme
     // fill style referenced by `<a:fillRef>` (recolored by its phClr).
     let fill = match props.fill.as_ref() {
-        Some(f) => resolve_fill(f, ctx),
-        None => resolve_theme_fill(style_fill_ref, theme, ctx),
+        Some(f) => resolve_fill(f, ctx, media),
+        None => resolve_theme_fill(style_fill_ref, theme, ctx, media),
     };
 
     let theme_ln = theme_line_style(style_line_ref, theme);
@@ -100,6 +102,7 @@ fn resolve_theme_fill(
     style_fill_ref: Option<&StyleMatrixRef>,
     theme: Option<&Theme>,
     ctx: &DrawingColorContext<'_>,
+    media: Option<&PartMedia>,
 ) -> ResolvedFill {
     let Some(r) = style_fill_ref else {
         return ResolvedFill::None;
@@ -119,7 +122,7 @@ fn resolve_theme_fill(
         Some(c) => ctx.with_placeholder(resolve_drawing_color(c, ctx)),
         None => *ctx,
     };
-    resolve_fill(fill, &fill_ctx)
+    resolve_fill(fill, &fill_ctx, media)
 }
 
 /// §19.3.1.3: resolve a slide/layout/master `<p:bgRef>` against the theme.
@@ -141,6 +144,7 @@ pub fn resolve_background_fill(
     bg_ref: &StyleMatrixRef,
     theme: Option<&Theme>,
     ctx: &DrawingColorContext<'_>,
+    media: Option<&PartMedia>,
 ) -> ResolvedFill {
     // §20.1.4.2.19: 0 is the no-reference sentinel, here meaning "no
     // background" rather than "inherit".
@@ -162,7 +166,7 @@ pub fn resolve_background_fill(
         Some(c) => ctx.with_placeholder(resolve_drawing_color(c, ctx)),
         None => *ctx,
     };
-    resolve_fill(fill, &fill_ctx)
+    resolve_fill(fill, &fill_ctx, media)
 }
 
 /// Look up a theme line style by its 1-based `lnRef` index.
@@ -210,7 +214,18 @@ pub fn default_path_fill_for_stroked_shape() -> PathFillMode {
 
 // ── Fills ───────────────────────────────────────────────────────────────────
 
-pub fn resolve_fill(fill: &DrawingFill, ctx: &DrawingColorContext<'_>) -> ResolvedFill {
+/// Resolve one fill descriptor.
+///
+/// `media` is the [`PartMedia`] of the part that **declares** this fill, and
+/// `None` means the caller has no media channel at all (the DOCX shape path
+/// today). A blip fill without one resolves to [`ResolvedFill::None`]: the
+/// alternative — resolving against whatever table happened to be in scope —
+/// is how an inherited picture acquires the slide's `rId1` instead of its own.
+pub fn resolve_fill(
+    fill: &DrawingFill,
+    ctx: &DrawingColorContext<'_>,
+    media: Option<&PartMedia>,
+) -> ResolvedFill {
     match fill {
         DrawingFill::None => ResolvedFill::None,
         DrawingFill::Solid(color) => ResolvedFill::Solid(resolve_drawing_color(color, ctx)),
@@ -237,10 +252,7 @@ pub fn resolve_fill(fill: &DrawingFill, ctx: &DrawingColorContext<'_>) -> Resolv
             };
             ResolvedFill::Gradient(ResolvedGradient { stops, kind })
         }
-        DrawingFill::Blip(_) => {
-            log::warn!("shape_visuals: blip fill not yet resolved (Tier 2)");
-            ResolvedFill::None
-        }
+        DrawingFill::Blip(blip_fill) => resolve_blip_fill(blip_fill, media),
         DrawingFill::Pattern(_) => {
             log::warn!("shape_visuals: pattern fill not yet resolved (Tier 3)");
             ResolvedFill::None
@@ -252,6 +264,60 @@ pub fn resolve_fill(fill: &DrawingFill, ctx: &DrawingColorContext<'_>) -> Resolv
             ResolvedFill::None
         }
     }
+}
+
+/// §20.1.8.14 `a:blipFill` → the bytes the painter stretches into the path.
+///
+/// Four of the five ways this returns `None` are *correct* readings of the
+/// file rather than gaps, which is why they are separated by a log level the
+/// caller can act on:
+///
+/// * **no `a:blip` child** — an empty picture placeholder ("click to add
+///   picture"). 157 on the PPTX corpus, every one of them in a layout or
+///   master, and painting anything for them would stamp a phantom frame on
+///   every slide under that rung.
+/// * **`r:link`** — the image lives outside the package; there are no bytes to
+///   draw and never will be from this file alone.
+/// * **an `r:embed` the part does not declare**, or one whose target is
+///   missing from the zip: a broken package, reported rather than guessed at.
+/// * **`a:tile`** — the image repeats rather than stretching. Returned as
+///   `None` on purpose: painting a tile stretched is a *wrong* slide in
+///   exactly the way an unbuildable preset drawn as its bounding box would be,
+///   and the corpus has **zero** of them, so strictness here costs nothing and
+///   keeps the first real one from rendering silently wrong.
+///
+/// The crop goes through [`relative_rect_to_fraction`], shared with the
+/// picture path, so a cropped fill and a cropped picture cannot diverge.
+pub fn resolve_blip_fill(fill: &crate::model::BlipFill, media: Option<&PartMedia>) -> ResolvedFill {
+    let Some(blip) = fill.blip.as_ref() else {
+        log::debug!("shape_visuals: blipFill with no a:blip — empty picture placeholder");
+        return ResolvedFill::None;
+    };
+    if let BlipFillKind::Tile(_) = fill.fill_kind {
+        log::warn!("shape_visuals: tiled blip fill not painted — a stretch would be wrong");
+        return ResolvedFill::None;
+    }
+    let Some(embed) = blip.embed.as_ref() else {
+        // `r:link` is the only other way to name an image, and it is external.
+        log::debug!("shape_visuals: blip has no r:embed (external r:link?) — nothing to paint");
+        return ResolvedFill::None;
+    };
+    let Some(media) = media else {
+        log::debug!("shape_visuals: blip fill on a path with no media channel");
+        return ResolvedFill::None;
+    };
+    let Some(entry) = media.get(embed) else {
+        log::warn!(
+            "shape_visuals: blip r:embed {} not declared by the part that uses it",
+            embed.as_str()
+        );
+        return ResolvedFill::None;
+    };
+    ResolvedFill::Blip(ResolvedBlip {
+        data: entry.data.clone(),
+        format: entry.format,
+        src_rect: fill.src_rect.as_ref().and_then(relative_rect_to_fraction),
+    })
 }
 
 // ── Outline → Stroke ────────────────────────────────────────────────────────
@@ -473,7 +539,14 @@ mod tests {
 
     #[test]
     fn empty_props_resolves_to_none_visuals() {
-        let v = resolve_shape_visuals(None, None, None, None, &DrawingColorContext::new(None));
+        let v = resolve_shape_visuals(
+            None,
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+            None,
+        );
         assert!(matches!(v.fill, ResolvedFill::None));
         assert!(v.stroke.is_none());
         assert!(v.effects.is_empty());
@@ -495,6 +568,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
         );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!()
@@ -525,6 +599,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
         );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(0.75));
@@ -557,6 +632,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
         );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(0.75));
@@ -586,6 +662,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
         );
         assert!(v.stroke.is_none());
     }
@@ -642,6 +719,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(Some(&theme)),
+            None,
         );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(2.0));
@@ -684,6 +762,7 @@ mod tests {
             Some(&er),
             None,
             &DrawingColorContext::new(Some(&theme)),
+            None,
         );
         assert_eq!(v.effects.len(), 1);
     }
@@ -737,6 +816,7 @@ mod tests {
             Some(&er),
             None,
             &DrawingColorContext::new(Some(&theme)),
+            None,
         );
         let ResolvedEffect::OuterShadow {
             blur_radius, color, ..
@@ -775,6 +855,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
         );
         assert_eq!(v.effects.len(), 1);
         let ResolvedEffect::OuterShadow {
@@ -818,6 +899,7 @@ mod tests {
             None,
             Some(&fill_ref),
             &DrawingColorContext::new(Some(&theme)),
+            None,
         );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!("expected solid theme fill, got {:?}", v.fill);
@@ -849,6 +931,7 @@ mod tests {
             None,
             Some(&fill_ref),
             &DrawingColorContext::new(Some(&theme)),
+            None,
         );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!("expected solid fill");
@@ -870,7 +953,115 @@ mod tests {
             None,
             Some(&fill_ref),
             &DrawingColorContext::new(Some(&theme)),
+            None,
         );
         assert!(matches!(v.fill, ResolvedFill::None));
+    }
+
+    // ── blip fills ──────────────────────────────────────────────────────────
+
+    fn blip_fill(embed: Option<&str>, kind: BlipFillKind) -> crate::model::BlipFill {
+        crate::model::BlipFill {
+            rotate_with_shape: None,
+            dpi: None,
+            blip: embed.map(|e| crate::model::Blip {
+                embed: Some(crate::model::RelId::new(e)),
+                link: None,
+                compression: None,
+            }),
+            src_rect: None,
+            fill_kind: kind,
+        }
+    }
+
+    fn media_with(id: &str) -> PartMedia {
+        let mut m = PartMedia::new();
+        m.insert(
+            crate::model::RelId::new(id),
+            crate::render::resolve::images::MediaEntry {
+                data: std::sync::Arc::from(&b"\x89PNG\r\n\x1a\n"[..]),
+                format: crate::model::ImageFormat::Png,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn blip_resolves_against_its_own_parts_table() {
+        let media = media_with("rId7");
+        let fill = blip_fill(Some("rId7"), BlipFillKind::Unspecified);
+        let ResolvedFill::Blip(b) = resolve_blip_fill(&fill, Some(&media)) else {
+            panic!("expected a blip fill");
+        };
+        assert_eq!(b.format, crate::model::ImageFormat::Png);
+        assert!(b.src_rect.is_none(), "no a:srcRect declared");
+    }
+
+    #[test]
+    fn blip_embed_absent_from_this_parts_table_is_not_painted() {
+        // The inherited-`rId1` trap, as a unit test: a layout picture's id
+        // looked up in the *slide's* table must resolve to nothing rather than
+        // to whatever that table happens to hold under the same id.
+        let media = media_with("rId1");
+        let fill = blip_fill(Some("rId9"), BlipFillKind::Unspecified);
+        assert!(matches!(
+            resolve_blip_fill(&fill, Some(&media)),
+            ResolvedFill::None
+        ));
+    }
+
+    #[test]
+    fn blip_fill_with_no_blip_child_is_an_empty_placeholder() {
+        // 157 on the PPTX corpus, all in layouts and masters: "click to add
+        // picture". Correctly paints nothing.
+        let fill = blip_fill(None, BlipFillKind::Unspecified);
+        assert!(matches!(
+            resolve_blip_fill(&fill, Some(&media_with("rId1"))),
+            ResolvedFill::None
+        ));
+    }
+
+    #[test]
+    fn tiled_blip_is_refused_rather_than_stretched() {
+        // A tile drawn stretched is a *wrong* slide, not a coarse one — the
+        // same rule that forbids drawing an unbuildable preset as its bbox.
+        let media = media_with("rId7");
+        let tile = BlipFillKind::Tile(crate::model::TileFill {
+            tx: None,
+            ty: None,
+            sx: None,
+            sy: None,
+            flip: None,
+            alignment: None,
+        });
+        let fill = blip_fill(Some("rId7"), tile);
+        assert!(matches!(
+            resolve_blip_fill(&fill, Some(&media)),
+            ResolvedFill::None
+        ));
+    }
+
+    #[test]
+    fn blip_with_no_media_channel_is_not_painted() {
+        let fill = blip_fill(Some("rId7"), BlipFillKind::Unspecified);
+        assert!(matches!(resolve_blip_fill(&fill, None), ResolvedFill::None));
+    }
+
+    #[test]
+    fn blip_src_rect_uses_the_shared_converter() {
+        let media = media_with("rId7");
+        let mut fill = blip_fill(Some("rId7"), BlipFillKind::Unspecified);
+        fill.src_rect = Some(crate::model::RelativeRect {
+            left: Some(Dimension::new(25000)),
+            top: None,
+            right: Some(Dimension::new(10000)),
+            bottom: Some(Dimension::new(10000)),
+        });
+        let ResolvedFill::Blip(b) = resolve_blip_fill(&fill, Some(&media)) else {
+            panic!("expected a blip fill");
+        };
+        let r = b.src_rect.expect("crop present");
+        assert!((r.origin.x.raw() - 0.25).abs() < 1e-5);
+        assert!((r.size.width.raw() - 0.65).abs() < 1e-5);
     }
 }

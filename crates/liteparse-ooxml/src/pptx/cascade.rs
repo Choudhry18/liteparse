@@ -72,6 +72,7 @@ use std::collections::HashMap;
 use crate::model::{ColorMap, Theme, Transform2D};
 use crate::render::layout::draw_command::ResolvedFill;
 use crate::render::resolve::drawing_color::DrawingColorContext;
+use crate::render::resolve::images::PartMedia;
 use crate::render::resolve::shape_visuals::{resolve_background_fill, resolve_fill};
 
 use super::shapes::{Background, Placeholder, PlaceholderKind, Shape};
@@ -311,15 +312,21 @@ pub fn resolve_background<'a>(
 /// `color_map` is the slide's effective §19.3.1.6 map, without which a
 /// `<a:schemeClr val="bg1"/>` backdrop under a swapped master resolves to the
 /// wrong end of the theme's light/dark pair.
+/// `media` must be the [`PartMedia`] of the part the background was resolved
+/// *from* — the [`BackgroundSource`] rung, which is the slide's own on 58
+/// corpus slides, its layout's on 95 and its master's on 1,125. Passing the
+/// slide's own table for a master's photograph is the inherited-`rId1` trap:
+/// a real image, from the wrong relationship.
 pub fn background_fill(
     bg: &Background,
     theme: Option<&Theme>,
     color_map: Option<ColorMap>,
+    media: Option<&PartMedia>,
 ) -> ResolvedFill {
     let ctx = DrawingColorContext::new(theme).with_color_map(color_map);
     match bg {
-        Background::Properties(fill) => resolve_fill(fill, &ctx),
-        Background::Reference(r) => resolve_background_fill(r, theme, &ctx),
+        Background::Properties(fill) => resolve_fill(fill, &ctx, media),
+        Background::Reference(r) => resolve_background_fill(r, theme, &ctx, media),
     }
 }
 
@@ -591,7 +598,7 @@ mod tests {
         ] {
             let (src, bg) = resolve_background(slide, layout, master).expect("resolves");
             assert_eq!(src, want_src);
-            assert_eq!(solid_rgb(&background_fill(bg, None, None)), want_rgb);
+            assert_eq!(solid_rgb(&background_fill(bg, None, None, None)), want_rgb);
         }
     }
 
@@ -624,7 +631,7 @@ mod tests {
             color: None,
         });
         assert_eq!(
-            solid_rgb(&background_fill(&bg, Some(&theme), None)),
+            solid_rgb(&background_fill(&bg, Some(&theme), None, None)),
             0x00AA00
         );
 
@@ -634,7 +641,7 @@ mod tests {
             color: None,
         });
         assert_eq!(
-            solid_rgb(&background_fill(&bg2, Some(&theme), None)),
+            solid_rgb(&background_fill(&bg2, Some(&theme), None, None)),
             0x00BB00
         );
 
@@ -645,7 +652,7 @@ mod tests {
             color: None,
         });
         assert_eq!(
-            solid_rgb(&background_fill(&bg3, Some(&theme), None)),
+            solid_rgb(&background_fill(&bg3, Some(&theme), None, None)),
             0xBB0000
         );
     }
@@ -659,7 +666,7 @@ mod tests {
             color: None,
         });
         assert!(matches!(
-            background_fill(&bg, Some(&Theme::default()), None),
+            background_fill(&bg, Some(&Theme::default()), None, None),
             ResolvedFill::None
         ));
     }
@@ -677,7 +684,7 @@ mod tests {
             color: None,
         });
         assert!(matches!(
-            background_fill(&bg, Some(&theme), None),
+            background_fill(&bg, Some(&theme), None, None),
             ResolvedFill::None
         ));
     }

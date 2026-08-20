@@ -13,13 +13,17 @@
 //! Fidelity tiers, mirroring the vendored painter's own tiering:
 //! - **Rendered faithfully**: text (monochrome outlines), underlines, lines,
 //!   rects, images (PNG/JPEG/GIF/BMP/TIFF/WebP incl. `src_rect` crops), shape
-//!   paths with solid fills and solid/dashed strokes.
+//!   paths with solid or **stretched-blip** fills and solid/dashed strokes. A
+//!   blip fill clips to the path, so a picture in an `ellipse` or `custGeom`
+//!   frame is cropped to its shape rather than drawn as a rectangle.
 //! - **Approximated**: gradient fills collapse to their mean stop color
 //!   (logged once); emoji clusters draw monochrome outlines when the resolved
 //!   face has them, else nothing.
-//! - **Skipped**: blip/pattern fills, effects (shadow/glow), EMF/WMF/SVG
-//!   media (no decoder — same set `collect_images` skips), color glyph
-//!   tables. Each skip logs once per process, never per command.
+//! - **Skipped**: tiled blip fills (refused upstream in `resolve_fill` rather
+//!   than stretched, which would be wrong rather than coarse), pattern fills,
+//!   effects (shadow/glow), EMF/WMF/SVG media (no decoder — same set
+//!   `collect_images` skips), color glyph tables. Each skip logs once per
+//!   process, never per command.
 //!
 //! The output is plain `{rgba, width, height}` so consumers need no tiny-skia
 //! types; the buffer is effectively straight (non-premultiplied) RGBA because
@@ -99,6 +103,9 @@ pub fn rasterize_page(
     // covers text/shading — rare, and its fill still paints. A shape's own
     // text-box text is emitted as separate `Text` commands, so it stays over
     // its fill in the ink pass.
+    // Outside the pass loop: the same image can be a shape fill and a placed
+    // picture on one page, and every pass walks the whole command list.
+    let mut images = ImageCache::default();
     for pass in [
         RasterPass::Shape,
         RasterPass::Shading,
@@ -200,8 +207,22 @@ pub fn rasterize_page(
                     let transform = device.pre_concat(place_transform(
                         *origin, *rotation, *flip_h, *flip_v, *extent,
                     ));
+                    // Decoded once per `Path`, not once per subpath: a
+                    // `custGeom` picture frame routinely has several.
+                    let blip = match fill {
+                        ResolvedFill::Blip(b) => images.get(&b.data, b.format, b.src_rect.as_ref()),
+                        _ => None,
+                    };
                     for sub in paths {
-                        draw_subpath(&mut pixmap, sub, fill, stroke.as_ref(), transform);
+                        draw_subpath(
+                            &mut pixmap,
+                            sub,
+                            fill,
+                            blip,
+                            *extent,
+                            stroke.as_ref(),
+                            transform,
+                        );
                     }
                 }
                 // Non-drawing commands: link/destination/outline metadata
@@ -457,18 +478,59 @@ fn draw_image(
         }
         _ => {}
     }
-    let Ok(decoded) = image::load_from_memory(&media.data) else {
-        log::warn!(
-            "undecodable {:?} media ({} bytes)",
-            media.format,
-            media.data.len()
-        );
+    let Some(src) = decode_media(&media.data, media.format, src_rect) else {
         return;
+    };
+    let (iw, ih) = (src.width(), src.height());
+
+    let sx = rect.size.width.raw() / iw as f32;
+    let sy = rect.size.height.raw() / ih as f32;
+    if sx <= 0.0 || sy <= 0.0 {
+        return;
+    }
+    let transform = device.pre_concat(
+        Transform::from_translate(rect.origin.x.raw(), rect.origin.y.raw())
+            .pre_concat(Transform::from_scale(sx, sy)),
+    );
+    let paint = PixmapPaint {
+        quality: tiny_skia::FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+}
+
+/// Decode one media entry into a premultiplied tiny-skia pixmap, applying the
+/// §20.1.10.48 `srcRect` crop.
+///
+/// **The single decode path**, shared by [`DrawCommand::Image`] (Word's placed
+/// pictures) and by the blip *fill* on a [`DrawCommand::Path`] (PowerPoint's).
+/// The crop is the reason it has to be shared rather than merely similar: the
+/// fraction rect both callers hand in comes from one converter
+/// (`relative_rect_to_fraction`), and a second copy of the pixel arithmetic
+/// here would let a cropped picture and a cropped fill drift apart while both
+/// kept passing every count.
+fn decode_media(data: &[u8], format: ImageFormat, src_rect: Option<&PtRect>) -> Option<Pixmap> {
+    static VECTOR_ONCE: Once = Once::new();
+    match format {
+        ImageFormat::Emf | ImageFormat::Wmf | ImageFormat::Svg | ImageFormat::Unknown => {
+            VECTOR_ONCE.call_once(|| {
+                log::info!("EMF/WMF/SVG media are not rasterized; placements render blank");
+            });
+            return None;
+        }
+        _ => {}
+    }
+    let decoded = match image::load_from_memory(data) {
+        Ok(d) => d,
+        Err(_) => {
+            log::warn!("undecodable {:?} media ({} bytes)", format, data.len());
+            return None;
+        }
     };
     let mut rgba = decoded.to_rgba8();
 
     // §20.1.10.48 srcRect: fractional crop of the natural extent, applied
-    // before stretching into `rect`.
+    // before stretching into the destination.
     if let Some(crop) = src_rect {
         let (w, h) = (rgba.width() as f32, rgba.height() as f32);
         let x = (crop.origin.x.raw() * w).round().clamp(0.0, w) as u32;
@@ -491,27 +553,49 @@ fn draw_image(
             px[2] = ((px[2] as u16 * a) / 255) as u8;
         }
     }
-    let Some(size) = tiny_skia::IntSize::from_wh(iw, ih) else {
-        return;
-    };
-    let Some(src) = Pixmap::from_vec(data, size) else {
-        return;
-    };
+    let size = tiny_skia::IntSize::from_wh(iw, ih)?;
+    Pixmap::from_vec(data, size)
+}
 
-    let sx = rect.size.width.raw() / iw as f32;
-    let sy = rect.size.height.raw() / ih as f32;
-    if sx <= 0.0 || sy <= 0.0 {
-        return;
+/// Decoded bitmaps for one page, keyed by image identity and crop.
+///
+/// A deck puts one logo on 60 slides and one background photograph behind
+/// every shape on a slide; without this, each placement re-runs a full PNG
+/// decode. The key's first half is the `Arc`'s **pointer**, which is exactly
+/// the identity `MediaEntry` was built to preserve — `resolve` hands out
+/// clones of one allocation per media part, so pointer equality means "the
+/// same image" without hashing megabytes to find out.
+///
+/// The crop is part of the key because two placements of one image may crop it
+/// differently — the same photograph cropped square for a thumbnail and wide
+/// for a banner is two bitmaps, and keying on the pointer alone would serve
+/// the second placement the first one's crop.
+#[derive(Default)]
+struct ImageCache {
+    entries: std::collections::HashMap<(usize, [u32; 4]), Option<Pixmap>>,
+}
+
+impl ImageCache {
+    fn get(
+        &mut self,
+        data: &std::sync::Arc<[u8]>,
+        format: ImageFormat,
+        src_rect: Option<&PtRect>,
+    ) -> Option<&Pixmap> {
+        let crop = src_rect.map_or([0u32; 4], |r| {
+            [
+                r.origin.x.raw().to_bits(),
+                r.origin.y.raw().to_bits(),
+                r.size.width.raw().to_bits(),
+                r.size.height.raw().to_bits(),
+            ]
+        });
+        let key = (data.as_ptr() as usize, crop);
+        self.entries
+            .entry(key)
+            .or_insert_with(|| decode_media(data, format, src_rect))
+            .as_ref()
     }
-    let transform = device.pre_concat(
-        Transform::from_translate(rect.origin.x.raw(), rect.origin.y.raw())
-            .pre_concat(Transform::from_scale(sx, sy)),
-    );
-    let paint = PixmapPaint {
-        quality: tiny_skia::FilterQuality::Bilinear,
-        ..PixmapPaint::default()
-    };
-    pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
 }
 
 // ─── Shape paths ────────────────────────────────────────────────────────────
@@ -520,15 +604,17 @@ fn draw_subpath(
     pixmap: &mut Pixmap,
     sub: &SubPath,
     fill: &ResolvedFill,
+    blip: Option<&Pixmap>,
+    extent: crate::render::geometry::PtSize,
     stroke: Option<&ResolvedStroke>,
     transform: Transform,
 ) {
     let Some(path) = build_path(sub) else { return };
 
-    if sub.fill_mode != PathFillMode::None {
-        if let Some(paint) = fill_paint(fill) {
-            pixmap.fill_path(&path, &paint, FillRule::EvenOdd, transform, None);
-        }
+    if sub.fill_mode != PathFillMode::None
+        && let Some(paint) = fill_paint(fill, blip, extent)
+    {
+        pixmap.fill_path(&path, &paint, FillRule::EvenOdd, transform, None);
     }
     if sub.stroked
         && let Some(s) = stroke
@@ -630,10 +716,20 @@ fn build_path(sub: &SubPath) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
-/// Tier-0 fill: solid faithfully; gradient as the mean stop color (logged
-/// once); blip/pattern skipped (logged once). Inventing pixels quietly is the
-/// silent-corruption trap; a one-time log keeps the approximation loud.
-fn fill_paint(fill: &ResolvedFill) -> Option<Paint<'static>> {
+/// Tier-0 fill: solid and blip faithfully; gradient as the mean stop color
+/// (logged once); pattern skipped (logged once). Inventing pixels quietly is
+/// the silent-corruption trap; a one-time log keeps the approximation loud.
+///
+/// `blip` is the already-decoded bitmap for a [`ResolvedFill::Blip`] and
+/// `extent` the shape's local size — the box the image stretches into. The
+/// decode happens in the caller because it needs `&mut ImageCache` while this
+/// function borrows the result, and because one `Path` with four subpaths must
+/// decode once, not four times.
+fn fill_paint<'a>(
+    fill: &ResolvedFill,
+    blip: Option<&'a Pixmap>,
+    extent: crate::render::geometry::PtSize,
+) -> Option<Paint<'a>> {
     static GRADIENT_ONCE: Once = Once::new();
     static TEXTURE_ONCE: Once = Once::new();
     match fill {
@@ -662,9 +758,40 @@ fn fill_paint(fill: &ResolvedFill) -> Option<Paint<'static>> {
             };
             (c.a > 0.0).then(|| solid(rgba_color(c)))
         }
-        ResolvedFill::Blip(_) | ResolvedFill::Pattern(_) => {
+        ResolvedFill::Blip(_) => {
+            // `None` here is an undecodable or missing image, already logged
+            // by `decode_media`. The path then paints nothing, which is the
+            // honest outcome — an EMF drawn as a grey box would be a wrong
+            // slide rather than an incomplete one.
+            let src = blip?;
+            let (iw, ih) = (src.width() as f32, src.height() as f32);
+            let (ew, eh) = (extent.width.raw(), extent.height.raw());
+            if iw <= 0.0 || ih <= 0.0 || ew <= 0.0 || eh <= 0.0 {
+                return None;
+            }
+            // §20.1.8.14 `a:stretch`: the image fills the shape's box, aspect
+            // ratio not preserved. Tiling never reaches here — `resolve_fill`
+            // refuses `a:tile` rather than letting it stretch silently.
+            //
+            // `SpreadMode::Pad` rather than `Clamp`-to-transparent so that a
+            // path whose geometry runs a fraction of a point past the extent
+            // — an antialiased `roundRect` corner, a stroked edge — takes the
+            // edge pixel instead of a transparent notch.
+            Some(Paint {
+                shader: tiny_skia::Pattern::new(
+                    src.as_ref(),
+                    tiny_skia::SpreadMode::Pad,
+                    tiny_skia::FilterQuality::Bilinear,
+                    1.0,
+                    Transform::from_scale(ew / iw, eh / ih),
+                ),
+                anti_alias: true,
+                ..Paint::default()
+            })
+        }
+        ResolvedFill::Pattern(_) => {
             TEXTURE_ONCE.call_once(|| {
-                log::info!("blip/pattern fills are not rasterized; interiors render unfilled");
+                log::info!("pattern fills are not rasterized; interiors render unfilled");
             });
             None
         }

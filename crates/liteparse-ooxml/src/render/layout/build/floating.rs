@@ -249,6 +249,12 @@ pub(super) fn extract_floating_shapes(
             &crate::render::resolve::drawing_color::DrawingColorContext::new(
                 ctx.resolved.theme.as_ref(),
             ),
+            // No media channel on the Word shape path. A `w:drawing` picture
+            // reaches the page as a `DrawCommand::Image` through
+            // `resolve::images`, not as a shape fill, so a blip *fill* on a
+            // Word autoshape stays unpainted — as it was before this argument
+            // existed. Wiring it is a DOCX-side step with its own corpus.
+            None,
         );
 
         // §20.1.7.6 transform attributes (rotation/flip) live on the shape's

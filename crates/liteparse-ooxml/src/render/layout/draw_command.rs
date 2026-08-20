@@ -300,7 +300,10 @@ pub enum ResolvedGradientKind {
 }
 
 /// Painter-ready image fill — pointer to decoded bytes + source crop.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written (see below): the derived one prints every byte of
+/// the image, which turns any `{:?}` of a command list into megabytes.
+#[derive(Clone)]
 pub struct ResolvedBlip {
     pub data: std::sync::Arc<[u8]>,
     pub format: crate::model::ImageFormat,
@@ -310,6 +313,23 @@ pub struct ResolvedBlip {
     /// picture path uses — so cropped fills and cropped pictures stay in
     /// lockstep.
     pub src_rect: Option<PtRect>,
+}
+
+impl std::fmt::Debug for ResolvedBlip {
+    /// Identity and shape, never contents. A `DrawCommand` list holding a
+    /// full-slide photograph is routine, and a derived `Debug` makes printing
+    /// one — in a probe, a test failure, a `log::debug!` — dump the whole JPEG.
+    /// The pointer is included because it *is* the identity the rasterizer's
+    /// bitmap cache keys on, so two placements sharing one decode are visible
+    /// here rather than having to be inferred.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedBlip")
+            .field("format", &self.format)
+            .field("bytes", &self.data.len())
+            .field("data_ptr", &self.data.as_ptr())
+            .field("src_rect", &self.src_rect)
+            .finish()
+    }
 }
 
 /// Painter-ready pattern fill — foreground/background + preset id.
