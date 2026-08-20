@@ -55,8 +55,8 @@ use liteparse_ooxml::model::{
     StyleMatrixRef, Theme,
 };
 use liteparse_ooxml::pptx::{
-    self, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Spacing, TextBody, TextCascade,
-    TextParagraph,
+    self, Group, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Spacing, TextBody,
+    TextCascade, TextParagraph,
 };
 use liteparse_ooxml::render::dimension::Pt;
 use liteparse_ooxml::render::fonts::FontRegistry;
@@ -77,13 +77,15 @@ use liteparse_ooxml::render::resolve::drawing_color::{DrawingColorContext, resol
 use liteparse_ooxml::render::resolve::fonts::resolve_font_set_themes;
 use liteparse_ooxml::render::resolve::images::PartMedia;
 use liteparse_ooxml::render::resolve::shape_geometry::build_geometry;
-use liteparse_ooxml::render::resolve::shape_visuals::{resolve_blip_fill, resolve_shape_visuals};
+use liteparse_ooxml::render::resolve::shape_visuals::{
+    resolve_blip_fill, resolve_fill, resolve_shape_visuals,
+};
 
 use std::collections::HashMap;
 
 use crate::error::LiteParseError;
 use crate::office::docx_layout;
-use crate::office::pptx::{Deck, is_title, reading_order};
+use crate::office::pptx::{self as pptx_emit, Deck, is_title, reading_order};
 use crate::types::{Page, TextItem};
 
 /// EMU per point (§20.1.2.1: 914400 EMU/inch ÷ 72 pt/inch).
@@ -222,16 +224,28 @@ pub struct SlideGeometry {
     /// — the same class as `unpainted_shapes`, counted separately for the same
     /// reason as above.
     pub inherited_shapes_unpainted: usize,
-    /// Occurrences of an inherited shape that **carries text this pass does not
-    /// lay out**: 237 layout and 15 master shapes on the corpus, 13.7k
-    /// characters between them.
+    /// Occurrences of an inherited shape that **carries text at all**: 371 on
+    /// the corpus, of which 292 are a master's and 79 a layout's.
     ///
-    /// A measured gap, deliberately left open. Emitting it would put text on a
-    /// page that the markdown emitter — which walks the slide's tree only —
-    /// does not emit, and the two must agree: a `TextItem` is a faithful box
-    /// only for markdown a reader actually gets. Closing it means teaching both
-    /// walks at once, which is its own step.
+    /// Not a gap, and not a target. The census behind
+    /// `bench/pptx_corpus/inherited_text_census.py` found only **43 distinct
+    /// strings** under those 371 occurrences — a layout shape is drawn on every
+    /// slide that uses the layout, so one speaker banner authored once lands on
+    /// 47 pages, and 151 of the occurrences are the literal `‹#›` of a slide
+    /// number. This counts the population; `inherited_text_laid_out` counts the
+    /// part of it a reader gets.
     pub inherited_shapes_with_text: usize,
+    /// Occurrences of inherited text this pass **did** lay out: the strings
+    /// that land on exactly one slide of their deck, 29 of the 371 on the
+    /// corpus. See [`PreparedSlide::inherited_text`] for the rule and what it
+    /// was measured against.
+    ///
+    /// Counted in the text walk rather than the paint walk, so it is an
+    /// occurrence of *emitted* text and not of a shape that happened to paint.
+    /// The residue — 342 — is furniture, and dropping it is the feature.
+    ///
+    /// [`PreparedSlide::inherited_text`]: crate::office::pptx::PreparedSlide::inherited_text
+    pub inherited_text_laid_out: usize,
     /// Slides that decline an inherited rung via `@showMasterSp="0"` — 4 slides
     /// declining their layout's shapes and, through 25 layouts, the slides that
     /// decline their master's. Counted because "painted nothing here" and
@@ -258,6 +272,15 @@ pub struct SlideGeometry {
     /// Slides whose background is an image this pass now paints. Carved out of
     /// `unrenderable_backgrounds`, which was 63 before this step.
     pub blip_backgrounds_painted: usize,
+    /// Shapes whose `spPr` fill is `a:grpFill` and which took a real fill from
+    /// an enclosing group (§20.1.8.35).
+    pub fills_from_group: usize,
+    /// Shapes declaring `a:grpFill` where the chain of enclosing groups ends
+    /// without one naming a fill. **Not a defect**: a group with `noFill`, or
+    /// with no fill element at all, is the file saying "inherit nothing", and
+    /// the shape is correctly left unpainted. Counted to keep that case
+    /// visible and distinguishable from a lookup that missed.
+    pub group_fills_unanswered: usize,
     /// Runs whose resolved colour is **exactly the colour of the slide's own
     /// background**, i.e. text that cannot be read.
     ///
@@ -355,6 +378,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         inherited_shapes_painted: 0,
         inherited_shapes_unpainted: 0,
         inherited_shapes_with_text: 0,
+        inherited_text_laid_out: 0,
         slides_declining_layout: 0,
         slides_declining_master: 0,
         background_commands: Vec::with_capacity(pkg.slides.len()),
@@ -370,6 +394,8 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         pictures_implicit_rect: 0,
         blips_painted: 0,
         blip_backgrounds_painted: 0,
+        fills_from_group: 0,
+        group_fills_unanswered: 0,
     };
 
     for (idx, slide) in pkg.slides.iter().enumerate() {
@@ -404,6 +430,7 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 inherited_shapes_painted: &mut out.inherited_shapes_painted,
                 inherited_shapes_unpainted: &mut out.inherited_shapes_unpainted,
                 inherited_shapes_with_text: &mut out.inherited_shapes_with_text,
+                inherited_text_laid_out: &mut out.inherited_text_laid_out,
                 painted_backgrounds: &mut out.painted_backgrounds,
                 transparent_backgrounds: &mut out.transparent_backgrounds,
                 unrenderable_backgrounds: &mut out.unrenderable_backgrounds,
@@ -417,6 +444,8 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 pictures_implicit_rect: &mut out.pictures_implicit_rect,
                 blips_painted: &mut out.blips_painted,
                 blip_backgrounds_painted: &mut out.blip_backgrounds_painted,
+                fills_from_group: &mut out.fills_from_group,
+                group_fills_unanswered: &mut out.group_fills_unanswered,
             };
             // Two walks over one `prepare`, in the order the raster wants
             // them. See [`paint_shape`] for why they cannot be one walk. The
@@ -432,11 +461,24 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
             // from, which is why an inherited panel is a backdrop for the
             // slide's own shapes rather than a lid over them.
             for (rung, media) in prepared.inherited.into_iter().zip(prepared.inherited_media) {
-                paint_shapes(rung, Source::inherited(media), &mut ctx);
+                paint_shapes(rung, Source::inherited(media), None, &mut ctx);
             }
-            paint_shapes(&prepared.shapes, Source::slide(prepared.media), &mut ctx);
-            for shape in reading_order(&prepared.shapes) {
-                layout_shape(shape, &mut ctx);
+            paint_shapes(
+                &prepared.shapes,
+                Source::slide(prepared.media),
+                None,
+                &mut ctx,
+            );
+            // One order over the slide's own shapes *and* the inherited text
+            // the furniture rule kept — the same list the markdown emitter
+            // walks, from the same `prepare`. A `TextItem` is a faithful box
+            // only for markdown a reader actually gets, so the two walks take
+            // the same traversal or the claim is not true.
+            for read in pptx_emit::slide_reading_order(&prepared) {
+                if read.rung.is_some() {
+                    *ctx.inherited_text_laid_out += 1;
+                }
+                layout_shape(read.shape, &mut ctx);
             }
             out.slides_declining_master += usize::from(prepared.declined[0]);
             out.slides_declining_layout += usize::from(prepared.declined[1]);
@@ -499,6 +541,7 @@ struct ShapeCtx<'a, 'r> {
     inherited_shapes_painted: &'a mut usize,
     inherited_shapes_unpainted: &'a mut usize,
     inherited_shapes_with_text: &'a mut usize,
+    inherited_text_laid_out: &'a mut usize,
     painted_backgrounds: &'a mut usize,
     transparent_backgrounds: &'a mut usize,
     unrenderable_backgrounds: &'a mut usize,
@@ -514,6 +557,8 @@ struct ShapeCtx<'a, 'r> {
     pictures_implicit_rect: &'a mut usize,
     blips_painted: &'a mut usize,
     blip_backgrounds_painted: &'a mut usize,
+    fills_from_group: &'a mut usize,
+    group_fills_unanswered: &'a mut usize,
 }
 
 /// Which part a painted shape came from.
@@ -688,14 +733,53 @@ fn paint_background(
 /// chrome filter: this walk paints chrome, the text walk still drops it, and
 /// the 347 chrome shapes that carry text are a divergence this step leaves
 /// open rather than closes (see the module-level note in the plan).
-fn paint_shapes(shapes: &[Shape], from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) {
+/// `group_fill` is the fill the *enclosing* group offers its members, already
+/// resolved and already chain-collapsed — see [`group_fill_for`].
+fn paint_shapes(
+    shapes: &[Shape],
+    from: Source<'_>,
+    group_fill: Option<&ResolvedFill>,
+    ctx: &mut ShapeCtx<'_, '_>,
+) {
     for shape in shapes {
-        paint_shape(shape, from, ctx);
+        paint_shape(shape, from, group_fill, ctx);
         if let ShapeKind::Group(group) = &shape.kind {
-            // A group's own `grpSpPr` fill is not lowered to `ShapeProperties`
-            // at all, so a group paints nothing itself — its children carry
-            // every fill, in their own declaration order.
-            paint_shapes(&group.children, from, ctx);
+            // A group puts no ink down itself: §19.3.1.23 gives it no
+            // geometry, so its `grpSpPr` fill exists only as the thing its
+            // members' `a:grpFill` names. Its children carry every fill, in
+            // their own declaration order.
+            let inherited = group_fill_for(group, group_fill, from, ctx);
+            paint_shapes(&group.children, from, inherited.as_ref(), ctx);
+        }
+    }
+}
+
+/// What this group offers its members, given what its own parent offered it.
+///
+/// Collapses the chain here rather than at the point of use so that a
+/// `DrawingFill::Group` reaching the resolver is always answerable in one
+/// step. Three outcomes, and only the first paints:
+///
+/// * the group names a fill → that, resolved in this part's colour context
+/// * the group's own fill is `a:grpFill` → whatever its parent offered,
+///   passed straight through (6 corpus groups, carrying 414 shapes between
+///   them, so the chain is load-bearing rather than theoretical)
+/// * the group names `a:noFill`, or no fill at all → `None`. The spec's
+///   "inherit nothing"; a member is then correctly unpainted.
+fn group_fill_for(
+    group: &Group,
+    parent: Option<&ResolvedFill>,
+    from: Source<'_>,
+    ctx: &ShapeCtx<'_, '_>,
+) -> Option<ResolvedFill> {
+    match group.fill.as_ref()? {
+        DrawingFill::Group => parent.cloned(),
+        fill => {
+            let color_ctx = DrawingColorContext::new(ctx.theme).with_color_map(ctx.color_map);
+            match resolve_fill(fill, &color_ctx, Some(from.media), parent) {
+                ResolvedFill::None => None,
+                resolved => Some(resolved),
+            }
         }
     }
 }
@@ -708,7 +792,12 @@ fn paint_shapes(shapes: &[Shape], from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) 
 /// self-placing. That also lets it carry the two flips, which a text bracket
 /// deliberately does not — §20.1.7.6 mirrors a shape's *geometry*, and
 /// PowerPoint does not mirror the text inside it.
-fn paint_shape(shape: &Shape, from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) {
+fn paint_shape(
+    shape: &Shape,
+    from: Source<'_>,
+    group_fill: Option<&ResolvedFill>,
+    ctx: &mut ShapeCtx<'_, '_>,
+) {
     let Some(props) = shape_properties(shape) else {
         return;
     };
@@ -732,7 +821,18 @@ fn paint_shape(shape: &Shape, from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) {
         style.and_then(|s| s.fill_ref.as_ref()),
         &DrawingColorContext::new(ctx.theme).with_color_map(ctx.color_map),
         Some(from.media),
+        group_fill,
     );
+    // §20.1.8.35 — tallied here, not after the paint gate: a `grpFill` that
+    // resolved and then failed to build is a geometry gap, and folding it in
+    // with the shapes that inherited nothing would blame the wrong step.
+    if matches!(props.fill, Some(DrawingFill::Group)) {
+        if matches!(visuals.fill, ResolvedFill::None) {
+            *ctx.group_fills_unanswered += 1;
+        } else {
+            *ctx.fills_from_group += 1;
+        }
+    }
     // Where the ink came from, read *before* the picture override below
     // replaces the fill: a `p:pic` whose frame inherits a theme fill still
     // inherited it, and the photograph that lands on top is a different fact.

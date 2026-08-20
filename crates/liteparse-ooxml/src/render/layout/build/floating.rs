@@ -255,6 +255,9 @@ pub(super) fn extract_floating_shapes(
             // Word autoshape stays unpainted — as it was before this argument
             // existed. Wiring it is a DOCX-side step with its own corpus.
             None,
+            // No enclosing group: this walk visits `wps:wsp` anchors, and a
+            // Word group's members do not reach it.
+            None,
         );
 
         // §20.1.7.6 transform attributes (rotation/flip) live on the shape's

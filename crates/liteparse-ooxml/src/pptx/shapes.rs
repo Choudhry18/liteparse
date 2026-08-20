@@ -250,7 +250,19 @@ pub struct Connector {
 /// numbers it needs.
 #[derive(Clone, Debug, Default)]
 pub struct Group {
-    pub properties: Option<ShapeProperties>,
+    /// §20.1.8.35 — the fill a descendant's `a:grpFill` inherits.
+    ///
+    /// A [`ShapeProperties`] would be the obvious type and is the wrong one:
+    /// §19.3.1.23's `p:grpSpPr` is `a:xfrm` + `EG_FillProperties` +
+    /// `EG_EffectProperties` + `a:scene3d`, so a group has **no geometry and
+    /// no `a:ln`** — those two fields could never be populated — and its
+    /// transform is already hoisted onto [`Shape::transform`], where the
+    /// geometry pass reads it. Carrying the one member that has a consumer
+    /// keeps the second copy of the transform from existing to drift.
+    ///
+    /// A group never paints this itself: it has no geometry to put it in.
+    /// The fill exists only as the source of the children's inheritance.
+    pub fill: Option<DrawingFill>,
     /// `a:chOff` — the origin of the child coordinate space.
     pub child_offset: Option<Offset<Emu>>,
     /// `a:chExt` — the extent of the child coordinate space.
@@ -544,6 +556,51 @@ impl Background {
 /// which returns both from a single deserialization.
 pub fn parse_shape_tree(data: &[u8]) -> Result<Vec<Shape>> {
     Ok(parse_slide_part(data)?.shapes)
+}
+
+/// §19.2.1.32 `@showMasterSp` alone, read from the root element without
+/// deserializing the part.
+///
+/// [`parse_slide_part`] already returns this as
+/// [`SlidePart::show_inherited_shapes`], and that is what every *walk* should
+/// use. This exists for the one caller that needs the attribute **without** the
+/// shape tree: the deck-wide tally of inherited text has to know which slides
+/// really draw a rung, and it visits every slide before either walk begins.
+/// Deserializing 1,278 slide parts a second time to read one boolean measured
+/// at +7.5% on the corpus's end-to-end markdown run; this measures at nothing.
+///
+/// The duplication is deliberate and is fenced by
+/// `cheap_reader_agrees_with_the_full_parse`, which asserts the two answers
+/// match on the same bytes — a second reader of an attribute is only safe while
+/// something fails when they disagree.
+///
+/// Defaults to **true**, per the schema, and on anything it cannot read: a part
+/// whose XML is malformed is the full parse's problem to report, and answering
+/// "shows its rungs" here keeps the failure in one place.
+pub fn shows_inherited_shapes(data: &[u8]) -> bool {
+    let mut reader = quick_xml::Reader::from_reader(data);
+    let mut buf = Vec::new();
+    loop {
+        // The root element is the first `Start` — `Empty` cannot be it, since a
+        // `p:sld` with no `p:cSld` is still not self-closing in any producer,
+        // and an empty root has no rungs to draw anyway.
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                // The true-family is `AttrBool`'s, spelled the same way on
+                // purpose: anything else present — `0`, `off`, a typo — is
+                // false there, and a reader that only special-cased `"0"`
+                // would answer differently on the odd ones.
+                return e
+                    .try_get_attribute("showMasterSp")
+                    .ok()
+                    .flatten()
+                    .and_then(|a| a.unescape_value().ok())
+                    .is_none_or(|v| matches!(v.as_ref(), "1" | "true" | "on"));
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return true,
+            _ => buf.clear(),
+        }
+    }
 }
 
 /// A `p:cSld`'s two payloads: its shape tree and its background.
@@ -1056,12 +1113,29 @@ struct NvGrpSpPrXml {
     cnv_pr: CNvPrXml,
 }
 
+/// §19.3.1.23 `p:grpSpPr` — `a:xfrm` + `EG_FillProperties` +
+/// `EG_EffectProperties` + `a:scene3d`. There is deliberately no `ln` field:
+/// the schema gives a group no outline, which is why a census of the corpus
+/// finds an `a:ln` on 0 of 695 groups. The six fill members route through
+/// [`pick_fill`], the same collapse `SpPrXml` and `p:bgPr` use.
 #[derive(Debug, Deserialize, Default)]
 struct GrpSpPrXml {
     #[serde(rename = "xfrm", default)]
     xfrm: Option<GroupXfrmXml>,
     #[serde(rename = "@bwMode", default)]
     _bw_mode: Option<String>,
+    #[serde(rename = "noFill", default)]
+    no_fill: Option<crate::docx::parse::drawing::schema::fill::Empty>,
+    #[serde(rename = "solidFill", default)]
+    solid_fill: Option<crate::docx::parse::drawing::schema::fill::SolidFillXml>,
+    #[serde(rename = "gradFill", default)]
+    grad_fill: Option<crate::docx::parse::drawing::schema::fill::GradFillXml>,
+    #[serde(rename = "blipFill", default)]
+    blip_fill: Option<crate::docx::parse::drawing::schema::fill::BlipFillXml>,
+    #[serde(rename = "pattFill", default)]
+    patt_fill: Option<crate::docx::parse::drawing::schema::fill::PattFillXml>,
+    #[serde(rename = "grpFill", default)]
+    grp_fill: Option<crate::docx::parse::drawing::schema::fill::Empty>,
 }
 
 /// A group's `<a:xfrm>`, which is `XfrmXml` **plus** `chOff`/`chExt`.
@@ -1391,7 +1465,16 @@ fn lower_cxn(cxn: CxnSpXml) -> Shape {
 }
 
 fn lower_grp(grp: GrpSpXml) -> Shape {
-    let xfrm = grp.grp_sp_pr.and_then(|p| p.xfrm);
+    let grp_sp_pr = grp.grp_sp_pr.unwrap_or_default();
+    let fill = pick_fill(
+        grp_sp_pr.no_fill,
+        grp_sp_pr.grp_fill,
+        grp_sp_pr.solid_fill,
+        grp_sp_pr.grad_fill,
+        grp_sp_pr.blip_fill,
+        grp_sp_pr.patt_fill,
+    );
+    let xfrm = grp_sp_pr.xfrm;
     let transform = xfrm.as_ref().map(GroupXfrmXml::transform);
     Shape {
         non_visual: doc_properties(grp.nv_grp_sp_pr.map(|nv| nv.cnv_pr)),
@@ -1402,7 +1485,7 @@ fn lower_grp(grp: GrpSpXml) -> Shape {
         // §19.3.1.22: `p:grpSp` has no `style` child in the schema.
         style: None,
         kind: ShapeKind::Group(Box::new(Group {
-            properties: None,
+            fill,
             child_offset: xfrm
                 .as_ref()
                 .and_then(|x| x.ch_off.as_ref())
@@ -1863,6 +1946,53 @@ mod tests {
         assert_eq!(group.children.len(), 1);
     }
 
+    /// §19.3.1.23 — the group's own fill, which is what a member's `a:grpFill`
+    /// inherits. 82 corpus groups declare a `solidFill` here.
+    #[test]
+    fn group_fill_is_lowered() {
+        let shapes = tree(&format!(
+            r#"<p:grpSp>
+                 <p:nvGrpSpPr><p:cNvPr id="5" name="g"/></p:nvGrpSpPr>
+                 <p:grpSpPr><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></p:grpSpPr>
+                 {}
+               </p:grpSp>"#,
+            sp("<p:spPr><a:grpFill/></p:spPr>")
+        ));
+        let ShapeKind::Group(group) = &shapes[0].kind else {
+            panic!("expected a group");
+        };
+        assert!(matches!(group.fill, Some(DrawingFill::Solid(_))));
+        // The member defers rather than declaring nothing: the distinction is
+        // the whole of `grpFill`, and a `None` here would be a shape that
+        // silently falls through to its `p:style` instead.
+        let ShapeKind::AutoShape(member) = &group.children[0].kind else {
+            panic!("expected an autoshape");
+        };
+        assert!(matches!(
+            member.properties.as_ref().and_then(|p| p.fill.as_ref()),
+            Some(DrawingFill::Group)
+        ));
+    }
+
+    /// A group with no fill element is the spec's "inherit nothing" — it must
+    /// not be confused with one that names `noFill`, which says the same thing
+    /// but says it, nor silently become a fill.
+    #[test]
+    fn group_without_a_fill_lowers_to_none() {
+        let shapes = tree(
+            r#"<p:grpSp>
+                 <p:nvGrpSpPr><p:cNvPr id="5" name="g"/></p:nvGrpSpPr>
+                 <p:grpSpPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:grpSpPr>
+               </p:grpSp>"#,
+        );
+        let ShapeKind::Group(group) = &shapes[0].kind else {
+            panic!("expected a group");
+        };
+        assert!(group.fill.is_none());
+        // The `xfrm` still has to survive alongside the new fill fields.
+        assert_eq!(shapes[0].transform.unwrap().offset.unwrap().x.raw(), 1);
+    }
+
     #[test]
     fn groups_nest_and_visit_is_preorder() {
         let shapes = tree(&format!(
@@ -2134,9 +2264,53 @@ mod tests {
                  </p:spTree></p:cSld>
                </p:sld>"#
         );
-        parse_slide_part(xml.as_bytes())
+        let full = parse_slide_part(xml.as_bytes())
             .expect("parses")
-            .show_inherited_shapes
+            .show_inherited_shapes;
+        // Every case below fences the second reader, not just the one test
+        // written for it: `shows_inherited_shapes` exists only while it cannot
+        // drift from the parse it shortcuts.
+        assert_eq!(
+            full,
+            shows_inherited_shapes(xml.as_bytes()),
+            "cheap reader disagreed on {root_attrs:?}"
+        );
+        full
+    }
+
+    /// The two readers must agree on the whole `AttrBool` true-family and on
+    /// the values outside it, which is where a hand-rolled attribute scan is
+    /// most likely to go its own way.
+    #[test]
+    fn cheap_reader_agrees_with_the_full_parse() {
+        for attrs in [
+            "",
+            r#"showMasterSp="0""#,
+            r#"showMasterSp="1""#,
+            r#"showMasterSp="true""#,
+            r#"showMasterSp="false""#,
+            r#"showMasterSp="on""#,
+            r#"showMasterSp="off""#,
+            // Not a value the schema allows. Both sides must still land on the
+            // same answer, whatever it is.
+            r#"showMasterSp="yes""#,
+            // A sibling attribute, to catch a scan that matches by prefix.
+            r#"preserve="1""#,
+        ] {
+            show_inherited(attrs);
+        }
+    }
+
+    /// The attribute is on the **root**, and a `p:sp` deeper in the part may
+    /// carry unrelated attributes. A reader that took the first match anywhere
+    /// would read the wrong element.
+    #[test]
+    fn cheap_reader_reads_the_root_not_a_descendant() {
+        let xml = r#"<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                                  showMasterSp="0">
+                       <p:cSld><p:spTree><p:sp showMasterSp="1"/></p:spTree></p:cSld>
+                     </p:sldLayout>"#;
+        assert!(!shows_inherited_shapes(xml.as_bytes()));
     }
 
     /// The schema default is `true`, and it is the *absence* of the attribute

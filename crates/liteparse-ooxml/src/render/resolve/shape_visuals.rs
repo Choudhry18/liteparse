@@ -51,6 +51,14 @@ pub struct ResolvedVisuals {
 /// the theme is no longer the only thing a scheme colour resolves through:
 /// PresentationML states its `bg1`/`tx1` mapping in the master's §19.3.1.6
 /// `p:clrMap`, and a shape fill has to see the same map its text does.
+///
+/// `group_fill` is the **already-resolved** fill of the nearest enclosing
+/// group, which is what a `a:grpFill` on this shape inherits (§20.1.8.35);
+/// `None` for a shape at the top of a tree, and for every DOCX caller. It
+/// arrives resolved rather than as a `DrawingFill` for two reasons: the
+/// group's fill resolves in the group's own colour context, which is the one
+/// place it is correct to resolve it, and a group with 776 children resolves
+/// once instead of 776 times.
 pub fn resolve_shape_visuals(
     props: Option<&ShapeProperties>,
     style_line_ref: Option<&StyleMatrixRef>,
@@ -58,6 +66,7 @@ pub fn resolve_shape_visuals(
     style_fill_ref: Option<&StyleMatrixRef>,
     ctx: &DrawingColorContext<'_>,
     media: Option<&PartMedia>,
+    group_fill: Option<&ResolvedFill>,
 ) -> ResolvedVisuals {
     let theme = ctx.theme;
     let props = match props {
@@ -75,8 +84,12 @@ pub fn resolve_shape_visuals(
 
     // §20.1.4.1.13: a direct spPr fill wins; otherwise fall back to the theme
     // fill style referenced by `<a:fillRef>` (recolored by its phClr).
+    // A `grpFill` is a *declared* fill, so it wins over a `fillRef` even when
+    // the group hands back nothing: 269 corpus shapes declare both, and
+    // falling through to the theme on an unanswered group would paint them a
+    // colour the file never asks for.
     let fill = match props.fill.as_ref() {
-        Some(f) => resolve_fill(f, ctx, media),
+        Some(f) => resolve_fill(f, ctx, media, group_fill),
         None => resolve_theme_fill(style_fill_ref, theme, ctx, media),
     };
 
@@ -146,7 +159,9 @@ fn resolve_theme_fill(
         Some(c) => ctx.with_placeholder(resolve_drawing_color(c, ctx)),
         None => *ctx,
     };
-    resolve_fill(fill, &fill_ctx, media)
+    // A theme fill style entry cannot itself defer to a group: there is no
+    // shape, so there is no enclosing group.
+    resolve_fill(fill, &fill_ctx, media, None)
 }
 
 /// §19.3.1.3: resolve a slide/layout/master `<p:bgRef>` against the theme.
@@ -190,7 +205,7 @@ pub fn resolve_background_fill(
         Some(c) => ctx.with_placeholder(resolve_drawing_color(c, ctx)),
         None => *ctx,
     };
-    resolve_fill(fill, &fill_ctx, media)
+    resolve_fill(fill, &fill_ctx, media, None)
 }
 
 /// Look up a theme line style by its 1-based `lnRef` index.
@@ -245,10 +260,15 @@ pub fn default_path_fill_for_stroked_shape() -> PathFillMode {
 /// today). A blip fill without one resolves to [`ResolvedFill::None`]: the
 /// alternative — resolving against whatever table happened to be in scope —
 /// is how an inherited picture acquires the slide's `rId1` instead of its own.
+///
+/// `group_fill` is the resolved fill of the nearest enclosing group — see
+/// [`resolve_shape_visuals`]. `None` means there is no group to inherit from,
+/// which is a correct reading of the file and not a gap.
 pub fn resolve_fill(
     fill: &DrawingFill,
     ctx: &DrawingColorContext<'_>,
     media: Option<&PartMedia>,
+    group_fill: Option<&ResolvedFill>,
 ) -> ResolvedFill {
     match fill {
         DrawingFill::None => ResolvedFill::None,
@@ -281,12 +301,19 @@ pub fn resolve_fill(
             log::warn!("shape_visuals: pattern fill not yet resolved (Tier 3)");
             ResolvedFill::None
         }
-        DrawingFill::Group => {
-            log::warn!(
-                "shape_visuals: group fill (grpFill) not resolved — no enclosing group context"
-            );
-            ResolvedFill::None
-        }
+        // §20.1.8.35 — take the enclosing group's fill. The chain through
+        // nested groups is collapsed by the caller before it gets here: a
+        // group whose own fill is itself `grpFill` resolves against *its*
+        // parent, so what arrives is always a fill, never another deferral.
+        DrawingFill::Group => match group_fill {
+            Some(f) => f.clone(),
+            None => {
+                log::debug!(
+                    "shape_visuals: grpFill with no enclosing group fill — nothing to inherit"
+                );
+                ResolvedFill::None
+            }
+        },
     }
 }
 
@@ -594,6 +621,7 @@ mod tests {
             None,
             &DrawingColorContext::new(None),
             None,
+            None,
         );
         assert!(matches!(v.fill, ResolvedFill::None));
         assert!(v.stroke.is_none());
@@ -616,6 +644,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
             None,
         );
         let ResolvedFill::Solid(c) = v.fill else {
@@ -647,6 +676,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
             None,
         );
         let s = v.stroke.unwrap();
@@ -681,6 +711,7 @@ mod tests {
             None,
             &DrawingColorContext::new(None),
             None,
+            None,
         );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(0.75));
@@ -710,6 +741,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
             None,
         );
         assert!(v.stroke.is_none());
@@ -768,6 +800,7 @@ mod tests {
             None,
             &DrawingColorContext::new(Some(&theme)),
             None,
+            None,
         );
         let s = v.stroke.unwrap();
         assert_eq!(s.width, Pt::new(2.0));
@@ -822,6 +855,7 @@ mod tests {
             None,
             &DrawingColorContext::new(Some(&theme)),
             None,
+            None,
         );
         let s = v.stroke.expect("a colourless outline is still an outline");
         assert_eq!(s.color.to_rgb24(), 0x4472C4, "phClr := the lnRef's colour");
@@ -851,6 +885,7 @@ mod tests {
             None,
             &DrawingColorContext::new(Some(&theme)),
             None,
+            None,
         );
         let s = v.stroke.expect("the theme line style is the outline");
         assert_eq!(s.color.to_rgb24(), 0xED7D31);
@@ -877,6 +912,7 @@ mod tests {
             None,
             &DrawingColorContext::new(None),
             None,
+            None,
         );
         assert_eq!(v.stroke.unwrap().color.to_rgb24(), 0x000000);
         assert!(
@@ -901,6 +937,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(Some(&theme)),
+            None,
             None,
         );
         assert!(v.stroke.is_none());
@@ -942,6 +979,7 @@ mod tests {
             Some(&er),
             None,
             &DrawingColorContext::new(Some(&theme)),
+            None,
             None,
         );
         assert_eq!(v.effects.len(), 1);
@@ -997,6 +1035,7 @@ mod tests {
             None,
             &DrawingColorContext::new(Some(&theme)),
             None,
+            None,
         );
         let ResolvedEffect::OuterShadow {
             blur_radius, color, ..
@@ -1035,6 +1074,7 @@ mod tests {
             None,
             None,
             &DrawingColorContext::new(None),
+            None,
             None,
         );
         assert_eq!(v.effects.len(), 1);
@@ -1080,11 +1120,63 @@ mod tests {
             Some(&fill_ref),
             &DrawingColorContext::new(Some(&theme)),
             None,
+            None,
         );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!("expected solid theme fill, got {:?}", v.fill);
         };
         assert_eq!(c.to_rgb24(), 0xFF0000, "phClr substituted by fillRef color");
+    }
+
+    /// §20.1.8.35 — the enclosing group supplies the fill.
+    #[test]
+    fn grp_fill_takes_the_enclosing_group_fill() {
+        let props = shape_props(Some(DrawingFill::Group), None, None);
+        let group = ResolvedFill::Solid(Rgba::from_rgb24(0x00FF00));
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+            None,
+            Some(&group),
+        );
+        let ResolvedFill::Solid(c) = v.fill else {
+            panic!("expected the group's fill, got {:?}", v.fill);
+        };
+        assert_eq!(c.to_rgb24(), 0x00FF00);
+    }
+
+    /// With no group to inherit from, a `grpFill` is still a *declared* fill:
+    /// it resolves to nothing rather than falling through to the `fillRef`.
+    /// 269 corpus shapes declare both, and the fall-through would paint every
+    /// one of them a colour the file never asks for.
+    #[test]
+    fn unanswered_grp_fill_does_not_fall_through_to_fill_ref() {
+        let theme = ph_theme();
+        let fill_ref = StyleMatrixRef {
+            idx: 1,
+            color: Some(DrawingColor::Srgb {
+                rgb: 0xFF0000,
+                transforms: vec![],
+            }),
+        };
+        let props = shape_props(Some(DrawingFill::Group), None, None);
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            Some(&fill_ref),
+            &DrawingColorContext::new(Some(&theme)),
+            None,
+            None,
+        );
+        assert!(
+            matches!(v.fill, ResolvedFill::None),
+            "grpFill with no group must not inherit the theme fill, got {:?}",
+            v.fill
+        );
     }
 
     #[test]
@@ -1112,6 +1204,7 @@ mod tests {
             Some(&fill_ref),
             &DrawingColorContext::new(Some(&theme)),
             None,
+            None,
         );
         let ResolvedFill::Solid(c) = v.fill else {
             panic!("expected solid fill");
@@ -1133,6 +1226,7 @@ mod tests {
             None,
             Some(&fill_ref),
             &DrawingColorContext::new(Some(&theme)),
+            None,
             None,
         );
         assert!(matches!(v.fill, ResolvedFill::None));

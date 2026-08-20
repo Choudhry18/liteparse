@@ -325,7 +325,8 @@ pub fn background_fill(
 ) -> ResolvedFill {
     let ctx = DrawingColorContext::new(theme).with_color_map(color_map);
     match bg {
-        Background::Properties(fill) => resolve_fill(fill, &ctx, media),
+        // A background is not inside a shape tree, so it has no group.
+        Background::Properties(fill) => resolve_fill(fill, &ctx, media, None),
         Background::Reference(r) => resolve_background_fill(r, theme, &ctx, media),
     }
 }

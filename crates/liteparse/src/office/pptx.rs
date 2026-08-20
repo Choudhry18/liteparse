@@ -139,6 +139,13 @@ pub struct Deck {
     /// that [`PreparedSlide`] can borrow it and every walk builds the *same*
     /// `TextCascade` — see [`Deck::prepare`].
     fallback_defaults: DeckTextDefaults,
+    /// How many slides of this deck an inherited string lands on, keyed by the
+    /// string itself. Built once in [`Deck::index_inherited_text`].
+    ///
+    /// Deck-wide by necessity: whether a layout's text is furniture or content
+    /// is not a property of the slide showing it, and cannot be decided while
+    /// standing on one. See [`PreparedSlide::inherited_text`].
+    inherited_text_counts: HashMap<String, usize>,
 }
 
 /// One slide's shapes with their geometry composed and their text cascade
@@ -180,10 +187,28 @@ pub struct PreparedSlide<'d> {
     /// Borrowed, not cloned: unlike `background` this is a whole shape tree per
     /// part, shared by every slide under it.
     ///
-    /// Read by the geometry pass only. The markdown emitter deliberately
-    /// ignores it — see the module note on why layout text is a measured gap
-    /// rather than something this field quietly fixes.
+    /// Read by the paint walk only: it is the whole rung, placeholders already
+    /// dropped, and most of it is furniture with no text at all. The text these
+    /// shapes carry reaches a reader through `inherited_text`, which is a much
+    /// smaller list and a different rule.
     pub inherited: [&'d [Shape]; 2],
+    /// The inherited shapes whose text a reader should actually get:
+    /// `[master, layout]`, parallel to `inherited`, groups already flattened so
+    /// each entry is a `p:sp` that carries its own composed rectangle.
+    ///
+    /// **This is a filtered list, and the filter is the point.** A layout shape
+    /// is drawn on every slide that uses the layout, so emitting its text
+    /// per-slide reprints the deck's furniture once per page: the census found
+    /// 371 occurrences behind just 43 distinct strings, one of them a speaker
+    /// banner landing on 47 slides and another the literal `‹#›` of a slide
+    /// number. [`Deck::keeps_inherited_text`] admits only the strings that land
+    /// on exactly one slide of the deck — 29 of the 371 — which is what makes
+    /// this a content fix rather than a letterhead regression.
+    ///
+    /// Both walks read it, and neither re-derives it: the markdown a reader
+    /// gets and the boxes the geometry pass reports are the same shapes by
+    /// construction.
+    pub inherited_text: [Vec<&'d Shape>; 2],
     /// Whether each arm of `inherited` is empty because it was **declined**
     /// rather than because the part had nothing to give: `[master, layout]`,
     /// parallel to `inherited`.
@@ -233,7 +258,7 @@ impl Deck {
         // rather than failing the deck.
         let default_text_style =
             pptx::parse_default_text_style(&pkg.presentation.xml).unwrap_or_default();
-        Self {
+        let mut deck = Self {
             master_geo: HashMap::new(),
             layout_geo: HashMap::new(),
             master_text: HashMap::new(),
@@ -251,7 +276,99 @@ impl Deck {
                 default_text_style: default_text_style.clone(),
             },
             default_text_style,
+            inherited_text_counts: HashMap::new(),
+        };
+        deck.index_inherited_text(pkg);
+        deck
+    }
+
+    /// Count, deck-wide, how many slides each inherited string lands on.
+    ///
+    /// Runs here rather than lazily because the answer is not knowable from one
+    /// slide, and both walks need it on their first. It primes the rung caches
+    /// as it goes, so the parts it reads are the ones the walks would have
+    /// parsed anyway — the only work this adds is one attribute read per slide.
+    ///
+    /// That attribute is `@showMasterSp`, and it is read through
+    /// [`pptx::shows_inherited_shapes`] rather than by deserializing the slide:
+    /// a slide that declines a rung draws none of its text, so counting its
+    /// occurrences would push a string off the "lands on one slide" rule and
+    /// silently drop content. Getting it from a second `parse_slide_part` per
+    /// slide measured at +7.5% on the corpus's markdown run, for one boolean.
+    fn index_inherited_text(&mut self, pkg: &PresentationPackage) {
+        for slide in &pkg.slides {
+            self.prime(slide);
+            let shows_layout = pptx::shows_inherited_shapes(&slide.slide.xml);
+            let mut found = Vec::new();
+            for shapes in self.inherited_rungs(slide, shows_layout).0 {
+                collect_text_shapes(shapes, &mut found);
+            }
+            // The keys are owned before the counter is touched: `found` borrows
+            // the rung caches, and the tally borrows `self` mutably.
+            let keys: Vec<String> = found.into_iter().map(|(_, key)| key).collect();
+            for key in keys {
+                *self.inherited_text_counts.entry(key).or_default() += 1;
+            }
         }
+    }
+
+    /// Whether an inherited string is content rather than furniture.
+    ///
+    /// **Lands on exactly one slide of the deck.** Measured against the
+    /// alternative — "comes from a rung part that exactly one slide draws",
+    /// which needs no string keying — on the 45-deck corpus: the two keep the
+    /// same 29 occurrences, and the rung rule additionally emits 10 the text
+    /// rule rejects. All 10 are furniture, and one of them is an authoring note
+    /// to whoever edits the deck ("Glegoo is een niet-Windows-Font…"), which is
+    /// as clear a statement as the corpus can make about which axis is right.
+    fn keeps_inherited_text(&self, key: &str) -> bool {
+        self.inherited_text_counts.get(key) == Some(&1)
+    }
+
+    /// The `[master, layout]` shape trees a slide draws, and whether each empty
+    /// arm was **declined** rather than absent.
+    ///
+    /// Shared by [`Deck::prepare`] and [`Deck::index_inherited_text`] because
+    /// the two must agree about what a slide shows: a tally that counted a rung
+    /// the walk then declines would drop a string that is on one page only.
+    ///
+    /// §19.2.1.32: the slide's own `@showMasterSp` turns off *everything* the
+    /// rungs above supply, so it gates the master arm as well as the layout's —
+    /// a slide that declines its layout's design does not then take the
+    /// master's, which the layout was itself drawing over. §19.3.1.39: the
+    /// layout's gates only the master's.
+    fn inherited_rungs(
+        &self,
+        slide: &pptx::SlideParts,
+        shows_layout: bool,
+    ) -> ([&[Shape]; 2], [bool; 2]) {
+        let layout = slide.layout.as_ref();
+        let shows_master = shows_layout
+            && layout
+                .and_then(|l| self.layout_shows_master.get(&l.path))
+                .copied()
+                .unwrap_or(true);
+        (
+            [
+                if shows_master {
+                    slide
+                        .master
+                        .as_ref()
+                        .and_then(|m| self.master_shapes.get(&m.path))
+                        .map_or(&[][..], Vec::as_slice)
+                } else {
+                    &[]
+                },
+                if shows_layout {
+                    layout
+                        .and_then(|l| self.layout_shapes.get(&l.path))
+                        .map_or(&[][..], Vec::as_slice)
+                } else {
+                    &[]
+                },
+            ],
+            [!shows_master, !shows_layout],
+        )
     }
 
     /// Prime the cascades for this slide's layout/master, parse its shape
@@ -320,36 +437,20 @@ impl Deck {
         pptx::apply_inherited_geometry(&mut shapes, layout_geo, MatchRule::Idx);
         pptx::apply_slide_geometry(&mut shapes);
 
-        // §19.2.1.32: the slide's own `@showMasterSp` turns off *everything*
-        // the rungs above supply, so it gates the master arm as well as the
-        // layout's — a slide that declines its layout's design does not then
-        // take the master's, which the layout was itself drawing over.
-        // §19.3.1.39: the layout's gates only the master's.
-        let layout = slide.layout.as_ref();
-        let shows_layout = part.show_inherited_shapes;
-        let shows_master = shows_layout
-            && layout
-                .and_then(|l| self.layout_shows_master.get(&l.path))
-                .copied()
-                .unwrap_or(true);
-        let inherited = [
-            if shows_master {
-                slide
-                    .master
-                    .as_ref()
-                    .and_then(|m| self.master_shapes.get(&m.path))
-                    .map_or(&[][..], Vec::as_slice)
-            } else {
-                &[]
-            },
-            if shows_layout {
-                layout
-                    .and_then(|l| self.layout_shapes.get(&l.path))
-                    .map_or(&[][..], Vec::as_slice)
-            } else {
-                &[]
-            },
-        ];
+        let (inherited, declined) = self.inherited_rungs(slide, part.show_inherited_shapes);
+        // Filtered here rather than at either walk's door, for the same reason
+        // `inherited_shapes` drops placeholders at cache-build time: what comes
+        // out of `prepare` should be exactly what the walks may show, so the
+        // markdown and the geometry cannot apply the rule differently.
+        let inherited_text = inherited.map(|shapes| {
+            let mut found = Vec::new();
+            collect_text_shapes(shapes, &mut found);
+            found
+                .into_iter()
+                .filter(|(_, key)| self.keeps_inherited_text(key))
+                .map(|(shape, _)| shape)
+                .collect()
+        });
 
         let master = slide
             .master
@@ -372,7 +473,8 @@ impl Deck {
             background,
             color_map,
             inherited,
-            declined: [!shows_master, !shows_layout],
+            inherited_text,
+            declined,
             media: self.media.get(Some(slide.slide.path.as_str())),
             inherited_media: [self.media.get(master_path), self.media.get(layout_path)],
             background_media,
@@ -392,17 +494,28 @@ impl Deck {
             let Some(prepared) = self.prepare(pkg, slide) else {
                 continue;
             };
-            let shapes = &prepared.shapes;
-
             let mut ctx = SlideCtx {
                 cascade: prepared.cascade(),
                 part: &slide.slide,
                 package: &pkg.package,
                 opts,
             };
-            for shape in reading_order(shapes) {
-                emit_shape(shape, &mut ctx, &mut out, BlockSource::Slide(idx));
+            for read in slide_reading_order(&prepared) {
+                // The part an `r:id` resolves in — see [`Reading::rung`]. The
+                // fallback cannot fire: a rung contributes shapes only when
+                // `inherited_rungs` found its part, which is the same `Option`.
+                ctx.part = match read.rung {
+                    Some(0) => slide.master.as_ref().unwrap_or(&slide.slide),
+                    Some(_) => slide.layout.as_ref().unwrap_or(&slide.slide),
+                    None => &slide.slide,
+                };
+                emit_shape(read.shape, &mut ctx, &mut out, BlockSource::Slide(idx));
             }
+            // Put the slide's own part back before anything else reads `ctx`:
+            // the notes walk below resolves its rels through this field, and
+            // leaving it pointing at whichever rung happened to sort last would
+            // be a bug that only shows on slides that inherit text.
+            ctx.part = &slide.slide;
 
             if opts.notes
                 && let Some(notes) = &slide.notes
@@ -546,21 +659,123 @@ pub fn reading_order(shapes: &[Shape]) -> Vec<&Shape> {
         .iter()
         .filter(|s| !is_chrome(s.placeholder.as_ref()))
         .collect();
-    v.sort_by_key(|s| {
-        let (band, x) = match s.slide_rect {
-            Some(r) => {
-                let b = r.bounding_box();
-                (b.origin.y.raw().div_euclid(ROW_BAND_EMU), b.origin.x.raw())
-            }
-            // A shape with no rectangle cannot be placed. Sorting it last
-            // keeps it in the output — dropping content to keep a sort total
-            // is never the right trade — while leaving positioned shapes in
-            // their proper order. The census measured 0 of these.
-            None => (i64::MAX, i64::MAX),
-        };
-        (!is_title(s.placeholder.as_ref()), band, x)
-    });
+    v.sort_by_key(|s| reading_key(s));
     v
+}
+
+/// One shape's position in the reading order: title first, then top-to-bottom
+/// in bands, then left-to-right.
+///
+/// Factored out of [`reading_order`] so that [`slide_reading_order`], which
+/// sorts a list the former cannot build, is provably the same order rather than
+/// a copy that agrees today.
+fn reading_key(shape: &Shape) -> (bool, i64, i64) {
+    let (band, x) = match shape.slide_rect {
+        Some(r) => {
+            let b = r.bounding_box();
+            (b.origin.y.raw().div_euclid(ROW_BAND_EMU), b.origin.x.raw())
+        }
+        // A shape with no rectangle cannot be placed. Sorting it last
+        // keeps it in the output — dropping content to keep a sort total
+        // is never the right trade — while leaving positioned shapes in
+        // their proper order. The census measured 0 of these.
+        None => (i64::MAX, i64::MAX),
+    };
+    (!is_title(shape.placeholder.as_ref()), band, x)
+}
+
+/// A shape in a slide's reading order, and which tree it came out of.
+#[doc(hidden)]
+pub struct Reading<'a> {
+    pub shape: &'a Shape,
+    /// `None` for the slide's own `p:spTree`; `Some(0)` for the master's and
+    /// `Some(1)` for the layout's — the same `[master, layout]` index as
+    /// [`PreparedSlide::inherited`] and `inherited_media`.
+    ///
+    /// Carried rather than derived because an inherited shape's `r:id`s resolve
+    /// in the part that wrote them: a layout's `rId3` and the slide's `rId3`
+    /// are unrelated relationships, and a hyperlink read from the wrong table
+    /// is a real URL pointing somewhere the author never wrote.
+    pub rung: Option<usize>,
+}
+
+/// Everything a slide shows, in one reading order: its own shapes and the
+/// inherited text that survived the furniture rule.
+///
+/// **One sort, not two passes.** An inherited shape is a backdrop in *paint*
+/// order — that is why the paint walk draws the rungs before the slide — but it
+/// is not a backdrop in *reading* order: `waterun`'s inherited subtitle sits
+/// under the slide's title and reads there. Appending the rungs and sorting
+/// once puts each string where it appears on the page, which is the only
+/// ordering claim this module ever makes.
+///
+/// The slide's own shapes are inserted first, so on a tie — same band, same x —
+/// the slide's text reads before the template's. `sort_by_key` is stable, so
+/// that is a property of the order rather than an accident of it.
+///
+/// Public for the same reason [`reading_order`] is: a probe must measure this
+/// traversal, not a re-implementation of it.
+#[doc(hidden)]
+pub fn slide_reading_order<'a>(prepared: &'a PreparedSlide<'_>) -> Vec<Reading<'a>> {
+    let mut v: Vec<Reading<'a>> = prepared
+        .shapes
+        .iter()
+        .filter(|s| !is_chrome(s.placeholder.as_ref()))
+        .map(|shape| Reading { shape, rung: None })
+        .collect();
+    for (rung, shapes) in prepared.inherited_text.iter().enumerate() {
+        // No chrome filter: `is_chrome` reads a `p:ph`, and an inherited shape
+        // has none by construction — `inherited_shapes` dropped every
+        // placeholder before these reached the cache.
+        v.extend(shapes.iter().map(|&shape| Reading {
+            shape,
+            rung: Some(rung),
+        }));
+    }
+    v.sort_by_key(|r| reading_key(r.shape));
+    v
+}
+
+/// Every text-bearing `p:sp` in a rung's tree, with the string the furniture
+/// rule counts, groups flattened.
+///
+/// Flattened rather than walked as a tree because the rule is per *string*: a
+/// group holding a logo and a strapline is two decisions, not one, and the
+/// shapes come out of `inherited_shapes` with their group transforms already
+/// composed — so a leaf carries its own rectangle and needs no parent.
+///
+/// The key joins the paragraphs a reader would see, and is what
+/// `bench/pptx_corpus/inherited_text_census.py` counts, so the census's numbers
+/// and this module's are about the same strings.
+fn collect_text_shapes<'a>(shapes: &'a [Shape], out: &mut Vec<(&'a Shape, String)>) {
+    for shape in shapes {
+        match &shape.kind {
+            ShapeKind::AutoShape(sp) => {
+                if let Some(body) = &sp.text {
+                    let mut key = String::new();
+                    for para in &body.paragraphs {
+                        let line = para.text();
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if !key.is_empty() {
+                            key.push('\n');
+                        }
+                        key.push_str(&line);
+                    }
+                    let key = key.trim();
+                    if !key.is_empty() {
+                        out.push((shape, key.to_string()));
+                    }
+                }
+            }
+            ShapeKind::Group(group) => collect_text_shapes(&group.children, out),
+            // A `p:graphicFrame`'s table is a second gap of a different shape —
+            // 2 of them in layout parts against 237 `p:sp`s — and folding the
+            // two would make neither number act on.
+            _ => {}
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -1113,5 +1328,164 @@ mod tests {
         assert!(is_title(ph(PlaceholderKind::CtrTitle).as_ref()));
         assert!(!is_title(ph(PlaceholderKind::SubTitle).as_ref()));
         assert!(!is_title(None));
+    }
+
+    // ── inherited text ──────────────────────────────────────────────────────
+
+    /// A shape tree from a fragment, with geometry composed the way
+    /// `inherited_shapes` composes a rung's before it caches it.
+    fn tree(inner: &str) -> Vec<Shape> {
+        let xml = format!(
+            r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                      xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                 <p:cSld><p:spTree>
+                   <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+                   <p:grpSpPr/>
+                   {inner}
+                 </p:spTree></p:cSld>
+               </p:sld>"#
+        );
+        let mut shapes = pptx::parse_shape_tree(xml.as_bytes()).expect("parses");
+        pptx::apply_slide_geometry(&mut shapes);
+        shapes
+    }
+
+    /// A `p:sp` at `(x, y)` EMU carrying one paragraph per line of `text`.
+    fn text_shape(id: u32, x: i64, y: i64, text: &[&str]) -> String {
+        let paras: String = text
+            .iter()
+            .map(|t| format!("<a:p><a:r><a:t>{t}</a:t></a:r></a:p>"))
+            .collect();
+        format!(
+            r#"<p:sp>
+                 <p:nvSpPr><p:cNvPr id="{id}" name="s{id}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+                 <p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>
+                 <p:txBody><a:bodyPr/><a:lstStyle/>{paras}</p:txBody>
+               </p:sp>"#
+        )
+    }
+
+    /// The key is the string the census counts: paragraphs joined by newline,
+    /// blank ones skipped. A key that drifted from the census's would make
+    /// every number in the plan's write-up about a different population.
+    #[test]
+    fn the_key_joins_the_paragraphs_a_reader_would_see() {
+        let shapes = tree(&text_shape(
+            2,
+            0,
+            0,
+            &["Thank you", "", "for your", "attention"],
+        ));
+        let mut found = Vec::new();
+        collect_text_shapes(&shapes, &mut found);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "Thank you\nfor your\nattention");
+    }
+
+    /// A rung's logo-plus-strapline group is two strings, not one: the rule is
+    /// per string, and a group that kept its children together would let a
+    /// repeated logo drag a one-off strapline out of the output with it.
+    #[test]
+    fn groups_are_flattened_into_one_decision_per_string() {
+        let shapes = tree(&format!(
+            r#"<p:grpSp>
+                 <p:nvGrpSpPr><p:cNvPr id="9" name="g"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+                 <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/>
+                   <a:chOff x="0" y="0"/><a:chExt cx="914400" cy="914400"/></a:xfrm></p:grpSpPr>
+                 {}{}
+               </p:grpSp>"#,
+            text_shape(10, 0, 0, &["ACME"]),
+            text_shape(11, 0, 100, &["a one-off strapline"]),
+        ));
+        let mut found = Vec::new();
+        collect_text_shapes(&shapes, &mut found);
+        let keys: Vec<&str> = found.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(keys, ["ACME", "a one-off strapline"]);
+    }
+
+    /// A picture or a connector carries no `p:txBody`, and an empty one is not
+    /// a string — neither may enter the tally, or the counts stop matching the
+    /// census and a blank shape starts competing for a "lands on one slide".
+    #[test]
+    fn shapes_with_nothing_to_say_are_not_counted() {
+        let shapes = tree(&format!(
+            r#"{}<p:cxnSp><p:nvCxnSpPr><p:cNvPr id="4" name="c"/><p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr>
+                 <p:spPr/></p:cxnSp>"#,
+            text_shape(3, 0, 0, &["", "  "]),
+        ));
+        let mut found = Vec::new();
+        collect_text_shapes(&shapes, &mut found);
+        assert!(found.is_empty(), "{found:?} should be empty");
+    }
+
+    /// A `PreparedSlide` holding hand-built trees, so the merged order can be
+    /// tested without a package on disk.
+    fn prepared<'a>(
+        shapes: Vec<Shape>,
+        inherited: &'a [Shape],
+        defaults: &'a DeckTextDefaults,
+        media: &'a PartMedia,
+    ) -> PreparedSlide<'a> {
+        PreparedSlide {
+            shapes,
+            background: None,
+            color_map: None,
+            inherited: [&[], &[]],
+            inherited_text: [Vec::new(), inherited.iter().collect()],
+            declined: [false, false],
+            media,
+            inherited_media: [media, media],
+            background_media: media,
+            layout_text: None,
+            master_text: None,
+            deck_defaults: defaults,
+        }
+    }
+
+    /// Inherited text is a backdrop in *paint* order and not in *reading*
+    /// order: `waterun`'s inherited strapline sits above the slide's own first
+    /// line and reads there, which one sort over both trees gives for free.
+    #[test]
+    fn inherited_text_reads_where_it_sits_on_the_page() {
+        let defaults = DeckTextDefaults::default();
+        let slide = tree(&text_shape(2, 0, 3_000_000, &["the slide's own line"]));
+        let rung = tree(&text_shape(3, 0, 0, &["an inherited strapline"]));
+        let media = PartMedia::default();
+        let p = prepared(slide, &rung, &defaults, &media);
+        let order: Vec<Option<usize>> = slide_reading_order(&p).iter().map(|r| r.rung).collect();
+        assert_eq!(order, [Some(1), None]);
+    }
+
+    /// Same band, same x. The slide's own text is inserted first and the sort
+    /// is stable, so it reads first — a template's caption should not cut in
+    /// front of the line it was authored behind.
+    #[test]
+    fn the_slide_wins_a_tie_with_its_template() {
+        let defaults = DeckTextDefaults::default();
+        let slide = tree(&text_shape(2, 0, 0, &["the slide's own line"]));
+        let rung = tree(&text_shape(3, 0, 0, &["an inherited line"]));
+        let media = PartMedia::default();
+        let p = prepared(slide, &rung, &defaults, &media);
+        let order: Vec<Option<usize>> = slide_reading_order(&p).iter().map(|r| r.rung).collect();
+        assert_eq!(order, [None, Some(1)]);
+    }
+
+    /// Title-first survives the merge. An inherited banner across the top of
+    /// every slide sits above the title geometrically, and sorting on position
+    /// alone would put it in front of the `#` on every page that keeps one.
+    #[test]
+    fn a_title_still_reads_first_under_an_inherited_banner() {
+        let defaults = DeckTextDefaults::default();
+        let mut slide = tree(&text_shape(2, 0, 3_000_000, &["the title"]));
+        slide[0].placeholder = Some(Placeholder {
+            kind: PlaceholderKind::Title,
+            idx: 0,
+        });
+        let rung = tree(&text_shape(3, 0, 0, &["an inherited banner"]));
+        let media = PartMedia::default();
+        let p = prepared(slide, &rung, &defaults, &media);
+        let order: Vec<Option<usize>> = slide_reading_order(&p).iter().map(|r| r.rung).collect();
+        assert_eq!(order, [None, Some(1)]);
     }
 }
