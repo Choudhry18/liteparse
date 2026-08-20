@@ -47,7 +47,7 @@ use serde::Deserialize;
 use crate::model::dimension::{Dimension, Emu};
 use crate::model::geometry::{Offset, Size};
 use crate::model::{
-    BodyProperties, ColorMap, DocProperties, DrawingFill, NvPicProperties, Picture,
+    BodyProperties, ColorMap, DocProperties, DrawingFill, FontReference, NvPicProperties, Picture,
     ShapeProperties, StyleMatrixRef, TextAnchoringType, TextVerticalType, Transform2D,
 };
 
@@ -56,8 +56,8 @@ use crate::docx::parse::drawing::schema::color::StSchemeColorVal;
 use crate::docx::parse::drawing::schema::fill::BlipFillXml;
 use crate::docx::parse::drawing::schema::picture::{CNvPicPrXml, CNvPrXml};
 use crate::docx::parse::drawing::schema::shape::{
-    ExtXml, OffXml, SpPrXml, StTextAnchoringType, StTextVerticalType, StyleMatrixRefXml, XfrmXml,
-    pick_fill,
+    ExtXml, OffXml, ShapeStyleXml, SpPrXml, StTextAnchoringType, StTextVerticalType,
+    StyleMatrixRefXml, XfrmXml, pick_fill,
 };
 use crate::docx::parse::serde_xml;
 
@@ -98,7 +98,62 @@ pub struct Shape {
     /// probe can still see the declared EMU, which is what they check against
     /// the source XML.
     pub slide_rect: Option<SlideRect>,
+    /// §19.3.1.46 `p:style` — the shape's references into the theme's style
+    /// matrices, when it declares one. 2,181 of the corpus's 17,024 shapes do.
+    ///
+    /// On [`Shape`] rather than on each [`ShapeKind`] variant because all three
+    /// kinds that can carry one (`p:sp`, `p:cxnSp`, `p:pic`) carry the *same*
+    /// `a:CT_ShapeStyle`, and both consumers — the fill emitter and, later, the
+    /// text cascade — reach it from the shape rather than from its payload.
+    /// `p:grpSp` and `p:graphicFrame` have no `style` in the schema and always
+    /// leave this `None`.
+    pub style: Option<ShapeStyle>,
     pub kind: ShapeKind,
+}
+
+/// §20.1.4.1.4 `a:CT_ShapeStyle` — the four theme-matrix references a
+/// `p:style` holds.
+///
+/// The spec requires all four children, and the corpus agrees exactly (2,181
+/// of each), but they are modelled as `Option` because a file that omits one
+/// should lose that reference and not the whole shape.
+///
+/// Deliberately *not* four loose fields on [`Shape`] the way
+/// [`crate::model::WordProcessingShape`] carries them: there they arrived one
+/// at a time as Word's needs appeared, and here all four exist from the start
+/// and are always read together.
+#[derive(Clone, Debug, Default)]
+pub struct ShapeStyle {
+    /// `a:lnRef` — the theme line style. Supplies the outline's colour when
+    /// `a:ln` declares none (179 corpus shapes, today's black default) and the
+    /// **entire** outline when there is no `a:ln` at all (312).
+    pub line_ref: Option<StyleMatrixRef>,
+    /// `a:fillRef` — the theme fill style, used only when `spPr` declares no
+    /// fill element of its own. 631 corpus shapes inherit through it, of which
+    /// 335 name `idx="0"` and therefore inherit *nothing*.
+    pub fill_ref: Option<StyleMatrixRef>,
+    /// `a:effectRef` — the theme effect style, consulted when the direct
+    /// `a:effectLst` is absent or empty.
+    pub effect_ref: Option<StyleMatrixRef>,
+    /// `a:fontRef` — the shape's default text colour and theme font
+    /// collection.
+    ///
+    /// Parsed here but **not yet consumed**: it belongs to the text cascade,
+    /// not the paint walk, and wiring it into one and not the other would make
+    /// the markdown emitter and the geometry pass disagree about a run's
+    /// colour. 2,181 corpus shapes declare one.
+    pub font_ref: Option<FontReference>,
+}
+
+impl From<ShapeStyleXml> for ShapeStyle {
+    fn from(x: ShapeStyleXml) -> Self {
+        Self {
+            line_ref: x.ln_ref.map(Into::into),
+            fill_ref: x.fill_ref.map(Into::into),
+            effect_ref: x.effect_ref.map(Into::into),
+            font_ref: x.font_ref.map(Into::into),
+        }
+    }
 }
 
 impl Shape {
@@ -861,6 +916,11 @@ struct SpXml {
     nv_sp_pr: Option<NvSpPrXml>,
     #[serde(rename = "spPr", default)]
     sp_pr: Option<SpPrXml>,
+    /// §19.3.1.46 `p:style`. Same `a:CT_ShapeStyle` the DOCX `wps:style`
+    /// holds, so the schema type is shared — the content models coincide
+    /// element for element, which is the only case where reusing one is safe.
+    #[serde(rename = "style", default)]
+    style: Option<ShapeStyleXml>,
     #[serde(rename = "txBody", default)]
     tx_body: Option<TextBodyXml>,
 }
@@ -947,6 +1007,8 @@ struct PicXml {
     blip_fill: BlipFillXml,
     #[serde(rename = "spPr", default)]
     sp_pr: Option<SpPrXml>,
+    #[serde(rename = "style", default)]
+    style: Option<ShapeStyleXml>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -966,6 +1028,8 @@ struct CxnSpXml {
     nv_cxn_sp_pr: Option<NvCxnSpPrXml>,
     #[serde(rename = "spPr", default)]
     sp_pr: Option<SpPrXml>,
+    #[serde(rename = "style", default)]
+    style: Option<ShapeStyleXml>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1275,6 +1339,7 @@ fn lower_sp(sp: SpXml) -> Shape {
         transform: properties.as_ref().and_then(|p| p.transform),
         transform_inherited: false,
         slide_rect: None,
+        style: sp.style.map(Into::into),
         kind: ShapeKind::AutoShape(Box::new(AutoShape {
             properties,
             text: sp.tx_body.map(TextBodyXml::into_model),
@@ -1300,6 +1365,7 @@ fn lower_pic(pic: PicXml) -> Shape {
         transform,
         transform_inherited: false,
         slide_rect: None,
+        style: pic.style.map(Into::into),
         kind: ShapeKind::Picture(Box::new(Picture {
             nv_pic_pr: NvPicProperties {
                 cnv_pr: non_visual,
@@ -1319,6 +1385,7 @@ fn lower_cxn(cxn: CxnSpXml) -> Shape {
         transform: properties.as_ref().and_then(|p| p.transform),
         transform_inherited: false,
         slide_rect: None,
+        style: cxn.style.map(Into::into),
         kind: ShapeKind::Connector(Box::new(Connector { properties })),
     }
 }
@@ -1332,6 +1399,8 @@ fn lower_grp(grp: GrpSpXml) -> Shape {
         transform,
         transform_inherited: false,
         slide_rect: None,
+        // §19.3.1.22: `p:grpSp` has no `style` child in the schema.
+        style: None,
         kind: ShapeKind::Group(Box::new(Group {
             properties: None,
             child_offset: xfrm
@@ -1364,6 +1433,8 @@ fn lower_graphic_frame(gf: GraphicFrameXml) -> Shape {
         transform: gf.xfrm.map(Into::into),
         transform_inherited: false,
         slide_rect: None,
+        // §19.3.1.21: `p:graphicFrame` has no `style` child in the schema.
+        style: None,
         kind: ShapeKind::GraphicFrame(Box::new(GraphicFrame { payload })),
     }
 }
@@ -1536,6 +1607,39 @@ mod tests {
         assert_eq!(t.offset.expect("offset").x.raw(), 914400);
         assert_eq!(t.extent.expect("extent").width.raw(), 1828800);
         assert!(!shapes[0].needs_inherited_geometry());
+    }
+
+    /// §19.3.1.46. All four references, with the `phClr` substitute each one
+    /// carries — the substitute is the load-bearing half, since every theme
+    /// matrix entry on the corpus is written in terms of `phClr` and resolves
+    /// to black without it.
+    #[test]
+    fn shape_style_lowers_all_four_references() {
+        let shapes = tree(&sp(r#"<p:spPr/><p:style>
+                 <a:lnRef idx="2"><a:schemeClr val="accent1"><a:shade val="50000"/></a:schemeClr></a:lnRef>
+                 <a:fillRef idx="1"><a:schemeClr val="accent1"/></a:fillRef>
+                 <a:effectRef idx="0"><a:schemeClr val="accent1"/></a:effectRef>
+                 <a:fontRef idx="minor"><a:schemeClr val="lt1"/></a:fontRef>
+               </p:style>"#));
+        let style = shapes[0].style.as_ref().expect("p:style lowered");
+        let ln = style.line_ref.as_ref().expect("lnRef");
+        assert_eq!(ln.idx, 2);
+        assert!(ln.color.is_some(), "the phClr substitute must survive");
+        assert_eq!(style.fill_ref.as_ref().expect("fillRef").idx, 1);
+        // §20.1.4.2.19: 0 is the no-reference sentinel and is kept as declared,
+        // not normalised away — 335 corpus `fillRef`s rely on the resolver
+        // seeing it.
+        assert_eq!(style.effect_ref.as_ref().expect("effectRef").idx, 0);
+        assert!(style.font_ref.is_some(), "parsed, though unused for now");
+    }
+
+    /// A shape with no `p:style` gets `None`, not a default-constructed set of
+    /// references — an all-zero `ShapeStyle` would read as "asked the theme and
+    /// got nothing" rather than "never asked".
+    #[test]
+    fn shape_without_style_has_no_references() {
+        let shapes = tree(&sp("<p:spPr/>"));
+        assert!(shapes[0].style.is_none());
     }
 
     /// `p:ph@idx` reaches exactly `u32::MAX` in 13 of the 45 corpus decks.

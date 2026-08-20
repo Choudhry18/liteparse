@@ -27,6 +27,15 @@ pub struct ResolvedVisuals {
     pub fill: ResolvedFill,
     pub stroke: Option<ResolvedStroke>,
     pub effects: Vec<ResolvedEffect>,
+    /// True when the stroke is painted black because *nothing* declared a
+    /// colour — neither the direct `<a:ln>` nor the theme line style its
+    /// `lnRef` names. Distinct from a stroke that is black because the file
+    /// says black, which is not a defect.
+    ///
+    /// Reported rather than left for a caller to re-derive, because the only
+    /// way to re-derive it is to redo the theme lookup this function already
+    /// did, and a second copy of that lookup is a second thing to get wrong.
+    pub stroke_color_defaulted: bool,
 }
 
 /// Resolve the visual aspect of a shape (fill, outline, effects) into the
@@ -59,6 +68,7 @@ pub fn resolve_shape_visuals(
                 fill: resolve_theme_fill(style_fill_ref, theme, ctx, media),
                 stroke: None,
                 effects: Vec::new(),
+                stroke_color_defaulted: false,
             };
         }
     };
@@ -71,10 +81,22 @@ pub fn resolve_shape_visuals(
     };
 
     let theme_ln = theme_line_style(style_line_ref, theme);
-    let stroke = props
-        .outline
-        .as_ref()
-        .and_then(|o| resolve_outline(o, theme_ln, ctx));
+    // §20.1.4.1.22: the theme line style is written in terms of `phClr`, which
+    // the `lnRef` itself supplies — the same substitution `resolve_theme_fill`
+    // does. Resolving the theme outline in the *shape's* context instead would
+    // hand `phClr` to a scheme lookup that has never heard of it.
+    let ln_ctx = match style_line_ref.and_then(|r| r.color.as_ref()) {
+        Some(c) => ctx.with_placeholder(resolve_drawing_color(c, ctx)),
+        None => *ctx,
+    };
+    let stroke = match props.outline.as_ref() {
+        Some(o) => resolve_outline(o, theme_ln, ctx, &ln_ctx),
+        // No `<a:ln>` at all: the `lnRef` is the whole outline, not just its
+        // defaults. 312 corpus shapes are in this case and PowerPoint strokes
+        // every one of them, so declining here is a missing outline rather
+        // than a conservative one.
+        None => theme_ln.and_then(|t| resolve_outline(t, None, &ln_ctx, &ln_ctx)),
+    };
 
     let direct_effects = props
         .effect_list
@@ -87,10 +109,12 @@ pub fn resolve_shape_visuals(
         resolve_theme_effects(style_effect_ref, theme, ctx)
     };
 
+    let stroke_color_defaulted = stroke.as_ref().is_some_and(|&(_, d)| d);
     ResolvedVisuals {
         fill,
-        stroke,
+        stroke: stroke.map(|(s, _)| s),
         effects,
+        stroke_color_defaulted,
     }
 }
 
@@ -322,11 +346,20 @@ pub fn resolve_blip_fill(fill: &crate::model::BlipFill, media: Option<&PartMedia
 
 // ── Outline → Stroke ────────────────────────────────────────────────────────
 
+/// Resolve one `<a:ln>` into a painter stroke, with `theme_ln` supplying every
+/// property the direct outline omits.
+///
+/// Two colour contexts, because the two outlines are written in different
+/// vocabularies: `ctx` resolves the shape's own colours, and `ln_ctx` is `ctx`
+/// with `phClr` bound to the `lnRef`'s colour, which is the only context the
+/// theme line style's `<a:schemeClr val="phClr"/>` means anything in. Passing
+/// one context for both would silently paint every inherited stroke black.
 fn resolve_outline(
     outline: &Outline,
     theme_ln: Option<&Outline>,
     ctx: &DrawingColorContext<'_>,
-) -> Option<ResolvedStroke> {
+    ln_ctx: &DrawingColorContext<'_>,
+) -> Option<(ResolvedStroke, bool)> {
     // Width: direct `@w` wins; else theme `lnRef`; else spec default 0.75pt.
     // OOXML `w` is EMU (12700 per pt).
     let width = outline
@@ -335,16 +368,28 @@ fn resolve_outline(
         .map(emu_to_pt)
         .unwrap_or_else(|| Pt::new(0.75));
 
-    // Pull the outline color from its fill. If the fill is non-solid or
-    // absent, default to black; Tier 0 cannot paint gradient strokes.
-    let color = match outline.fill.as_ref() {
-        Some(DrawingFill::Solid(c)) => resolve_drawing_color(c, ctx),
-        Some(DrawingFill::None) => return None,
-        Some(DrawingFill::Gradient(_) | DrawingFill::Blip(_) | DrawingFill::Pattern(_)) => {
+    // Pull the outline color from its fill. A direct fill wins; an outline
+    // with no fill of its own inherits the theme line style's, which is what
+    // `lnRef` exists for. Only when neither declares one is black correct.
+    let declared = outline
+        .fill
+        .as_ref()
+        .map(|f| (f, ctx))
+        .or_else(|| theme_ln.and_then(|t| t.fill.as_ref()).map(|f| (f, ln_ctx)));
+    let mut color_defaulted = false;
+    let color = match declared {
+        Some((DrawingFill::Solid(c), cx)) => resolve_drawing_color(c, cx),
+        Some((DrawingFill::None, _)) => return None,
+        Some((DrawingFill::Gradient(_) | DrawingFill::Blip(_) | DrawingFill::Pattern(_), _)) => {
             log::warn!("shape_visuals: non-solid stroke fill not yet supported");
             Rgba::BLACK
         }
-        Some(DrawingFill::Group) | None => Rgba::BLACK,
+        // `a:grpFill` on a stroke, or no colour anywhere in the cascade. Black
+        // is a guess in both cases, and the flag says so.
+        Some((DrawingFill::Group, _)) | None => {
+            color_defaulted = true;
+            Rgba::BLACK
+        }
     };
 
     let cap = outline
@@ -365,13 +410,16 @@ fn resolve_outline(
         .map(|d| map_line_dash(d, width))
         .unwrap_or(ResolvedDashPattern::Solid);
 
-    Some(ResolvedStroke {
-        width,
-        color,
-        dash,
-        cap,
-        join,
-    })
+    Some((
+        ResolvedStroke {
+            width,
+            color,
+            dash,
+            cap,
+            join,
+        },
+        color_defaulted,
+    ))
 }
 
 fn map_line_cap(cap: LineCap) -> ResolvedLineCap {
@@ -725,6 +773,138 @@ mod tests {
         assert_eq!(s.width, Pt::new(2.0));
         assert_eq!(s.color.to_rgb24(), 0xD99F34);
         assert_eq!(s.cap, ResolvedLineCap::Butt);
+        assert!(!v.stroke_color_defaulted, "the shape declared the colour");
+    }
+
+    /// A theme line style whose colour is the `phClr` placeholder, which is how
+    /// every one of the corpus's `lnStyleLst` entries is written.
+    fn theme_with_phclr_line(width_emu: i64) -> Theme {
+        use crate::model::DrawingColor;
+        Theme {
+            line_styles: vec![Outline {
+                width: Some(Dimension::new(width_emu)),
+                fill: Some(DrawingFill::Solid(DrawingColor::Scheme {
+                    name: crate::model::SchemeColorVal::PhClr,
+                    transforms: vec![],
+                })),
+                ..empty_outline()
+            }],
+            ..Theme::default()
+        }
+    }
+
+    /// §20.1.4.1.22: an `<a:ln>` that names no colour takes the theme line
+    /// style's, recoloured by the `lnRef`'s own `phClr` substitute — 179 corpus
+    /// shapes, every one of which used to be painted black.
+    #[test]
+    fn colourless_outline_takes_its_colour_from_the_line_ref() {
+        use crate::model::DrawingColor;
+        let props = shape_props(
+            None,
+            Some(Outline {
+                width: Some(Dimension::new(12_700)),
+                ..empty_outline()
+            }),
+            None,
+        );
+        let theme = theme_with_phclr_line(25_400);
+        let ln_ref = StyleMatrixRef {
+            idx: 1,
+            color: Some(DrawingColor::Srgb {
+                rgb: 0x4472C4,
+                transforms: vec![],
+            }),
+        };
+        let v = resolve_shape_visuals(
+            Some(&props),
+            Some(&ln_ref),
+            None,
+            None,
+            &DrawingColorContext::new(Some(&theme)),
+            None,
+        );
+        let s = v.stroke.expect("a colourless outline is still an outline");
+        assert_eq!(s.color.to_rgb24(), 0x4472C4, "phClr := the lnRef's colour");
+        // The direct `@w` still wins over the theme's 2pt.
+        assert_eq!(s.width, Pt::new(1.0));
+        assert!(!v.stroke_color_defaulted);
+    }
+
+    /// No `<a:ln>` at all: the `lnRef` is the whole outline. 312 corpus shapes,
+    /// which PowerPoint strokes and this resolver used to leave bare.
+    #[test]
+    fn line_ref_supplies_the_whole_outline_when_there_is_no_ln() {
+        use crate::model::DrawingColor;
+        let props = shape_props(None, None, None);
+        let theme = theme_with_phclr_line(25_400);
+        let ln_ref = StyleMatrixRef {
+            idx: 1,
+            color: Some(DrawingColor::Srgb {
+                rgb: 0xED7D31,
+                transforms: vec![],
+            }),
+        };
+        let v = resolve_shape_visuals(
+            Some(&props),
+            Some(&ln_ref),
+            None,
+            None,
+            &DrawingColorContext::new(Some(&theme)),
+            None,
+        );
+        let s = v.stroke.expect("the theme line style is the outline");
+        assert_eq!(s.color.to_rgb24(), 0xED7D31);
+        assert_eq!(s.width, Pt::new(2.0), "width comes from the theme too");
+        assert!(!v.stroke_color_defaulted);
+    }
+
+    /// The flag means *nothing declared a colour anywhere*, not "the stroke is
+    /// black". Without a `lnRef` there is nowhere else to look.
+    #[test]
+    fn colourless_outline_with_no_line_ref_reports_a_defaulted_colour() {
+        let props = shape_props(
+            None,
+            Some(Outline {
+                width: Some(Dimension::new(12_700)),
+                ..empty_outline()
+            }),
+            None,
+        );
+        let v = resolve_shape_visuals(
+            Some(&props),
+            None,
+            None,
+            None,
+            &DrawingColorContext::new(None),
+            None,
+        );
+        assert_eq!(v.stroke.unwrap().color.to_rgb24(), 0x000000);
+        assert!(
+            v.stroke_color_defaulted,
+            "black here is a guess, not a fact"
+        );
+    }
+
+    /// A shape with no `<a:ln>` and a `lnRef` the theme cannot satisfy stays
+    /// unstroked — the miss must not become an invented black outline.
+    #[test]
+    fn line_ref_out_of_range_leaves_the_shape_unstroked() {
+        let props = shape_props(None, None, None);
+        let theme = theme_with_phclr_line(25_400);
+        let ln_ref = StyleMatrixRef {
+            idx: 3,
+            color: None,
+        };
+        let v = resolve_shape_visuals(
+            Some(&props),
+            Some(&ln_ref),
+            None,
+            None,
+            &DrawingColorContext::new(Some(&theme)),
+            None,
+        );
+        assert!(v.stroke.is_none());
+        assert!(!v.stroke_color_defaulted);
     }
 
     #[test]

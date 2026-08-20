@@ -51,7 +51,8 @@
 
 use liteparse_ooxml::model::dimension::Dimension;
 use liteparse_ooxml::model::{
-    Alignment, ColorMap, DrawingFill, PresetGeometryDef, PresetShapeType, ShapeGeometry, Theme,
+    Alignment, ColorMap, DrawingFill, PresetGeometryDef, PresetShapeType, ShapeGeometry,
+    StyleMatrixRef, Theme,
 };
 use liteparse_ooxml::pptx::{
     self, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Spacing, TextBody, TextCascade,
@@ -139,12 +140,38 @@ pub struct SlideGeometry {
     /// cannot build — an unimplemented preset, or none declared. Their text is
     /// still laid out; only their ink is missing.
     pub unpainted_shapes: usize,
-    /// Painted shapes whose `<a:ln>` names no colour of its own, so the shared
-    /// resolver defaults it to black where DrawingML would inherit
-    /// `p:style/a:lnRef`. The census put this at 7.7% of strokes; it is the one
-    /// place this pass paints something *wrong* rather than painting nothing,
-    /// and it is counted rather than hidden until `p:style` is parsed.
+    /// Painted shapes whose stroke is black because **nothing** named a
+    /// colour — not the `<a:ln>`, and not the theme line style its
+    /// `p:style/a:lnRef` points at.
+    ///
+    /// Still the one place this pass paints something *wrong* rather than
+    /// painting nothing, but it now means what it says: before `p:style` was
+    /// parsed it also counted every outline whose colour was sitting in the
+    /// theme, unread.
     pub outlines_defaulted_black: usize,
+    /// Shapes carrying a `p:style` that the paint walk consulted. 2,181 on the
+    /// corpus, of which 1,744 are on slides and the rest on layouts and
+    /// masters.
+    pub shapes_with_style: usize,
+    /// Shapes whose fill came from the theme's `fillStyleLst` via `a:fillRef`,
+    /// because `spPr` declared no fill element at all. Counted after
+    /// resolution, so an `idx="0"` reference — 335 corpus shapes, more than
+    /// half of those that inherit — is not counted here.
+    pub fills_from_style_ref: usize,
+    /// Shapes stroked entirely from the theme's `lnStyleLst`, having no
+    /// `<a:ln>` of their own. This is ink the pass did not put down before,
+    /// which makes it the one counter here that can only grow the raster.
+    pub strokes_from_style_ref: usize,
+    /// Shapes that ask a style matrix for a fill or an outline — a non-zero
+    /// `idx`, with nothing declared locally — and get **nothing back**: the
+    /// theme part is missing, or its `fillStyleLst`/`lnStyleLst` is shorter
+    /// than the index.
+    ///
+    /// The honest residue of the two counters above. Without it a theme that
+    /// resolves to an empty matrix is indistinguishable from a corpus that
+    /// never asked, and the difference is a shape PowerPoint paints and we do
+    /// not.
+    pub style_refs_unresolved: usize,
     /// Per page, the command index of the full-slide background
     /// [`DrawCommand::Path`], when one was emitted. Parallel to `pages`.
     ///
@@ -321,6 +348,10 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         painted_shapes: 0,
         unpainted_shapes: 0,
         outlines_defaulted_black: 0,
+        shapes_with_style: 0,
+        fills_from_style_ref: 0,
+        strokes_from_style_ref: 0,
+        style_refs_unresolved: 0,
         inherited_shapes_painted: 0,
         inherited_shapes_unpainted: 0,
         inherited_shapes_with_text: 0,
@@ -366,6 +397,10 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
                 painted_shapes: &mut out.painted_shapes,
                 unpainted_shapes: &mut out.unpainted_shapes,
                 outlines_defaulted_black: &mut out.outlines_defaulted_black,
+                shapes_with_style: &mut out.shapes_with_style,
+                fills_from_style_ref: &mut out.fills_from_style_ref,
+                strokes_from_style_ref: &mut out.strokes_from_style_ref,
+                style_refs_unresolved: &mut out.style_refs_unresolved,
                 inherited_shapes_painted: &mut out.inherited_shapes_painted,
                 inherited_shapes_unpainted: &mut out.inherited_shapes_unpainted,
                 inherited_shapes_with_text: &mut out.inherited_shapes_with_text,
@@ -457,6 +492,10 @@ struct ShapeCtx<'a, 'r> {
     painted_shapes: &'a mut usize,
     unpainted_shapes: &'a mut usize,
     outlines_defaulted_black: &'a mut usize,
+    shapes_with_style: &'a mut usize,
+    fills_from_style_ref: &'a mut usize,
+    strokes_from_style_ref: &'a mut usize,
+    style_refs_unresolved: &'a mut usize,
     inherited_shapes_painted: &'a mut usize,
     inherited_shapes_unpainted: &'a mut usize,
     inherited_shapes_with_text: &'a mut usize,
@@ -680,18 +719,47 @@ fn paint_shape(shape: &Shape, from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) {
     if from.rung == Rung::Inherited && shape_text_len(shape) > 0 {
         *ctx.inherited_shapes_with_text += 1;
     }
-    // `p:style`'s `fillRef`/`lnRef`/`effectRef` are not parsed yet, so the
-    // three style arguments are `None` and 3,381 corpus shapes with no `spPr`
-    // fill element resolve to nothing. That is an *under*-paint: visible, but
-    // never misleading.
+    // §19.3.1.46 `p:style` — the theme-matrix references this shape inherits
+    // its fill and outline from when `spPr` declares none of its own. 2,181
+    // corpus shapes carry one; `a:fontRef` is deliberately not consulted here,
+    // because a run colour resolved in the paint walk and not in the text
+    // cascade would make the two disagree.
+    let style = shape.style.as_ref();
     let mut visuals = resolve_shape_visuals(
         Some(props),
-        None,
-        None,
-        None,
+        style.and_then(|s| s.line_ref.as_ref()),
+        style.and_then(|s| s.effect_ref.as_ref()),
+        style.and_then(|s| s.fill_ref.as_ref()),
         &DrawingColorContext::new(ctx.theme).with_color_map(ctx.color_map),
         Some(from.media),
     );
+    // Where the ink came from, read *before* the picture override below
+    // replaces the fill: a `p:pic` whose frame inherits a theme fill still
+    // inherited it, and the photograph that lands on top is a different fact.
+    // Both are tallied only once the shape is known to paint, so they stay
+    // subsets of `painted_shapes`.
+    let fill_from_ref = props.fill.is_none() && !matches!(visuals.fill, ResolvedFill::None);
+    let stroke_from_ref = props.outline.is_none() && visuals.stroke.is_some();
+    // A reference that named a matrix entry and came back empty. `idx == 0` is
+    // the spec's "no reference" sentinel — 335 corpus `fillRef`s use it — and
+    // is not a miss.
+    let asked = |r: Option<&StyleMatrixRef>| r.is_some_and(|r| r.idx != 0);
+    let missed_fill = props.fill.is_none()
+        && asked(style.and_then(|s| s.fill_ref.as_ref()))
+        && matches!(visuals.fill, ResolvedFill::None);
+    let missed_stroke = props.outline.is_none()
+        && asked(style.and_then(|s| s.line_ref.as_ref()))
+        && visuals.stroke.is_none();
+    if style.is_some() {
+        *ctx.shapes_with_style += 1;
+    }
+    // Counted here rather than beside the two "inherited" tallies below: a
+    // shape whose only ink was the reference that missed does not paint at
+    // all, and a miss that reported itself only on shapes that painted anyway
+    // would hide exactly the case it exists to expose.
+    if missed_fill || missed_stroke {
+        *ctx.style_refs_unresolved += 1;
+    }
     // §19.3.1.37: a `p:pic`'s image is its own `p:blipFill`, a sibling of
     // `spPr` — not an `spPr` fill element. So the picture's fill has to be
     // resolved separately and take precedence; reading `shape_properties`
@@ -757,8 +825,17 @@ fn paint_shape(shape: &Shape, from: Source<'_>, ctx: &mut ShapeCtx<'_, '_>) {
         return;
     };
 
-    if visuals.stroke.is_some() && props.outline.as_ref().is_some_and(|o| o.fill.is_none()) {
+    // Asked of the resolver rather than re-derived from `props`: whether a
+    // colourless `<a:ln>` is a defect now depends on what the `lnRef` found in
+    // the theme, and only the resolver did that lookup.
+    if visuals.stroke_color_defaulted {
         *ctx.outlines_defaulted_black += 1;
+    }
+    if fill_from_ref {
+        *ctx.fills_from_style_ref += 1;
+    }
+    if stroke_from_ref {
+        *ctx.strokes_from_style_ref += 1;
     }
     ctx.tally(from.rung, true);
     if matches!(visuals.fill, ResolvedFill::Blip(_)) {

@@ -27,8 +27,8 @@ pub use media::MediaCache;
 pub use package::{EMU_PER_POINT, Part, PresentationInfo, PresentationPackage, SlideParts, walk};
 pub use shapes::{
     AutoShape, Background, Connector, GraphicFrame, GraphicFramePayload, Group, Placeholder,
-    PlaceholderKind, Shape, ShapeKind, SlidePart, Table, TableCell, TableCellProperties, TableRow,
-    parse_shape_tree, parse_slide_part, visit_all,
+    PlaceholderKind, Shape, ShapeKind, ShapeStyle, SlidePart, Table, TableCell,
+    TableCellProperties, TableRow, parse_shape_tree, parse_slide_part, visit_all,
 };
 pub use text::{
     AutoNumberScheme, Bullet, ListStyle, Spacing, TextBody, TextParagraph, TextParagraphProperties,
