@@ -22,7 +22,9 @@ use crate::model::{AdjAngle, AdjCoord, AdjPoint, CustomGeometry, PathCommand, Pa
 use crate::render::dimension::Pt;
 use crate::render::geometry::{PtOffset, PtRect, PtSize};
 
-use super::guides::{GuideContext, evaluate_guides, resolve_adj_angle, resolve_adj_coord};
+use super::guides::{
+    GuideContext, evaluate_guides, evaluate_guides_into, resolve_adj_angle, resolve_adj_coord,
+};
 use super::{PathVerb, ShapePath, SubPath};
 
 pub fn build_custom(geom: &CustomGeometry, extent: PtSize) -> Option<ShapePath> {
@@ -51,18 +53,21 @@ pub fn build_custom(geom: &CustomGeometry, extent: PtSize) -> Option<ShapePath> 
 }
 
 fn build_subpath(geom: &CustomGeometry, path: &PathDef, extent: PtSize) -> Option<SubPath> {
-    let path_w = path.w.raw() as f64;
-    let path_h = path.h.raw() as f64;
-    if path_w <= 0.0 || path_h <= 0.0 {
-        return None;
-    }
+    // §20.1.9.15 @w/@h: "If this attribute is omitted, then a value of 0 is
+    // implied" — which names the shape's own coordinate space, not an empty
+    // path (see `path_space`). This is what makes the preset table work at
+    // all: 270 of the spec's 320 preset paths omit both attributes, and none
+    // of those 270 uses a literal coordinate, so every value in them is a
+    // guide resolved against this context.
+    let path_w = path_space(path.w.raw() as f64, extent.width.raw() as f64);
+    let path_h = path_space(path.h.raw() as f64, extent.height.raw() as f64);
     let ctx = GuideContext::new(path_w, path_h);
 
-    // Evaluate shape-level guides first (av_list + gd_list), then we're
-    // ready to resolve `AdjCoord::Guide` references within the commands.
+    // Evaluate shape-level guides first (av_list then gd_list, into one map:
+    // a computed guide routinely reads an adjust value), then we're ready to
+    // resolve `AdjCoord::Guide` references within the commands.
     let mut values = evaluate_guides(&geom.av_list, ctx);
-    let computed = evaluate_guides(&geom.gd_list, ctx);
-    values.extend(computed);
+    evaluate_guides_into(&mut values, &geom.gd_list, ctx);
 
     // Scale factors from path-local units → shape-local Pt.
     let sx = extent.width.raw() / path_w as f32;
@@ -111,20 +116,37 @@ fn build_subpath(geom: &CustomGeometry, path: &PathDef, extent: PtSize) -> Optio
     })
 }
 
+/// The coordinate space one axis of a path is expressed in: its own `@w`/`@h`
+/// when declared, else the shape's extent on that axis (§20.1.9.15).
+///
+/// A zero *extent* is not degenerate the way a zero path space is — a vertical
+/// line is authored as `cx=0, cy=N`, and its geometry is still a line. Falling
+/// back to a unit space keeps the guides evaluable; the scale factor is then
+/// `0 / 1`, which collapses every coordinate on that axis to 0. That is the
+/// line.
+fn path_space(declared: f64, extent: f64) -> f64 {
+    if declared > 0.0 {
+        declared
+    } else if extent > 0.0 {
+        extent
+    } else {
+        1.0
+    }
+}
+
 fn resolve_text_rect(
     geom: &CustomGeometry,
     path: &PathDef,
     rect: &crate::model::TextRect,
     extent: PtSize,
 ) -> Option<PtRect> {
-    let path_w = path.w.raw() as f64;
-    let path_h = path.h.raw() as f64;
-    if path_w <= 0.0 || path_h <= 0.0 {
-        return None;
-    }
+    // Same §20.1.9.15 rule as `build_subpath`: the text rect is resolved in
+    // the first path's space, which for an omitted @w/@h is the shape's own.
+    let path_w = path_space(path.w.raw() as f64, extent.width.raw() as f64);
+    let path_h = path_space(path.h.raw() as f64, extent.height.raw() as f64);
     let ctx = GuideContext::new(path_w, path_h);
     let mut values = evaluate_guides(&geom.av_list, ctx);
-    values.extend(evaluate_guides(&geom.gd_list, ctx));
+    evaluate_guides_into(&mut values, &geom.gd_list, ctx);
 
     let sx = extent.width.raw() / path_w as f32;
     let sy = extent.height.raw() / path_h as f32;
@@ -228,14 +250,24 @@ mod tests {
     }
 
     #[test]
-    fn zero_width_path_is_skipped() {
+    fn zero_width_path_resolves_in_shape_space() {
+        // §20.1.9.15: @w defaults to 0, which names the shape's own coordinate
+        // space rather than an empty path. The literal 100 in `rect_path` is
+        // then 100 Pt in a 10 Pt-wide shape — unscaled on x (the path space is
+        // the shape space), halved on y where @h = 50 against a 10 Pt height.
         let mut path = rect_path();
         path.w = emu(0);
         let geom = CustomGeometry {
             paths: vec![path],
             ..Default::default()
         };
-        assert!(build_custom(&geom, PtSize::new(Pt::new(10.0), Pt::new(10.0))).is_none());
+        let built = build_custom(&geom, PtSize::new(Pt::new(10.0), Pt::new(10.0)))
+            .expect("a zero-width path space is the shape's, not nothing");
+        let PathVerb::LineTo(p) = built.paths[0].verbs[1] else {
+            panic!("expected a lnTo second")
+        };
+        assert!((p.x.raw() - 100.0).abs() < 1e-3);
+        assert!((p.y.raw() - 0.0).abs() < 1e-3);
     }
 
     #[test]

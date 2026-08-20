@@ -67,38 +67,13 @@ pub enum PathVerb {
     Close,
 }
 
-/// §20.1.9.11's angle constants, in the `@stAng`/`@swAng` unit (60000ths of a
-/// degree). `QUARTER` is the spec's `cd4`, `HALF` its `cd2`, `THREE_QUARTER`
-/// its `3cd4` — named here because a preset generator writes them literally
-/// where a `custGeom` would reference the guide.
-pub mod turn {
-    pub const NONE: i64 = 0;
-    pub const QUARTER: i64 = 5_400_000;
-    pub const HALF: i64 = 10_800_000;
-    pub const THREE_QUARTER: i64 = 16_200_000;
-}
-
-/// One `<a:arcTo>`: a sweep of `swing` starting at `start`, from wherever the
-/// pen already is.
-///
-/// The angles pass through in OOXML's own units — the painter applies them
-/// directly to a clockwise-from-3-o'clock parametrisation, so converting here
-/// would only invite a second conversion downstream.
-pub(crate) fn arc(rx: Pt, ry: Pt, start: i64, swing: i64) -> PathVerb {
-    PathVerb::ArcTo {
-        radii: PtSize::new(rx, ry),
-        start_angle: Dimension::new(start),
-        swing_angle: Dimension::new(swing),
-    }
-}
-
 /// Build a `ShapePath` for a parsed `ShapeGeometry` given the shape's
 /// rendered extent.
 ///
 /// Returns `None` if:
-///  * a preset has no generator registered (Tier 0 supports `line` and
-///    `rect`; callers should log once and fall back to a stub bounding box),
-///  * the extent is zero in either dimension (nothing to draw).
+///  * the `prst` name has no definition in §20.1.9.18 — i.e. it is not one of
+///    the 187 the spec defines (callers should log once and skip the shape),
+///  * the extent is zero in both dimensions (nothing to draw).
 pub fn build_geometry(geometry: &ShapeGeometry, extent: PtSize) -> Option<ShapePath> {
     // Reject only fully zero-extent shapes. Lines are commonly authored as
     // `cx=0, cy=N` (vertical) or `cx=N, cy=0` (horizontal); both are valid
@@ -148,8 +123,13 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_preset_returns_none() {
+    fn preset_without_a_definition_returns_none() {
+        // The only presets that do not build are the ones §20.1.9.18 does not
+        // define — a `prst` attribute naming a shape that does not exist.
         let extent = PtSize::new(Pt::new(30.0), Pt::new(20.0));
-        assert!(build_geometry(&preset(PresetShapeType::Star12), extent).is_none());
+        assert!(build_geometry(&preset(PresetShapeType::Star12), extent).is_some());
+        assert!(
+            build_geometry(&preset(PresetShapeType::Other("nonesuch".into())), extent).is_none()
+        );
     }
 }

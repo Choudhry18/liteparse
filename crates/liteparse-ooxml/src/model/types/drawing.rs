@@ -640,7 +640,9 @@ pub enum ShapeGeometry {
 }
 
 /// §20.1.10.56 ST_ShapeType — preset shape types (subset).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Hash` is derived so the preset geometry table can key on the variant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PresetShapeType {
     Rect,
     RoundRect,
@@ -656,6 +658,7 @@ pub enum PresetShapeType {
     Star4,
     Star5,
     Star6,
+    Star7,
     Star8,
     Star10,
     Star12,
@@ -663,6 +666,8 @@ pub enum PresetShapeType {
     Star24,
     Star32,
     Line,
+    /// §20.1.10.56 `lineInv` — the `line` preset drawn bottom-left to top-right.
+    LineInv,
     Plus,
     Can,
     Cube,

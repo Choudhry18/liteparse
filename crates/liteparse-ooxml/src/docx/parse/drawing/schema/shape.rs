@@ -224,7 +224,11 @@ impl<'de> Deserialize<'de> for PresetShapeTypeXml {
     }
 }
 
-fn map_preset_shape(val: &str) -> PresetShapeType {
+/// `&str` → [`PresetShapeType`], and the only direction that mapping exists in.
+/// The preset geometry table keys itself by running its own names through this
+/// function (`shape_geometry::presets::table`), so an unmapped name lands on
+/// `Other` on both sides and still resolves.
+pub fn map_preset_shape(val: &str) -> PresetShapeType {
     use PresetShapeType as P;
     match val {
         "rect" => P::Rect,
@@ -241,6 +245,7 @@ fn map_preset_shape(val: &str) -> PresetShapeType {
         "star4" => P::Star4,
         "star5" => P::Star5,
         "star6" => P::Star6,
+        "star7" => P::Star7,
         "star8" => P::Star8,
         "star10" => P::Star10,
         "star12" => P::Star12,
@@ -248,6 +253,7 @@ fn map_preset_shape(val: &str) -> PresetShapeType {
         "star24" => P::Star24,
         "star32" => P::Star32,
         "line" => P::Line,
+        "lineInv" => P::LineInv,
         "plus" => P::Plus,
         "can" => P::Can,
         "cube" => P::Cube,

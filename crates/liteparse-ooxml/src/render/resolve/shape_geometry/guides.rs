@@ -56,12 +56,23 @@ pub type GuideValues = HashMap<String, f64>;
 /// but structurally-valid input).
 pub fn evaluate_guides(guides: &[GeomGuide], ctx: GuideContext) -> GuideValues {
     let mut values = GuideValues::new();
+    evaluate_guides_into(&mut values, guides, ctx);
+    values
+}
+
+/// Evaluate `guides` with `values` already in scope, adding to it.
+///
+/// §20.1.9.1 vs §20.1.9.10: `avLst` and `gdLst` are one namespace evaluated in
+/// document order, and the whole point of an adjust value is that the computed
+/// guides read it — `roundRect`'s `a` is `pin 0 adj 50000`. Evaluating the two
+/// lists into separate maps silently resolves every such reference to 0, which
+/// is not a missing corner radius but a *square* one.
+pub fn evaluate_guides_into(values: &mut GuideValues, guides: &[GeomGuide], ctx: GuideContext) {
     for guide in guides {
-        if let Some(v) = evaluate_formula(&guide.formula, &values, ctx) {
+        if let Some(v) = evaluate_formula(&guide.formula, values, ctx) {
             values.insert(guide.name.clone(), v);
         }
     }
-    values
 }
 
 /// Resolve an `AdjCoord` (literal or guide reference) to a concrete value.

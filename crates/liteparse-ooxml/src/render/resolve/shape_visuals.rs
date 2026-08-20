@@ -10,8 +10,8 @@
 use crate::model::dimension::{Dimension, Emu};
 use crate::model::{
     BlipFillKind, DrawingFill, Effect, GlowEffect, InnerShadowEffect, LineCap, LineDash, LineJoin,
-    OuterShadowEffect, Outline, PathFillMode, PresetShadowEffect, ReflectionEffect,
-    ShapeProperties, SoftEdgeEffect, StyleMatrixRef, Theme,
+    OuterShadowEffect, Outline, PresetShadowEffect, ReflectionEffect, ShapeProperties,
+    SoftEdgeEffect, StyleMatrixRef, Theme,
 };
 use crate::render::dimension::Pt;
 use crate::render::geometry::PtOffset;
@@ -243,12 +243,6 @@ fn resolve_theme_effects(
         return Vec::new();
     };
     resolve_effects(&list.effects, ctx)
-}
-
-/// Most preset shapes default the fill mode from `<a:path>`; for Tier 0
-/// presets without a path-level fill directive, callers can read this.
-pub fn default_path_fill_for_stroked_shape() -> PathFillMode {
-    PathFillMode::None
 }
 
 // ── Fills ───────────────────────────────────────────────────────────────────

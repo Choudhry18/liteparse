@@ -180,3 +180,30 @@ The fuzz harness corrupts every attribute value in the `docx_files` corpus
 
 Keeping this list current matters: it is what makes a future re-sync against a
 newer dxpdf tractable.
+
+## Second vendored source: the DrawingML preset shape table
+
+`assets/preset_shapes.xml` is **not** from dxpdf. It is the ECMA-376 Part 1
+§20.1.9.18 (`ST_ShapeType`) preset shape definition table — the 187 shapes
+PowerPoint and Word offer in their shape gallery, each expressed as the same
+`avLst`/`gdLst`/`rect`/`pathLst` content model as `<a:custGeom>`.
+
+Upstream copy: `presetShapeDefinitions.xml` as redistributed by the
+[Apache POI](https://poi.apache.org/) project under the **Apache License 2.0**:
+
+```
+poi/src/main/resources/org/apache/poi/sl/draw/geom/presetShapeDefinitions.xml
+```
+
+`assets/minify_presets.py` regenerates our copy and documents the two
+transformations applied (key each preset by attribute rather than by element
+name; drop the `ahLst` and `cxnLst` subtrees, which are UI drag handles and
+connector attachment points that nothing here reads). Everything the geometry
+evaluator consumes is verbatim.
+
+Why vendored rather than transcribed: a preset shape *is* a custom geometry
+with a name, and `render/resolve/shape_geometry/` already implements all 17
+guide operators and every path verb. A hand-written generator per shape would
+be 187 opportunities to disagree with the spec — the four that existed before
+the table did produced identical paths for `rect`, `line` and `ellipse`, and a
+*wrong* text rect for `roundRect`.

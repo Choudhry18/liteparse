@@ -1,48 +1,38 @@
-//! Preset shape generators (§20.1.9.18 ST_ShapeType).
+//! Preset shapes (§20.1.9.18 ST_ShapeType).
 //!
-//! Each generator is a pure function `PtSize → ShapePath`. Dispatch by
-//! variant lives in [`build_preset`]. Unimplemented presets return `None`
-//! and log once; callers should fall back to the shape's bounding box or
-//! skip the shape.
+//! A preset *is* a custom geometry with a name: the same `avLst` + `gdLst` +
+//! `rect` + `pathLst` content model, evaluated by the same guide machinery.
+//! So there are no generators here — [`table`] holds the spec's own definition
+//! for all 187 of them and [`build_preset`] runs it through the
+//! `<a:custGeom>` evaluator.
 //!
-//! Tier 0 supports only `line` and `rect` — the minimum to validate the
-//! pipeline end-to-end. Tier 1 adds the common ~20 shapes; Tier 2 adds the
-//! remaining ~60; Tier 3 completes the spec's ~200.
+//! Four shapes (`rect`, `line`/`straightConnector1`, `roundRect`, `ellipse`)
+//! did have hand-written generators, from before the table existed. A
+//! differential against the table retired them: `rect`, `line` and `ellipse`
+//! produced the identical path, and `roundRect` produced the identical path
+//! with a *wrong* text rect — the hand version inset it by the full corner
+//! radius where §20.1.9.22 insets it by 29.289% of that (`il = x1 * 29289 /
+//! 100000`, the sagitta of a 45° arc). One source of truth is worth the
+//! ~0.5µs per shape the table path costs over a bespoke one.
 //!
-//! `roundRect`, `ellipse` and `straightConnector1` are here ahead of the rest
-//! of tier 1 because the PPTX paint census counted what their absence costs:
-//! of 5,848 corpus shapes that put ink on a slide, `rect`/`line`/`custGeom`
-//! build 62.9% and these three take that to 87.1%. The shortfall is not spread
-//! evenly — it is every rounded panel and every bullet dot — so shipping fills
-//! without them drops a fifth of the ink *selectively*, which reads as a layout
-//! bug rather than as missing coverage.
+//! A preset returns `None` only when §20.1.9.18 does not define the name at
+//! all, i.e. `PresetShapeType::Other`. Callers log once and skip the shape;
+//! nothing here approximates a shape by its bounding box.
 
-mod ellipse;
-mod line;
-mod rect;
-mod round_rect;
+pub mod table;
 
-use crate::model::{PresetGeometryDef, PresetShapeType};
+use crate::model::PresetGeometryDef;
 use crate::render::geometry::PtSize;
 
 use super::ShapePath;
 
-/// Dispatch a preset to its generator. Returns `None` for presets not yet
-/// implemented; the call site is expected to log.
+/// Build a preset from the spec table. `None` when §20.1.9.18 defines no such
+/// shape; the call site is expected to log.
 pub fn build_preset(def: &PresetGeometryDef, extent: PtSize) -> Option<ShapePath> {
-    match def.preset {
-        // §20.1.9.18: `straightConnector1` is a `line` — the connector's
-        // endpoints are its own box's corners, and the flips in `a:xfrm` are
-        // what point it the other way.
-        PresetShapeType::Line | PresetShapeType::StraightConnector1 => Some(line::build(extent)),
-        PresetShapeType::Rect => Some(rect::build(extent)),
-        PresetShapeType::RoundRect => Some(round_rect::build(&def.adjust_values, extent)),
-        PresetShapeType::Ellipse => Some(ellipse::build(extent)),
-        _ => {
-            log::warn!(
-                "shape_geometry: preset {:?} not yet implemented",
-                def.preset
-            );
+    match table::resolve(&def.preset, &def.adjust_values) {
+        Some(geom) => super::custom::build_custom(&geom, extent),
+        None => {
+            log::warn!("shape_geometry: preset {:?} has no definition", def.preset);
             None
         }
     }
@@ -51,6 +41,7 @@ pub fn build_preset(def: &PresetGeometryDef, extent: PtSize) -> Option<ShapePath
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PresetShapeType;
     use crate::render::dimension::Pt;
 
     fn def(preset: PresetShapeType) -> PresetGeometryDef {
@@ -79,9 +70,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_preset_returns_none() {
+    fn table_preset_dispatches() {
+        // Star12 has no generator of its own and never will: it comes from the
+        // vendored spec table like every other shape outside the four above.
         let p = build_preset(
             &def(PresetShapeType::Star12),
+            PtSize::new(Pt::new(10.0), Pt::new(20.0)),
+        );
+        assert!(p.is_some());
+    }
+
+    #[test]
+    fn preset_without_a_definition_returns_none() {
+        let p = build_preset(
+            &def(PresetShapeType::Other("nonesuch".into())),
             PtSize::new(Pt::new(10.0), Pt::new(20.0)),
         );
         assert!(p.is_none());
