@@ -19,12 +19,15 @@ use liteparse_ooxml::pptx::{
     PlaceholderTextStyles, PresentationPackage, ResolvedTextStyle, Shape, ShapeKind, Table,
     TextBody, TextCascade, TextParagraph, TextStyles,
 };
+use liteparse_ooxml::render::layout::draw_command::ResolvedFill;
 use liteparse_ooxml::render::resolve::images::PartMedia;
+use liteparse_ooxml::render::resolve::shape_visuals::resolve_blip_fill;
 use std::collections::HashMap;
 
 use crate::error::LiteParseError;
 use crate::markdown_layout::{Block, Cell};
 use crate::office::inline::{Chunk, Fmt, render_chunks};
+use crate::types::{ExtractedImage, Rect};
 
 /// Two shapes whose tops differ by less than this sit on the same visual row
 /// and are ordered left-to-right. 0.25 in, generous for a line height, so the
@@ -47,6 +50,36 @@ pub struct EmitOptions {
     /// LibreOffice renders none of it, so this is the single largest content
     /// difference between the native and converted paths.
     pub notes: bool,
+    /// Emit `Block::Figure` refs for the deck's pictures. Mirrors the PDF and
+    /// DOCX gate, `image_mode != Off`.
+    pub figures: bool,
+    /// Keep the bytes behind those pictures in [`NativeDeck::images`]. Mirrors
+    /// `effective_extract_images`.
+    ///
+    /// Separate from `figures` because the two config gates are separate: an
+    /// `image_mode = Off` parse with `extract_images` on wants the bytes and
+    /// no markdown refs, and the PDF and DOCX paths both honour that pair.
+    /// **Ids do not depend on either flag** — the picture walk assigns them
+    /// whenever it runs at all, so `img_p3_2` names the same picture however
+    /// the caller asked for it.
+    pub images: bool,
+}
+
+/// What one native-parsed deck yields: the block stream, and the pictures
+/// behind whatever `Block::Figure`s are in it.
+///
+/// One walk produces both, which is the structural difference from the DOCX
+/// path. There, ids come from the layout walk and figures from the structure
+/// walk, so `docx_layout::NativeImages` has to carry a media-pointer → id FIFO
+/// to rejoin them. A slide's shapes already carry composed geometry *and* their
+/// reading order, so the id can be assigned where the figure is emitted and the
+/// join never has to exist.
+pub struct NativeDeck {
+    pub blocks: Vec<(Block, BlockSource)>,
+    /// Empty unless [`EmitOptions::images`] asked for the bytes. Placement
+    /// order, deduplicated: repeats carry `duplicate_of` and share the
+    /// canonical entry's `Arc`, matching the PDF and DOCX contract.
+    pub images: Vec<ExtractedImage>,
 }
 
 /// Where an emitted [`Block`] came from.
@@ -79,16 +112,19 @@ pub enum BlockSource {
 /// retrofitted with across four separate fail-closed classes.
 pub fn pptx_to_blocks(data: &[u8], opts: EmitOptions) -> Result<Vec<Block>, LiteParseError> {
     Ok(emit_with_sources(data, opts)?
+        .blocks
         .into_iter()
         .map(|(b, _)| b)
         .collect())
 }
 
-/// Emit blocks tagged with the slide they came from.
-pub fn emit_with_sources(
-    data: &[u8],
-    opts: EmitOptions,
-) -> Result<Vec<(Block, BlockSource)>, LiteParseError> {
+/// Emit blocks tagged with the slide they came from, and the pictures behind
+/// their figures.
+///
+/// Returns the pair rather than the blocks alone so that a caller cannot ask
+/// for figures and quietly drop the bytes those refs name — the refs would
+/// point at files nothing ever wrote.
+pub fn emit_with_sources(data: &[u8], opts: EmitOptions) -> Result<NativeDeck, LiteParseError> {
     let pkg = pptx::walk(data)
         .map_err(|e| LiteParseError::Conversion(format!("pptx parse failed: {e}")))?;
     Ok(Deck::new(&pkg).emit(&pkg, opts))
@@ -209,6 +245,22 @@ pub struct PreparedSlide<'d> {
     /// gets and the boxes the geometry pass reports are the same shapes by
     /// construction.
     pub inherited_text: [Vec<&'d Shape>; 2],
+    /// The inherited shapes that are **pictures**: `[master, layout]`, parallel
+    /// to `inherited`, groups already flattened.
+    ///
+    /// Unfiltered, and that is the difference from `inherited_text` beside it.
+    /// The furniture rule there exists because reprinting a layout's speaker
+    /// banner on all 47 slides that use the layout is a worse markdown than
+    /// omitting it. A repeated *picture* has an answer that repeated text does
+    /// not: the dedup contract gives every placement its own `name`, points
+    /// them all at one canonical `path`, and `rewrite_duplicate_image_refs`
+    /// resolves the refs — so 3,602 corpus placements cost 1,322 files.
+    ///
+    /// The conversion path this replaces already emits them, which is what
+    /// settles it: LibreOffice flattens the master into every page, so
+    /// `--no-office-native` prints 53 refs from 4 files on `bud_cnos` where
+    /// this path printed none. Emitting them is parity, not noise.
+    pub inherited_figures: [Vec<&'d Shape>; 2],
     /// Whether each arm of `inherited` is empty because it was **declined**
     /// rather than because the part had nothing to give: `[master, layout]`,
     /// parallel to `inherited`.
@@ -452,6 +504,14 @@ impl Deck {
                 .collect()
         });
 
+        // Same placement as `inherited_text`, and for the same reason: what
+        // comes out of `prepare` should be exactly what the walks may show.
+        let inherited_figures = inherited.map(|shapes| {
+            let mut found = Vec::new();
+            collect_figure_shapes(shapes, &mut found);
+            found
+        });
+
         let master = slide
             .master
             .as_ref()
@@ -474,6 +534,7 @@ impl Deck {
             color_map,
             inherited,
             inherited_text,
+            inherited_figures,
             declined,
             media: self.media.get(Some(slide.slide.path.as_str())),
             inherited_media: [self.media.get(master_path), self.media.get(layout_path)],
@@ -487,27 +548,43 @@ impl Deck {
         })
     }
 
-    fn emit(&mut self, pkg: &PresentationPackage, opts: EmitOptions) -> Vec<(Block, BlockSource)> {
+    fn emit(&mut self, pkg: &PresentationPackage, opts: EmitOptions) -> NativeDeck {
         let mut out = Vec::new();
+        let mut figures = FigureSink::default();
 
         for (idx, slide) in pkg.slides.iter().enumerate() {
             let Some(prepared) = self.prepare(pkg, slide) else {
                 continue;
             };
+            figures.start_slide();
             let mut ctx = SlideCtx {
                 cascade: prepared.cascade(),
                 part: &slide.slide,
+                media: prepared.media,
                 package: &pkg.package,
                 opts,
+                page: (idx + 1) as u32,
+                figures: &mut figures,
             };
             for read in slide_reading_order(&prepared) {
                 // The part an `r:id` resolves in — see [`Reading::rung`]. The
                 // fallback cannot fire: a rung contributes shapes only when
                 // `inherited_rungs` found its part, which is the same `Option`.
-                ctx.part = match read.rung {
-                    Some(0) => slide.master.as_ref().unwrap_or(&slide.slide),
-                    Some(_) => slide.layout.as_ref().unwrap_or(&slide.slide),
-                    None => &slide.slide,
+                //
+                // `media` moves with `part` and for the same reason: a layout
+                // logo's `rId2` and the slide's `rId2` are different pictures,
+                // so a figure resolved against the wrong table would extract a
+                // real image the author never put on that slide.
+                (ctx.part, ctx.media) = match read.rung {
+                    Some(0) => (
+                        slide.master.as_ref().unwrap_or(&slide.slide),
+                        prepared.inherited_media[0],
+                    ),
+                    Some(_) => (
+                        slide.layout.as_ref().unwrap_or(&slide.slide),
+                        prepared.inherited_media[1],
+                    ),
+                    None => (&slide.slide, prepared.media),
                 };
                 emit_shape(read.shape, &mut ctx, &mut out, BlockSource::Slide(idx));
             }
@@ -516,6 +593,7 @@ impl Deck {
             // leaving it pointing at whichever rung happened to sort last would
             // be a bug that only shows on slides that inherit text.
             ctx.part = &slide.slide;
+            ctx.media = prepared.media;
 
             if opts.notes
                 && let Some(notes) = &slide.notes
@@ -524,7 +602,14 @@ impl Deck {
                 emit_notes(&nshapes, &mut ctx, &mut out, idx);
             }
         }
-        out
+        NativeDeck {
+            blocks: out,
+            images: if opts.images {
+                figures.images
+            } else {
+                Vec::new()
+            },
+        }
     }
 
     /// Build whichever cascade rungs this slide's layout and master have not
@@ -622,14 +707,192 @@ fn inherited_shapes(shapes: &[Shape]) -> Vec<Shape> {
     kept
 }
 
+// ── figures ─────────────────────────────────────────────────────────────────
+
+/// Assigns figure ids and accumulates the bytes behind them, deck-wide.
+///
+/// Ids follow the platform extractor's `p{page}_{n}` naming, 1-based on both
+/// halves, so `img_{id}.{ext}` file names line up with the PDF and DOCX paths'.
+/// A slide *is* a page, so `page` is intrinsic here rather than recovered.
+///
+/// **`n` counts in reading order, not draw order**, which is the one place this
+/// diverges from its siblings. Draw order is available — it is source order —
+/// but using it would mean a second walk purely to number things, and reading
+/// order is the order the `![](…)` refs appear in the markdown, so a reader
+/// scanning down the page sees `_1` before `_2`. The platform's caveat about
+/// index drift (its extractor increments even for images it skips) already
+/// means these indices are names, not positions.
+#[derive(Default)]
+struct FigureSink {
+    images: Vec<ExtractedImage>,
+    /// Same media `Arc` ⇒ same bytes. Free dedup for the repeated-logo case,
+    /// which on this corpus is 3,602 placements behind 1,322 distinct images —
+    /// and `MediaCache` pools bytes by package path, so a logo a slide and its
+    /// master both reference is one allocation and hits here rather than in
+    /// the hash map below.
+    by_ptr: HashMap<usize, usize>,
+    /// Distinct rels can still hold identical bytes; hash → candidate
+    /// canonical indices, confirmed by full compare like the DOCX path's.
+    by_hash: HashMap<u64, Vec<usize>>,
+    /// 1-based within the current slide, reset by [`FigureSink::start_slide`].
+    n: u32,
+}
+
+impl FigureSink {
+    fn start_slide(&mut self) {
+        self.n = 0;
+    }
+
+    /// Record one placed picture and return the `(id, extension)` its
+    /// `Block::Figure` should carry, or `None` for media we do not surface
+    /// bytes for — the 29 corpus EMF references and the 154 SVG-only blips,
+    /// which have no raster fallback anywhere in the package.
+    fn place(
+        &mut self,
+        blip: &liteparse_ooxml::render::layout::draw_command::ResolvedBlip,
+        page: u32,
+        bbox: Rect,
+    ) -> Option<(String, String)> {
+        use std::hash::{Hash, Hasher};
+
+        let ext = super::docx_layout::media_extension(blip.format)?;
+        self.n += 1;
+        let id = format!("p{page}_{}", self.n);
+        let ptr = blip.data.as_ptr() as usize;
+
+        let canonical = self.by_ptr.get(&ptr).copied().or_else(|| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            blip.data.hash(&mut h);
+            self.by_hash
+                .get(&h.finish())?
+                .iter()
+                .copied()
+                .find(|&i| *self.images[i].bytes == *blip.data)
+        });
+
+        let entry = match canonical {
+            Some(ci) => {
+                let canonical = &self.images[ci];
+                ExtractedImage {
+                    id: id.clone(),
+                    name: format!("img_{id}.{ext}"),
+                    path: None,
+                    page,
+                    bbox,
+                    width: canonical.width,
+                    height: canonical.height,
+                    rotation: 0.0,
+                    format: ext.to_string(),
+                    duplicate_of: Some(canonical.id.clone()),
+                    bytes: std::sync::Arc::clone(&canonical.bytes),
+                }
+            }
+            None => {
+                let bytes = std::sync::Arc::new(blip.data.to_vec());
+                // The *natural* size of the image, not the placed box —
+                // `bbox` already carries the placement. A crop is not applied
+                // to either: `src_rect` describes a visible sub-rectangle the
+                // bytes still contain, and 44% of corpus pictures declare one,
+                // so re-encoding to honour it would re-encode nearly half the
+                // corpus to change a number no consumer reads.
+                let (width, height) =
+                    image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+                        .with_guessed_format()
+                        .ok()
+                        .and_then(|r| r.into_dimensions().ok())
+                        .unwrap_or((0, 0));
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                blip.data.hash(&mut h);
+                self.by_hash
+                    .entry(h.finish())
+                    .or_default()
+                    .push(self.images.len());
+                self.by_ptr.insert(ptr, self.images.len());
+                ExtractedImage {
+                    id: id.clone(),
+                    name: format!("img_{id}.{ext}"),
+                    path: None,
+                    page,
+                    bbox,
+                    width,
+                    height,
+                    rotation: 0.0,
+                    format: ext.to_string(),
+                    duplicate_of: None,
+                    bytes,
+                }
+            }
+        };
+        self.images.push(entry);
+        Some((id, ext.to_string()))
+    }
+}
+
+/// The blip fill a shape carries as its *picture*, if it is one.
+///
+/// Two shapes qualify and the second is the one the census had to find:
+///
+/// * `p:pic` — §19.3.1.37, the picture frame, whose image is its own
+///   `p:blipFill` sibling of `spPr` rather than an `spPr` fill.
+/// * **a `p:sp` with a blip fill and no text** — a picture in all but name.
+///   One corpus deck (`twinning_the_results_reviewed`) declares *zero* `p:pic`
+///   and puts all 37 of its images on 56 such shapes, so a `p:pic`-only rule
+///   takes that deck from the conversion path's 45 refs and 29 files to
+///   nothing at all.
+///
+/// The text test is what separates the two populations, and it separates them
+/// almost perfectly: 140 of 141 slide-level blip-filled `p:sp`s carry no text
+/// (pictures), while 27 of 29 layout-level ones do (a template banner *behind*
+/// a heading, which is a backdrop and not a figure).
+fn picture_fill(shape: &Shape) -> Option<&liteparse_ooxml::model::BlipFill> {
+    match &shape.kind {
+        ShapeKind::Picture(pic) => Some(&pic.blip_fill),
+        ShapeKind::AutoShape(sp) => {
+            if shape_has_text(sp) {
+                return None;
+            }
+            match sp.properties.as_ref()?.fill.as_ref()? {
+                liteparse_ooxml::model::DrawingFill::Blip(fill) => Some(fill),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a `p:sp` shows any text at all.
+///
+/// An absent `p:txBody` and one holding only empty runs are different things in
+/// the model and the same thing to a reader, which is the distinction that
+/// matters for [`picture_fill`].
+fn shape_has_text(sp: &liteparse_ooxml::pptx::AutoShape) -> bool {
+    sp.text.as_ref().is_some_and(|body| {
+        body.paragraphs
+            .iter()
+            .any(|para| !para.text().trim().is_empty())
+    })
+}
+
 struct SlideCtx<'a> {
     cascade: TextCascade<'a>,
     /// The slide part, for resolving relationships. Hyperlinks need the raw
     /// external target and SmartArt needs a resolved part path, so both the
     /// relationship table and the part's own directory are required.
     part: &'a pptx::Part,
+    /// The `r:embed` table for the part `part` points at, retargeted with it.
+    ///
+    /// Two fields moving together rather than one derived from the other,
+    /// because they come from different places: `part` is the package part and
+    /// this is `Deck`'s per-part media cache. They must stay in step — an
+    /// inherited picture resolved against the *slide's* table returns a real
+    /// photograph from an unrelated relationship, the same trap `Reading::rung`
+    /// exists to close for hyperlinks.
+    media: &'a PartMedia,
     package: &'a liteparse_ooxml::docx::zip::PackageContents,
     opts: EmitOptions,
+    /// 1-based page number of the slide being emitted, for figure ids.
+    page: u32,
+    figures: &'a mut FigureSink,
 }
 
 // ── reading order ───────────────────────────────────────────────────────────
@@ -697,6 +960,16 @@ pub struct Reading<'a> {
     /// are unrelated relationships, and a hyperlink read from the wrong table
     /// is a real URL pointing somewhere the author never wrote.
     pub rung: Option<usize>,
+    /// Whether this shape is in the order as a **picture** — a `p:pic`, or a
+    /// textless blip-filled `p:sp` — rather than as text.
+    ///
+    /// Carried rather than re-derived because the two populations arrive from
+    /// different lists (`inherited_text` and `inherited_figures`) and a
+    /// consumer asking "is this inherited?" is no longer asking the same
+    /// question as "is this inherited text?". The geometry pass's
+    /// `inherited_text_laid_out` counter is exactly that consumer: keyed on
+    /// `rung` alone it would silently start counting logos.
+    pub figure: bool,
 }
 
 /// Everything a slide shows, in one reading order: its own shapes and the
@@ -721,16 +994,26 @@ pub fn slide_reading_order<'a>(prepared: &'a PreparedSlide<'_>) -> Vec<Reading<'
         .shapes
         .iter()
         .filter(|s| !is_chrome(s.placeholder.as_ref()))
-        .map(|shape| Reading { shape, rung: None })
-        .collect();
-    for (rung, shapes) in prepared.inherited_text.iter().enumerate() {
-        // No chrome filter: `is_chrome` reads a `p:ph`, and an inherited shape
-        // has none by construction — `inherited_shapes` dropped every
-        // placeholder before these reached the cache.
-        v.extend(shapes.iter().map(|&shape| Reading {
+        .map(|shape| Reading {
             shape,
-            rung: Some(rung),
-        }));
+            rung: None,
+            figure: picture_fill(shape).is_some(),
+        })
+        .collect();
+    for (figure, rung_shapes) in [
+        (false, &prepared.inherited_text),
+        (true, &prepared.inherited_figures),
+    ] {
+        for (rung, shapes) in rung_shapes.iter().enumerate() {
+            // No chrome filter: `is_chrome` reads a `p:ph`, and an inherited
+            // shape has none by construction — `inherited_shapes` dropped every
+            // placeholder before these reached the cache.
+            v.extend(shapes.iter().map(|&shape| Reading {
+                shape,
+                rung: Some(rung),
+                figure,
+            }));
+        }
     }
     v.sort_by_key(|r| reading_key(r.shape));
     v
@@ -778,6 +1061,25 @@ fn collect_text_shapes<'a>(shapes: &'a [Shape], out: &mut Vec<(&'a Shape, String
     }
 }
 
+/// Every picture in a rung's tree, groups flattened.
+///
+/// Flattened for the same reason [`collect_text_shapes`] is: `inherited_shapes`
+/// has already composed group transforms, so a leaf carries its own composed
+/// rectangle and needs no parent to place it.
+///
+/// Uses the same [`picture_fill`] test as the slide's own shapes, so a layout's
+/// blip-filled panel and a slide's are the same kind of thing to this module.
+fn collect_figure_shapes<'a>(shapes: &'a [Shape], out: &mut Vec<&'a Shape>) {
+    for shape in shapes {
+        if picture_fill(shape).is_some() {
+            out.push(shape);
+        }
+        if let ShapeKind::Group(group) = &shape.kind {
+            collect_figure_shapes(&group.children, out);
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn is_title(ph: Option<&Placeholder>) -> bool {
     matches!(
@@ -816,6 +1118,13 @@ fn emit_shape(
     out: &mut Vec<(Block, BlockSource)>,
     src: BlockSource,
 ) {
+    // A shape is a picture *or* it is text — never both. `picture_fill`
+    // declines a blip-filled shape that carries text, because there the image
+    // is a backdrop the text sits on and the text is the content.
+    if let Some(fill) = picture_fill(shape) {
+        emit_figure(shape, fill, ctx, out, src);
+        return;
+    }
     match &shape.kind {
         ShapeKind::AutoShape(sp) => {
             if let Some(body) = &sp.text {
@@ -835,11 +1144,57 @@ fn emit_shape(
                 GraphicFramePayload::Unsupported { .. } => {}
             }
         }
-        // Pictures and connectors carry no text. Figures need image extraction
-        // wired first, which on the DOCX path takes its ids from the layout
-        // stage; PPTX has no equivalent yet.
+        // A picture whose bytes we do not surface (EMF, or an SVG with no
+        // raster fallback) reaches here, as does every connector. Neither
+        // carries text.
         ShapeKind::Picture(_) | ShapeKind::Connector(_) => {}
     }
+}
+
+/// Emit one picture as a `Block::Figure`, and record its bytes.
+///
+/// Nothing is emitted when the caller asked for neither figures nor images,
+/// when the shape has no composed rectangle, or when `resolve_blip_fill`
+/// declines the image. That resolver is shared with the paint walk rather than
+/// re-implemented, so the set of pictures a reader gets a ref for and the set
+/// the rasterizer draws cannot drift apart — it is also what applies the
+/// `a:tile`, `r:link` and unresolvable-`r:embed` rules, each of which is a
+/// picture with no bytes to hand back.
+fn emit_figure(
+    shape: &Shape,
+    fill: &liteparse_ooxml::model::BlipFill,
+    ctx: &mut SlideCtx<'_>,
+    out: &mut Vec<(Block, BlockSource)>,
+    src: BlockSource,
+) {
+    if !ctx.opts.figures && !ctx.opts.images {
+        return;
+    }
+    let ResolvedFill::Blip(blip) = resolve_blip_fill(fill, Some(ctx.media)) else {
+        return;
+    };
+    // The *bounding* box, matching the paint walk: `pptx::geometry` composes
+    // group transforms into `slide_rect`, so a grouped or rotated picture's
+    // placement is the box that composition produced.
+    let Some(rect) = shape.slide_rect else { return };
+    let box_ = rect.bounding_box();
+    let bbox = Rect {
+        x: emu_to_pt(box_.origin.x.raw()),
+        y: emu_to_pt(box_.origin.y.raw()),
+        width: emu_to_pt(box_.size.width.raw()),
+        height: emu_to_pt(box_.size.height.raw()),
+    };
+    let Some((id, format)) = ctx.figures.place(&blip, ctx.page, bbox) else {
+        return;
+    };
+    if ctx.opts.figures {
+        out.push((Block::Figure { id, format }, src));
+    }
+}
+
+/// EMU → points. 914,400 EMU to the inch, 72 points to the inch.
+fn emu_to_pt(emu: i64) -> f32 {
+    emu as f32 / 12_700.0
 }
 
 fn emit_text_body(
@@ -1433,6 +1788,7 @@ mod tests {
             color_map: None,
             inherited: [&[], &[]],
             inherited_text: [Vec::new(), inherited.iter().collect()],
+            inherited_figures: [Vec::new(), Vec::new()],
             declined: [false, false],
             media,
             inherited_media: [media, media],
@@ -1487,5 +1843,199 @@ mod tests {
         let p = prepared(slide, &rung, &defaults, &media);
         let order: Vec<Option<usize>> = slide_reading_order(&p).iter().map(|r| r.rung).collect();
         assert_eq!(order, [None, Some(1)]);
+    }
+
+    // ── figures ─────────────────────────────────────────────────────────
+
+    /// A `p:pic` at `(x, y)` EMU whose blip names `rel`.
+    fn pic_shape(id: u32, x: i64, y: i64, rel: &str) -> String {
+        format!(
+            r#"<p:pic>
+                 <p:nvPicPr><p:cNvPr id="{id}" name="p{id}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+                 <p:blipFill><a:blip r:embed="{rel}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+                 <p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="914400" cy="914400"/></a:xfrm>
+                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+               </p:pic>"#
+        )
+    }
+
+    /// A `p:sp` whose `spPr` fill is a blip, with `text` as its body (empty
+    /// slice = no `p:txBody` at all).
+    fn blip_filled_sp(id: u32, rel: &str, text: &[&str]) -> String {
+        let body = if text.is_empty() {
+            String::new()
+        } else {
+            let paras: String = text
+                .iter()
+                .map(|t| format!("<a:p><a:r><a:t>{t}</a:t></a:r></a:p>"))
+                .collect();
+            format!("<p:txBody><a:bodyPr/><a:lstStyle/>{paras}</p:txBody>")
+        };
+        format!(
+            r#"<p:sp>
+                 <p:nvSpPr><p:cNvPr id="{id}" name="s{id}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+                 <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>
+                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                   <a:blipFill><a:blip r:embed="{rel}"/><a:stretch><a:fillRect/></a:stretch></a:blipFill>
+                 </p:spPr>
+                 {body}
+               </p:sp>"#
+        )
+    }
+
+    /// The census's rule, in the two directions it has to hold: a `p:pic` is a
+    /// picture, and so is a blip-filled shape that says nothing.
+    #[test]
+    fn a_pic_and_a_textless_blip_filled_shape_are_both_pictures() {
+        let shapes = tree(&format!(
+            "{}{}",
+            pic_shape(2, 0, 0, "rId1"),
+            blip_filled_sp(3, "rId2", &[]),
+        ));
+        assert!(shapes.iter().all(|s| picture_fill(s).is_some()));
+    }
+
+    /// The other half of the same rule, and the half that keeps it honest: a
+    /// blip behind text is a backdrop, and the text is the content. 27 of the
+    /// corpus's 29 layout-level blip-filled shapes are exactly this.
+    #[test]
+    fn a_blip_behind_text_is_a_backdrop_not_a_figure() {
+        let shapes = tree(&blip_filled_sp(2, "rId2", &["a heading over a photo"]));
+        assert!(picture_fill(&shapes[0]).is_none());
+        // ...and a body of only-empty runs is textless to a reader, so it is
+        // a picture — the model's `Some(TextBody)` is not the question.
+        let blank = tree(&blip_filled_sp(3, "rId2", &["", "   "]));
+        assert!(picture_fill(&blank[0]).is_some());
+    }
+
+    /// A shape with no blip anywhere is not a picture, whatever else it is.
+    #[test]
+    fn an_ordinary_shape_is_not_a_picture() {
+        let shapes = tree(&text_shape(2, 0, 0, &["just words"]));
+        assert!(picture_fill(&shapes[0]).is_none());
+    }
+
+    fn blip(bytes: &std::sync::Arc<[u8]>) -> ResolvedBlipFor {
+        liteparse_ooxml::render::layout::draw_command::ResolvedBlip {
+            data: std::sync::Arc::clone(bytes),
+            format: liteparse_ooxml::model::ImageFormat::Png,
+            src_rect: None,
+        }
+    }
+    type ResolvedBlipFor = liteparse_ooxml::render::layout::draw_command::ResolvedBlip;
+
+    /// A 1x1 PNG, so `image::ImageReader` reports real dimensions.
+    fn png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    fn rect() -> Rect {
+        Rect {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+        }
+    }
+
+    /// Ids are `p{page}_{n}`, 1-based on both halves and restarted per slide,
+    /// so they line up with the platform extractor's and the PDF path's.
+    #[test]
+    fn figure_ids_are_page_scoped_and_one_based() {
+        let mut sink = FigureSink::default();
+        let a: std::sync::Arc<[u8]> = png().into();
+        let b: std::sync::Arc<[u8]> = {
+            let mut v = png();
+            v.extend_from_slice(&[0u8; 4]);
+            v.into()
+        };
+        sink.start_slide();
+        assert_eq!(sink.place(&blip(&a), 1, rect()).unwrap().0, "p1_1");
+        assert_eq!(sink.place(&blip(&b), 1, rect()).unwrap().0, "p1_2");
+        sink.start_slide();
+        assert_eq!(sink.place(&blip(&b), 2, rect()).unwrap().0, "p2_1");
+    }
+
+    /// The repeated-logo case, which is what makes emitting a master's picture
+    /// on all 47 of its slides affordable: every placement keeps its own name,
+    /// and all but the first point at one canonical entry's bytes.
+    #[test]
+    fn a_repeated_picture_collapses_onto_one_canonical_entry() {
+        let mut sink = FigureSink::default();
+        let logo: std::sync::Arc<[u8]> = png().into();
+        for page in 1..=3 {
+            sink.start_slide();
+            sink.place(&blip(&logo), page, rect()).expect("placed");
+        }
+        assert_eq!(sink.images.len(), 3, "one entry per placement");
+        assert_eq!(sink.images[0].duplicate_of, None);
+        assert_eq!(
+            sink.images[1].duplicate_of.as_deref(),
+            Some("p1_1"),
+            "later placements name the canonical id"
+        );
+        assert_eq!(sink.images[2].duplicate_of.as_deref(), Some("p1_1"));
+        // Distinct names, shared bytes — the platform's contract exactly.
+        assert_eq!(sink.images[1].name, "img_p2_1.png");
+        assert!(std::sync::Arc::ptr_eq(
+            &sink.images[0].bytes,
+            &sink.images[2].bytes
+        ));
+    }
+
+    /// Two *different* relationships can hold identical bytes — a logo the
+    /// author pasted into the slide and into the master. The `Arc` pointers
+    /// differ, so only the content hash catches this one.
+    #[test]
+    fn identical_bytes_behind_different_rels_still_dedupe() {
+        let mut sink = FigureSink::default();
+        let one: std::sync::Arc<[u8]> = png().into();
+        let two: std::sync::Arc<[u8]> = png().into();
+        assert!(!std::sync::Arc::ptr_eq(&one, &two), "distinct allocations");
+        sink.start_slide();
+        sink.place(&blip(&one), 1, rect()).expect("placed");
+        sink.place(&blip(&two), 1, rect()).expect("placed");
+        assert_eq!(sink.images[1].duplicate_of.as_deref(), Some("p1_1"));
+    }
+
+    /// Media we do not surface bytes for is not a figure and does not consume
+    /// an id — 29 corpus EMF references and 154 SVG-only blips land here, and
+    /// a ref numbered around them would name a file nothing writes.
+    #[test]
+    fn media_we_cannot_surface_takes_no_id() {
+        let mut sink = FigureSink::default();
+        let emf: std::sync::Arc<[u8]> = png().into();
+        sink.start_slide();
+        let mut b = blip(&emf);
+        b.format = liteparse_ooxml::model::ImageFormat::Emf;
+        assert!(sink.place(&b, 1, rect()).is_none());
+        assert!(sink.images.is_empty());
+        // The next real picture is still `_1`.
+        assert_eq!(sink.place(&blip(&emf), 1, rect()).unwrap().0, "p1_1");
+    }
+
+    /// A rung's pictures reach the reading order, and they arrive flagged as
+    /// figures — `inherited_text_laid_out` keys on that flag, so a picture
+    /// counted as inherited *text* would corrupt the metric that step's A/B
+    /// rests on.
+    #[test]
+    fn inherited_pictures_read_as_figures() {
+        let defaults = DeckTextDefaults::default();
+        let slide = tree(&text_shape(2, 0, 3_000_000, &["the slide's own line"]));
+        let rung = tree(&pic_shape(3, 0, 0, "rId1"));
+        let media = PartMedia::default();
+        let mut p = prepared(slide, &[], &defaults, &media);
+        p.inherited_figures = [Vec::new(), rung.iter().collect()];
+        let order: Vec<(Option<usize>, bool)> = slide_reading_order(&p)
+            .iter()
+            .map(|r| (r.rung, r.figure))
+            .collect();
+        assert_eq!(order, [(Some(1), true), (None, false)]);
     }
 }

@@ -828,22 +828,19 @@ impl LiteParse {
     /// Config options the native PPTX path cannot honor. Hitting one with
     /// `office_native` on is a hard `Config` error, not a fallback.
     ///
-    /// Two entries are PPTX-specific and are here because the alternative is
+    /// One entry is PPTX-specific and is here because the alternative is
     /// silent under-delivery:
     ///
-    /// * `extract_images` — the PPTX reader does not extract media at all yet
-    ///   (`ShapeKind::Picture` emits nothing), so an enabled flag would hand
-    ///   back an empty list rather than the deck's pictures.
     /// * `extract_annotations` — the geometry adapter builds fragments with no
     ///   `LinkTarget`, so there are no link rects to merge. Markdown links
     ///   (`extract_links`) are unaffected: those come from the emitter, which
     ///   does resolve `a:hlinkClick`.
     ///
-    /// `image_mode` is deliberately *not* here. Pictures already emit nothing
-    /// on the markdown path this ships beside, so a placeholder-mode parse gets
-    /// exactly what the (benchmarked) emitter has always produced; promoting
-    /// that long-standing content gap to a hard error would reject the default
-    /// config.
+    /// `extract_images` **was** here, for as long as `ShapeKind::Picture`
+    /// emitted nothing. It now extracts, so the flag is honored rather than
+    /// rejected; `image_mode` never was here, which meant a default-config
+    /// parse silently produced no `![](…)` refs where the conversion path
+    /// produced 2,719 across the corpus. Both are now the same answer.
     #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
     fn native_pptx_ineligible_reason(&self) -> Option<&'static str> {
         let c = &self.config;
@@ -857,8 +854,6 @@ impl LiteParse {
             Some("crop_box")
         } else if c.skip_diagonal_text {
             Some("skip_diagonal_text")
-        } else if c.effective_extract_images() {
-            Some("extract_images")
         } else if c.extract_annotations {
             Some("extract_annotations")
         } else {
@@ -904,7 +899,13 @@ impl LiteParse {
             }
         }
 
-        let tagged = pptx::emit_with_sources(
+        // Same two gates as the PDF and DOCX paths: figures interleave when
+        // `image_mode != Off`, pixel bytes surface under
+        // `effective_extract_images`.
+        let want_figures = self.config.image_mode != crate::config::ImageMode::Off;
+        let want_images = self.config.effective_extract_images();
+
+        let deck = pptx::emit_with_sources(
             data,
             pptx::EmitOptions {
                 links: self.config.extract_links,
@@ -914,8 +915,12 @@ impl LiteParse {
                 // markdown and contribute no `TextItem`s, because the text
                 // genuinely is not on the slide (user, 2026-08-17).
                 notes: true,
+                figures: want_figures,
+                images: want_images,
             },
         )?;
+        let images = deck.images;
+        let tagged = deck.blocks;
         let n_pages = geo.pages.len();
         let page_blocks = split_pptx_blocks_by_page(&tagged, n_pages);
         let outline = pptx_slide_outline(&page_blocks);
@@ -924,6 +929,7 @@ impl LiteParse {
 
         let complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>> =
             if self.config.include_complexity {
+                let img_rects = pptx_layout::image_rects_per_page(&geo.layouts);
                 geo.pages
                     .iter()
                     .enumerate()
@@ -938,12 +944,11 @@ impl LiteParse {
                                 )
                             })
                             .count();
-                        // No image rects: the reader does not place pictures
-                        // yet. A slide's column count is 1 — PPTX has no
-                        // section columns, and shapes are not columns.
+                        // A slide's column count is 1 — PPTX has no section
+                        // columns, and shapes are not columns.
                         Some(crate::ocr_merge::calculate_native_page_complexity(
                             p,
-                            &[],
+                            img_rects.get(i).map(Vec::as_slice).unwrap_or(&[]),
                             tables,
                             1,
                         ))
@@ -982,14 +987,26 @@ impl LiteParse {
             page_stats.push(s);
         }
 
-        Ok(Some(self.parse_from_native_blocks(
+        let mut result = self.parse_from_native_blocks(
             pages,
             page_blocks,
             (!page_filtered).then_some(all_blocks),
             outline,
-            Vec::new(),
+            images,
             page_stats,
-        )))
+        );
+
+        // Same post-passes as the PDF and DOCX paths, same order: duplicate
+        // figure refs point at the canonical name, then only canonical files
+        // are written. A deck leans on these harder than a document does —
+        // 3,602 corpus placements resolve to 1,322 files.
+        if self.config.output_format == crate::config::OutputFormat::Markdown {
+            rewrite_duplicate_image_refs(&mut result.pages, &mut result.text, &result.images);
+        }
+        if want_images && let Some(output_dir) = self.config.image_output_dir.as_deref() {
+            write_extracted_images(output_dir, &mut result.images)?;
+        }
+        Ok(Some(result))
     }
 
     /// Run the native DOCX pipeline. `Ok(None)` means "eligible fallback":

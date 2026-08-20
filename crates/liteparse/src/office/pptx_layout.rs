@@ -475,7 +475,11 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
             // only for markdown a reader actually gets, so the two walks take
             // the same traversal or the claim is not true.
             for read in pptx_emit::slide_reading_order(&prepared) {
-                if read.rung.is_some() {
+                // `!figure`: the same list now also carries the rungs'
+                // pictures, which this counter does not name and must not
+                // absorb — its value is the A/B anchor for the inherited-text
+                // step (29 on the corpus).
+                if read.rung.is_some() && !read.figure {
                     *ctx.inherited_text_laid_out += 1;
                 }
                 layout_shape(read.shape, &mut ctx);
@@ -1660,6 +1664,43 @@ fn spec_default_size() -> Pt {
 
 fn emu_to_pt(emu: i64) -> Pt {
     Pt::new(emu as f32 / EMU_PER_POINT)
+}
+
+/// Placed-image rects per slide, for the native complexity stats.
+///
+/// Read off the painted command stream rather than the emitter's figure list,
+/// so the number does not move when a caller changes `image_mode` or
+/// `extract_images` — complexity describes the deck, not the request. This is
+/// the same independence `docx_layout::image_rects_per_page` has by walking the
+/// layout rather than `collect_images`.
+///
+/// Wider than the figure list on purpose, and in both directions a figure would
+/// not go: a blip **background** and a blip fill behind text are image content
+/// on the page for the purpose of "is this slide complex", while neither is a
+/// figure a reader gets a ref to.
+pub fn image_rects_per_page(layouted: &[LayoutedPage]) -> Vec<Vec<crate::types::Rect>> {
+    layouted
+        .iter()
+        .map(|lp| {
+            lp.commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCommand::Path {
+                        origin,
+                        extent,
+                        fill: ResolvedFill::Blip(_),
+                        ..
+                    } => Some(crate::types::Rect {
+                        x: origin.x.raw(),
+                        y: origin.y.raw(),
+                        width: extent.width.raw(),
+                        height: extent.height.raw(),
+                    }),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn union_bounds(items: &[TextItem]) -> Option<crate::types::Rect> {

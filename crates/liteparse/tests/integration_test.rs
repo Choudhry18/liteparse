@@ -591,10 +591,14 @@ async fn test_parse_pptx_native_integration() {
     let blocks = liteparse::office::pptx::pptx_to_blocks(
         &data,
         liteparse::office::pptx::EmitOptions {
-            // Mirrors the defaults the parse above ran with: `extract_links` is
-            // on by default, and the native path always emits notes.
+            // Mirrors the defaults the parse above ran with: `extract_links`
+            // is on by default, the native path always emits notes, and
+            // `image_mode` defaults to `placeholder` so figure refs are on
+            // while the bytes behind them are not requested.
             links: true,
             notes: true,
+            figures: true,
+            images: false,
         },
     )
     .expect("blocks");
@@ -637,15 +641,17 @@ async fn test_parse_pptx_native_integration() {
 
 /// A config the native PPTX path cannot honor is a hard error, not a silent
 /// swap to LibreOffice — the user picks the engine, the engine never picks for
-/// them. `extract_images` is the PPTX-specific entry: the reader emits nothing
-/// for `ShapeKind::Picture`, so honoring the flag would mean handing back an
-/// empty list.
+/// them. `extract_annotations` is the PPTX-specific entry: the geometry adapter
+/// builds fragments with no `LinkTarget`, so there are no link rects to merge.
+///
+/// This used to test `extract_images`, which is now supported — see
+/// [`test_pptx_native_extracts_images`].
 #[cfg(feature = "pptx-native")]
 #[tokio::test]
 #[serial]
 async fn test_pptx_native_unsupported_config_is_hard_error() {
     let lit = LiteParse::new(LiteParseConfig {
-        extract_images: true,
+        extract_annotations: true,
         quiet: true,
         ..Default::default()
     });
@@ -657,7 +663,74 @@ async fn test_pptx_native_unsupported_config_is_hard_error() {
         Ok(_) => panic!("unsupported option must not silently fall back"),
     };
     assert!(
-        msg.contains("extract_images") && msg.contains("native PPTX"),
+        msg.contains("extract_annotations") && msg.contains("native PPTX"),
         "error names the option and the engine: {msg}"
     );
+}
+
+/// `extract_images` on the native PPTX path: bytes come back, duplicates
+/// collapse onto one canonical entry, and every ref in the markdown names a
+/// file the extraction actually produced.
+///
+/// The dedup assertion is the load-bearing one. A deck places its master's logo
+/// on every slide — this fixture is 25 slides — so an extractor without the
+/// contract would hand back 25 copies of one PNG.
+#[cfg(feature = "pptx-native")]
+#[tokio::test]
+#[serial]
+async fn test_pptx_native_extracts_images() {
+    let lit = LiteParse::new(LiteParseConfig {
+        output_format: liteparse::config::OutputFormat::Markdown,
+        extract_images: true,
+        quiet: true,
+        ..Default::default()
+    });
+    let parsed = lit
+        .parse("../../bench/pptx_corpus/staging/cloudviper_workshop__19687752.pptx")
+        .await
+        .expect("native parse succeeds with extract_images");
+
+    assert!(
+        !parsed.images.is_empty(),
+        "a deck full of pictures extracts some"
+    );
+    assert!(
+        parsed.images.iter().any(|i| i.duplicate_of.is_some()),
+        "a repeated master picture collapses onto a canonical entry"
+    );
+    // Bytes, dimensions and placement are all real — a zero on any of them is
+    // an entry that resolved structurally and carries nothing.
+    for img in &parsed.images {
+        assert!(!img.bytes.is_empty(), "{} has bytes", img.id);
+        assert!(img.width > 0 && img.height > 0, "{} has dimensions", img.id);
+        assert!(
+            img.bbox.width > 0.0 && img.bbox.height > 0.0,
+            "{} is placed",
+            img.id
+        );
+        assert!(img.page >= 1, "{} is on a 1-based page", img.id);
+    }
+
+    // Every `![](img_…)` in the markdown names an extracted image. After
+    // `rewrite_duplicate_image_refs` those are canonical names only, which is
+    // what makes a written-out directory self-consistent.
+    let canonical: std::collections::HashSet<&str> = parsed
+        .images
+        .iter()
+        .filter(|i| i.duplicate_of.is_none())
+        .map(|i| i.name.as_str())
+        .collect();
+    let mut refs = 0;
+    for (at, marker) in parsed.text.match_indices("![](") {
+        let name = parsed.text[at + marker.len()..]
+            .split(')')
+            .next()
+            .expect("a closed markdown image ref");
+        assert!(
+            canonical.contains(name),
+            "markdown ref {name} names a canonical extracted image"
+        );
+        refs += 1;
+    }
+    assert!(refs > 0, "figure refs reach the markdown");
 }

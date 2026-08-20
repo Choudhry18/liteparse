@@ -415,7 +415,12 @@ pub struct NativeImages {
 /// everything), so surfacing bytes most consumers cannot decode would be a
 /// worse contract than omitting them. Word's SVG embeds normally carry a PNG
 /// fallback blip, which is the one the layout draws.
-fn media_extension(format: liteparse_ooxml::model::ImageFormat) -> Option<&'static str> {
+///
+/// Shared with the PPTX figure emitter rather than mirrored there: two lists of
+/// "formats we surface" would compile, run, and disagree the first time one
+/// gained a format, and the disagreement would show up as a format that
+/// extracts on one office path and silently vanishes on the other.
+pub(crate) fn media_extension(format: liteparse_ooxml::model::ImageFormat) -> Option<&'static str> {
     use liteparse_ooxml::model::ImageFormat as F;
     match format {
         F::Png => Some("png"),
