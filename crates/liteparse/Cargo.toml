@@ -51,7 +51,7 @@ tesseract = ["dep:tesseract-rs"]
 # name instead of an `any(...)` list that grows with each format.
 office-native = []
 docx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
-pptx-native = ["dep:liteparse-ooxml", "office-native"]
+pptx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
 
 [dependencies]
 blake3 = "1"

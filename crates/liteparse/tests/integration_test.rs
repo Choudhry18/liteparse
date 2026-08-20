@@ -639,6 +639,72 @@ async fn test_parse_pptx_native_integration() {
     );
 }
 
+/// Native PPTX screenshots: the slide is rastered from the same draw commands
+/// the geometry pass laid out, so the PNG and the parse's `TextItem`s share one
+/// coordinate space. That parity is the assertion below — a screenshot from the
+/// conversion path never had it, which is what blocked highlight-on-screenshot.
+///
+/// `--target-pages` is exercised too, because a slide number is a page number
+/// and nothing downstream re-maps it.
+#[cfg(feature = "pptx-native")]
+#[tokio::test]
+#[serial]
+async fn test_screenshot_pptx_native_integration() {
+    let path = "../../bench/pptx_corpus/staging/cloudviper_workshop__19687752.pptx";
+    let lit = LiteParse::new(LiteParseConfig {
+        quiet: true,
+        ..Default::default()
+    });
+
+    let shots = lit.screenshot(path, None).await.expect("native raster");
+    assert_eq!(shots.len(), 25, "one screenshot per slide");
+    assert!(
+        shots.iter().all(|s| !s.image_bytes.is_empty()),
+        "every slide encodes to PNG"
+    );
+    assert!(
+        shots.iter().any(|s| !s.is_solid_fill),
+        "a 25-slide deck is not 25 blank pages"
+    );
+
+    // Same coordinate space as the parse: the raster is the page box scaled by
+    // dpi/72, so a `TextItem` box maps onto the PNG by that one factor.
+    let parsed = lit.parse(path).await.expect("native parse succeeds");
+    let scale = lit.config().dpi / 72.0;
+    for (shot, page) in shots.iter().zip(&parsed.pages) {
+        let expect_w = (page.page_width * scale).round() as u32;
+        let expect_h = (page.page_height * scale).round() as u32;
+        assert!(
+            shot.width.abs_diff(expect_w) <= 1 && shot.height.abs_diff(expect_h) <= 1,
+            "slide {}: raster {}x{} vs page {}x{} at {scale}x",
+            shot.page_num,
+            shot.width,
+            shot.height,
+            expect_w,
+            expect_h
+        );
+    }
+
+    let picked = lit
+        .screenshot(path, Some(vec![2, 5]))
+        .await
+        .expect("native raster");
+    assert_eq!(
+        picked.iter().map(|s| s.page_num).collect::<Vec<_>>(),
+        vec![2, 5],
+        "a slide number is a page number"
+    );
+
+    let err = lit
+        .screenshot(path, Some(vec![999]))
+        .await
+        .expect_err("out-of-range slide is the caller's error, not a fallback");
+    assert!(
+        err.to_string().contains("out of range"),
+        "engine reports the range rather than degrading to LibreOffice: {err}"
+    );
+}
+
 /// A config the native PPTX path cannot honor is a hard error, not a silent
 /// swap to LibreOffice — the user picks the engine, the engine never picks for
 /// them. `extract_annotations` is the PPTX-specific entry: the geometry adapter

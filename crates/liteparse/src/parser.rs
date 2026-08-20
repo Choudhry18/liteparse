@@ -1028,7 +1028,7 @@ impl LiteParse {
 
     /// Total text length below which a DOCX counts as text-sparse (likely a
     /// scanned document pasted into Word) when OCR is enabled.
-    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "office-native", not(target_arch = "wasm32")))]
     const NATIVE_TEXT_SPARSE_CHARS: usize = 32;
 
     #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
@@ -1223,6 +1223,29 @@ impl LiteParse {
         .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
         let layouted = liteparse_ooxml::render::layout_document(&resolved, &registry);
 
+        self.rasterize_native_pages(&layouted, &registry, page_numbers, ("document", "pages"))
+    }
+
+    /// Shared tail of every native-office screenshot: select pages, rasterize
+    /// the layout's draw commands, and wrap each raster in the same
+    /// `ScreenshotResult` shape the PDFium path produces.
+    ///
+    /// `unit` names the page population in the out-of-range message so a deck
+    /// says "slides" where a document says "pages"; it is the only thing that
+    /// differs between the DOCX and PPTX callers, because by this point both
+    /// are just a `[LayoutedPage]`.
+    #[cfg(all(
+        any(feature = "docx-native", feature = "pptx-native"),
+        not(target_arch = "wasm32")
+    ))]
+    fn rasterize_native_pages(
+        &self,
+        layouted: &[liteparse_ooxml::render::layout::draw_command::LayoutedPage],
+        registry: &liteparse_ooxml::render::fonts::FontRegistry,
+        page_numbers: Option<&[u32]>,
+        unit: (&str, &str),
+    ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
+        let (container, noun) = unit;
         let page_count = layouted.len() as u32;
         let pages: Vec<u32> = match page_numbers {
             Some(nums) => nums.to_vec(),
@@ -1233,12 +1256,12 @@ impl LiteParse {
         for page_num in pages {
             if page_num < 1 || page_num > page_count {
                 return Err(LiteParseError::Other(format!(
-                    "page {page_num} out of range (document has {page_count} pages)"
+                    "page {page_num} out of range ({container} has {page_count} {noun})"
                 )));
             }
             let raster = liteparse_ooxml::render::raster::rasterize_page(
                 &layouted[(page_num - 1) as usize],
-                &registry,
+                registry,
                 scale,
             )
             .map_err(LiteParseError::Conversion)?;
@@ -1270,6 +1293,41 @@ impl LiteParse {
         Ok(results)
     }
 
+    /// Native PPTX screenshot: the DOCX sibling's contract, one slide per
+    /// page. `Conversion` means the engine failed and the caller should fall
+    /// back to LibreOffice; anything else is the caller's error.
+    #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+    fn try_screenshot_pptx_native(
+        &self,
+        data: &[u8],
+        page_numbers: Option<&[u32]>,
+    ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.screenshot_pptx_native_inner(data, page_numbers)
+        }))
+        .unwrap_or_else(|_| {
+            Err(LiteParseError::Conversion(
+                "native pptx layout panicked".to_string(),
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+    fn screenshot_pptx_native_inner(
+        &self,
+        data: &[u8],
+        page_numbers: Option<&[u32]>,
+    ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
+        // Same registry construction as `parse_pptx_native_inner` — a deck
+        // embeds no fonts, and the raster must measure with the registry the
+        // geometry pass laid the text out with or the glyphs land off their
+        // own boxes.
+        let registry = liteparse_ooxml::render::fonts::FontRegistry::build(&[], &[])
+            .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
+        let geo = crate::office::pptx_layout::slides_to_pages(data, &registry)?;
+        self.rasterize_native_pages(&geo.layouts, &registry, page_numbers, ("deck", "slides"))
+    }
+
     /// `parse_from_pages`'s native sibling: no projection — the block model
     /// arrives from the DOCX source, so markdown is `render_blocks` per page
     /// and page text is a straight reading-order join of the text items.
@@ -1283,7 +1341,7 @@ impl LiteParse {
     /// structure path; the per-page markdown is the paged *view* of the same
     /// blocks. `None` (page-filtered parse) falls back to joining the
     /// surviving pages.
-    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "office-native", not(target_arch = "wasm32")))]
     fn parse_from_native_blocks(
         &self,
         pages: Vec<Page>,
@@ -1410,6 +1468,23 @@ impl LiteParse {
                 Ok(results) => return Ok(results),
                 Err(LiteParseError::Conversion(e)) => log(&format!(
                     "[liteparse] native docx screenshot failed ({e}); falling back to conversion"
+                )),
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Native PPTX raster, same contract as the DOCX branch above: the
+        // slide is drawn from the same commands the geometry pass laid out,
+        // so a screenshot and the native `TextItem`s share one coordinate
+        // space. `office_native` gates it; engine failures degrade.
+        #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
+        if self.config.office_native
+            && let Some(bytes) = crate::office::pptx_bytes(&input)
+        {
+            match self.try_screenshot_pptx_native(&bytes, page_numbers.as_deref()) {
+                Ok(results) => return Ok(results),
+                Err(LiteParseError::Conversion(e)) => log(&format!(
+                    "[liteparse] native pptx screenshot failed ({e}); falling back to conversion"
                 )),
                 Err(e) => return Err(e),
             }
@@ -1562,7 +1637,7 @@ fn split_blocks_by_page(
 /// Reading-order plain text from native text items: emission order is the
 /// engine's layout order, so lines are rebuilt by baseline proximity and
 /// word gaps rather than by re-sorting (which would interleave columns).
-#[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "office-native", not(target_arch = "wasm32")))]
 fn native_page_text(items: &[crate::types::TextItem]) -> String {
     /// Fraction of the font size an x-gap must exceed to count as a missing
     /// inter-word space (word commands carry no trailing spaces). Adjacent
