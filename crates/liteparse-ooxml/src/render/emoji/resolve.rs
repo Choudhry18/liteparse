@@ -237,6 +237,7 @@ mod tests {
             origin: TypefaceOrigin::System {
                 typeface_id: TypefaceId(id),
             },
+            wght: 400,
         }
     }
 

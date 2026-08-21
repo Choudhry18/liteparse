@@ -32,7 +32,7 @@
 use std::sync::Once;
 
 use skrifa::MetadataProvider;
-use skrifa::instance::{LocationRef, Size};
+use skrifa::instance::Size;
 use skrifa::outline::{DrawSettings, OutlinePen};
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint, Shader, Stroke,
@@ -41,7 +41,7 @@ use tiny_skia::{
 
 use crate::model::{ImageFormat, PathFillMode};
 use crate::render::dimension::Pt;
-use crate::render::fonts::{FontRegistry, FontStyle, TypefaceEntry};
+use crate::render::fonts::{FontRegistry, FontStyle, TypefaceEntry, wght_location};
 use crate::render::geometry::{PtOffset, PtRect};
 use crate::render::layout::draw_command::{
     DrawCommand, LayoutedPage, ResolvedDashPattern, ResolvedFill, ResolvedLineCap,
@@ -380,7 +380,8 @@ fn draw_text_run(
         let font = skrifa::FontRef::from_index(data, index).ok()?;
         let charmap = font.charmap();
         let outlines = font.outline_glyphs();
-        let metrics = font.glyph_metrics(Size::new(font_size.raw()), LocationRef::default());
+        let location = wght_location(&font, entry.wght);
+        let metrics = font.glyph_metrics(Size::new(font_size.raw()), &location);
 
         let mut pb = PathBuilder::new();
         let mut pen_x = position.x.raw();
@@ -393,8 +394,7 @@ fn draw_text_run(
                     baseline_y: position.y.raw(),
                     sx: text_scale,
                 };
-                let settings =
-                    DrawSettings::unhinted(Size::new(font_size.raw()), LocationRef::default());
+                let settings = DrawSettings::unhinted(Size::new(font_size.raw()), &location);
                 // A malformed glyph program draws nothing; the advance below
                 // still moves the pen so the rest of the run stays aligned.
                 let _ = glyph.draw(settings, &mut pen);
@@ -426,8 +426,9 @@ fn draw_emoji_fallback(
         let font = skrifa::FontRef::from_index(data, index).ok()?;
         let outlines = font.outline_glyphs();
         let charmap = font.charmap();
-        let m = font.metrics(Size::new(size.raw()), LocationRef::default());
-        let metrics = font.glyph_metrics(Size::new(size.raw()), LocationRef::default());
+        let location = wght_location(&font, typeface.wght);
+        let m = font.metrics(Size::new(size.raw()), &location);
+        let metrics = font.glyph_metrics(Size::new(size.raw()), &location);
         let baseline_y = rect.origin.y.raw() + m.ascent;
 
         let mut pb = PathBuilder::new();
@@ -441,8 +442,7 @@ fn draw_emoji_fallback(
                     baseline_y,
                     sx: 1.0,
                 };
-                let settings =
-                    DrawSettings::unhinted(Size::new(size.raw()), LocationRef::default());
+                let settings = DrawSettings::unhinted(Size::new(size.raw()), &location);
                 let _ = glyph.draw(settings, &mut pen);
             }
             pen_x += metrics.advance_width(gid).unwrap_or(0.0);

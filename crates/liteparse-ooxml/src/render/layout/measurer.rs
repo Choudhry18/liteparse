@@ -46,11 +46,11 @@ use std::collections::{HashMap, HashSet};
 
 use rustc_hash::FxHashMap;
 use skrifa::MetadataProvider;
-use skrifa::instance::{LocationRef, Size};
+use skrifa::instance::Size;
 
 use crate::render::dimension::Pt;
 use crate::render::emoji::resolve::{EmojiFamily, EmojiResolver, EmojiTypeface, RegistryLookup};
-use crate::render::fonts::{FontRegistry, FontStyle, TypefaceEntry, TypefaceId};
+use crate::render::fonts::{FontRegistry, FontStyle, TypefaceEntry, TypefaceId, wght_location};
 
 use super::fragment::{FontProps, TextMetrics};
 
@@ -62,6 +62,10 @@ use super::fragment::{FontProps, TextMetrics};
 /// `Box<str>: Borrow<str>`) so a cache hit allocates nothing.
 struct FontSlot {
     face: fontdb::ID,
+    /// `wght` coordinate this slot measures at — see [`TypefaceEntry::wght`].
+    /// Part of the slot rather than looked up per call because the slot key
+    /// already pins the (family, style) that produced it.
+    wght: u16,
     size: Pt,
     metrics: TextMetrics,
     /// `post`-table underline (offset, thickness) in pt at `size`, already in
@@ -132,7 +136,7 @@ impl<'r> TextMeasurer<'r> {
         let entry = self
             .registry
             .resolve(family, FontStyle::from_flags(bold, italic));
-        let slot = self.build_slot(entry.id, size);
+        let slot = self.build_slot(entry.id, entry.wght, size);
         let mut slots = self.slots.borrow_mut();
         slots.push(slot);
         let idx = slots.len() - 1;
@@ -140,11 +144,12 @@ impl<'r> TextMeasurer<'r> {
         idx
     }
 
-    fn build_slot(&self, face: fontdb::ID, size: Pt) -> FontSlot {
+    fn build_slot(&self, face: fontdb::ID, wght: u16, size: Pt) -> FontSlot {
         let px = f32::from(size);
         let read = self.registry.db().with_face_data(face, |data, index| {
             let font = skrifa::FontRef::from_index(data, index).ok()?;
-            let m = font.metrics(Size::new(px), LocationRef::default());
+            let location = wght_location(&font, wght);
+            let m = font.metrics(Size::new(px), &location);
             Some((
                 TextMetrics {
                     ascent: Pt::new(m.ascent),
@@ -169,6 +174,7 @@ impl<'r> TextMeasurer<'r> {
         });
         FontSlot {
             face,
+            wght,
             size,
             metrics,
             underline,
@@ -180,7 +186,7 @@ impl<'r> TextMeasurer<'r> {
     /// `measure_str` equivalent (no shaping, no kerning). An unmapped
     /// codepoint takes glyph 0 (.notdef), which is what a cmap lookup
     /// genuinely yields — matching Skia rather than skipping the character.
-    fn raw_advance(&self, face: fontdb::ID, size: Pt, text: &str) -> f32 {
+    fn raw_advance(&self, face: fontdb::ID, wght: u16, size: Pt, text: &str) -> f32 {
         self.registry
             .db()
             .with_face_data(face, |data, index| {
@@ -188,8 +194,8 @@ impl<'r> TextMeasurer<'r> {
                     return 0.0;
                 };
                 let charmap = font.charmap();
-                let metrics =
-                    font.glyph_metrics(Size::new(f32::from(size)), LocationRef::default());
+                let location = wght_location(&font, wght);
+                let metrics = font.glyph_metrics(Size::new(f32::from(size)), &location);
                 let mut sum = 0.0f32;
                 for ch in text.chars() {
                     let gid = charmap.map(ch).unwrap_or(skrifa::GlyphId::NOTDEF);
@@ -209,15 +215,21 @@ impl<'r> TextMeasurer<'r> {
             font_props.bold,
             font_props.italic,
         );
-        let (face, size, text_metrics, cached) = {
+        let (face, wght, size, text_metrics, cached) = {
             let slots = self.slots.borrow();
             let s = &slots[idx];
-            (s.face, s.size, s.metrics, s.widths.get(text).copied())
+            (
+                s.face,
+                s.wght,
+                s.size,
+                s.metrics,
+                s.widths.get(text).copied(),
+            )
         };
         let width = match cached {
             Some(w) => w,
             None => {
-                let w = self.raw_advance(face, size, text);
+                let w = self.raw_advance(face, wght, size, text);
                 self.slots.borrow_mut()[idx]
                     .widths
                     .insert(Box::from(text), w);
@@ -314,7 +326,8 @@ impl<'r> TextMeasurer<'r> {
             .db()
             .with_face_data(typeface.id, |data, index| {
                 let font = skrifa::FontRef::from_index(data, index).ok()?;
-                let m = font.metrics(Size::new(px), LocationRef::default());
+                let location = wght_location(&font, typeface.wght);
+                let m = font.metrics(Size::new(px), &location);
                 Some(TextMetrics {
                     ascent: Pt::new(m.ascent),
                     descent: Pt::new(-m.descent),
@@ -332,7 +345,7 @@ impl<'r> TextMeasurer<'r> {
         if let Some(&cached) = self.emoji_advance_cache.borrow().get(&key) {
             return (cached, text_metrics);
         }
-        let advance = Pt::new(self.raw_advance(typeface.id, size, text));
+        let advance = Pt::new(self.raw_advance(typeface.id, typeface.wght, size, text));
         self.emoji_advance_cache.borrow_mut().insert(key, advance);
         (advance, text_metrics)
     }

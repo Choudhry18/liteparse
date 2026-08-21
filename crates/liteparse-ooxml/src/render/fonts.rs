@@ -108,6 +108,24 @@ pub enum TypefaceOrigin {
 pub struct TypefaceEntry {
     pub id: fontdb::ID,
     pub origin: TypefaceOrigin,
+    /// The weight this resolution actually asked for, in CSS user space, to be
+    /// applied as the face's `wght` variation coordinate.
+    ///
+    /// **Not** the resolved face's weight, and not always `style.weight`. It
+    /// is what the *request* amounts to after the ladder has had its say: the
+    /// alias rung merges a PostScript name's own weight in, and the
+    /// style-suffix rung contributes the weight word it stripped off the
+    /// family name.
+    ///
+    /// It exists because fontdb registers a variable font as one face carrying
+    /// its default instance, so matching alone cannot express "Cabin at 700" —
+    /// there is only ever one Cabin to match. Without a coordinate, every
+    /// skrifa call renders the instance the file happens to open at, which for
+    /// Montserrat is Thin. Consumers pass this to
+    /// [`skrifa::AxisCollection::location`], which clamps it to the axis range
+    /// and ignores it outright on a static face; so carrying it costs a static
+    /// face nothing and is the entire fix for a variable one.
+    pub wght: u16,
 }
 
 /// Cache key for resolved typefaces — case-insensitive family + weight + slant.
@@ -233,19 +251,52 @@ const STYLE_SUFFIXES: &[&str] = &[
     "heavy", "thin",
 ];
 
+/// The weight a style word names, or `None` for the words that name a slant
+/// rather than a weight. `regular` is deliberately present and 400: a name
+/// that says Regular is asserting a weight, not declining to.
+fn suffix_weight(word: &str) -> Option<u16> {
+    Some(match word {
+        "thin" => 100,
+        "light" => 300,
+        "regular" => 400,
+        "medium" => 500,
+        "semibold" | "demibold" => 600,
+        "bold" => 700,
+        "black" | "heavy" => 900,
+        // "italic", "oblique" — slant, and no weight claim.
+        _ => return None,
+    })
+}
+
 /// Strip trailing style words, e.g. `Times New Roman Bold` → `Times New Roman`.
 /// Never strips the whole name (`Roman` alone stays `Roman`) — a family that
 /// *is* a style word is a real family, not a suffix.
-fn strip_style_suffix(family: &str) -> Option<String> {
+///
+/// Also returns the weight those words named, which the caller needs because
+/// stripping *discards* it. That is harmless when the stripped name reaches a
+/// static sibling — "Times New Roman Bold" re-queried with the run's own bold
+/// flag lands on the real bold face. It is destructive when the name reaches a
+/// **variable** family: "Montserrat SemiBold" strips to "Montserrat", matches
+/// the one face there is, and renders its default instance, which is Thin.
+/// A request for 600 becomes 100, the lightest weight in the file.
+///
+/// Where several style words are stripped, the **rightmost** weight-bearing
+/// one wins. Real names put the specific word last ("Open Sans Light"), and
+/// the only corpus case with two ("Albert Sans Regular Light") is a mangled
+/// name where Light is the operative half.
+fn strip_style_suffix(family: &str) -> Option<(String, Option<u16>)> {
     let mut words: Vec<&str> = family.split_whitespace().collect();
     let mut stripped = false;
+    let mut weight = None;
     while words.len() > 1
         && STYLE_SUFFIXES.contains(&words[words.len() - 1].to_lowercase().as_str())
     {
-        words.pop();
+        let word = words.pop().expect("len > 1 checked above").to_lowercase();
+        // First iteration is the rightmost word, so keep the earliest answer.
+        weight = weight.or_else(|| suffix_weight(&word));
         stripped = true;
     }
-    stripped.then(|| words.join(" "))
+    stripped.then(|| (words.join(" "), weight))
 }
 
 /// Requested family → ordered substitute candidates.
@@ -409,7 +460,7 @@ fn substitutes_for(family: &str) -> &'static [(&'static str, SubstKind)] {
     // A face-qualified name ("Calibri Light Italic") should still reach its
     // family's row when the suffix-stripped query itself found nothing.
     lookup(family)
-        .or_else(|| lookup(&strip_style_suffix(family)?))
+        .or_else(|| lookup(&strip_style_suffix(family)?.0))
         .unwrap_or(&[])
 }
 
@@ -735,6 +786,7 @@ impl FontRegistry {
                 TypefaceEntry {
                     id: face,
                     origin: TypefaceOrigin::Embedded { id: eid },
+                    wght: style.weight,
                 },
                 ResolveRule::Embedded,
             );
@@ -744,7 +796,7 @@ impl FontRegistry {
         // (unlike fontconfig-backed Skia, which substitutes), so a hit here is
         // genuinely the requested family — no exactness guard needed.
         if let Some(id) = self.query(&[fontdb::Family::Name(family)], style) {
-            return (system_entry(id), ResolveRule::Exact);
+            return (system_entry(id, style.weight), ResolveRule::Exact);
         }
 
         // 3. Face alias: PostScript name or weight-qualified face name.
@@ -765,14 +817,20 @@ impl FontRegistry {
                     alias.family,
                     merged
                 );
-                return (system_entry(id), ResolveRule::Alias);
+                return (system_entry(id, merged.weight), ResolveRule::Alias);
             }
         }
 
         // 4. Style suffix baked into the family name. The requested
         // bold/italic still applies, so "Times New Roman Bold" lands on the
         // real TNR bold face.
-        if let Some(base) = strip_style_suffix(family)
+        //
+        // The *query* keeps the run's own style, deliberately: feeding the
+        // stripped weight into it would change which face a static family
+        // resolves to, corpus-wide, on a step whose whole warrant is variable
+        // fonts. The stripped weight goes only to the variation coordinate,
+        // where it can affect nothing that does not carry an axis.
+        if let Some((base, suffix_wght)) = strip_style_suffix(family)
             && let Some(id) = self.query(&[fontdb::Family::Name(&base)], style)
         {
             log::debug!(
@@ -781,7 +839,10 @@ impl FontRegistry {
                 style,
                 base
             );
-            return (system_entry(id), ResolveRule::StyleSuffix);
+            let wght = suffix_wght
+                .map(|w| merged_alias_weight(w, style.weight))
+                .unwrap_or(style.weight);
+            return (system_entry(id, wght), ResolveRule::StyleSuffix);
         }
 
         // 5. Substitution table. Candidates in table order, so a host carrying
@@ -795,14 +856,17 @@ impl FontRegistry {
                     candidate,
                     kind
                 );
-                return (system_entry(id), ResolveRule::Substitution(*kind));
+                return (
+                    system_entry(id, style.weight),
+                    ResolveRule::Substitution(*kind),
+                );
             }
         }
 
         // 6. Whatever this host calls sans-serif.
         if let Some(id) = self.query(&[fontdb::Family::SansSerif], style) {
             log::debug!("[font] '{}' {:?} → generic sans-serif", family, style);
-            return (system_entry(id), ResolveRule::Generic);
+            return (system_entry(id, style.weight), ResolveRule::Generic);
         }
 
         // 7. Family::SansSerif can itself resolve to nothing (see
@@ -811,7 +875,7 @@ impl FontRegistry {
         // database up front.
         for name in LAST_RESORT {
             if let Some(id) = self.query(&[fontdb::Family::Name(name)], style) {
-                return (system_entry(id), ResolveRule::LastResort);
+                return (system_entry(id, style.weight), ResolveRule::LastResort);
             }
         }
         // Unreachable for a registry from `FontRegistry::build`, which rejects
@@ -823,7 +887,7 @@ impl FontRegistry {
             .faces()
             .next()
             .expect("FontRegistry::build guarantees a last-resort face");
-        (system_entry(f.id), ResolveRule::LastResort)
+        (system_entry(f.id, style.weight), ResolveRule::LastResort)
     }
 
     /// Resolve by exact family + style match only — embedded first, then the
@@ -838,10 +902,11 @@ impl FontRegistry {
             return Some(TypefaceEntry {
                 id: face,
                 origin: TypefaceOrigin::Embedded { id: eid },
+                wght: style.weight,
             });
         }
         self.query(&[fontdb::Family::Name(family)], style)
-            .map(system_entry)
+            .map(|id| system_entry(id, style.weight))
     }
 
     /// Resolve from the host font system only — bypasses embedded fonts.
@@ -856,7 +921,7 @@ impl FontRegistry {
         if matches!(info.source, fontdb::Source::Binary(_)) {
             return None;
         }
-        Some(system_entry(id))
+        Some(system_entry(id, style.weight))
     }
 
     /// Pre-resolve all four style variants for each family.
@@ -902,12 +967,31 @@ fn variant_for_style(style: FontStyle) -> EmbeddedFontVariant {
     }
 }
 
-fn system_entry(id: fontdb::ID) -> TypefaceEntry {
+/// Variation location for a face at a requested weight — the one place the
+/// `wght` coordinate is turned into something skrifa accepts.
+///
+/// Total and cheap on every input. `axes()` on a static face yields an empty
+/// collection, and `location` over an empty collection is an empty `Location`,
+/// which is exactly `LocationRef::default()` — so a static face measures and
+/// draws bit-identically to before this existed. On a variable face,
+/// `location` clamps the value into the axis's own range (§fvar), so a request
+/// for 700 against Cabin's 400–700 lands on 700 and against a 400–500 axis
+/// lands on 500; no caller has to know the range.
+///
+/// Only `wght` is set. `wdth` and any other axis stay at normalized 0.0, i.e.
+/// the face's default — OOXML has no run property that varies them.
+pub fn wght_location(font: &skrifa::FontRef<'_>, wght: u16) -> skrifa::instance::Location {
+    use skrifa::MetadataProvider;
+    font.axes().location([("wght", f32::from(wght))])
+}
+
+fn system_entry(id: fontdb::ID, wght: u16) -> TypefaceEntry {
     TypefaceEntry {
         id,
         origin: TypefaceOrigin::System {
             typeface_id: TypefaceId(id),
         },
+        wght,
     }
 }
 
@@ -918,18 +1002,63 @@ mod tests {
     #[test]
     fn style_suffix_strips_trailing_style_words() {
         assert_eq!(
-            strip_style_suffix("Times New Roman Bold").as_deref(),
-            Some("Times New Roman")
+            strip_style_suffix("Times New Roman Bold"),
+            Some(("Times New Roman".to_string(), Some(700)))
         );
         assert_eq!(
-            strip_style_suffix("Foo Bold Italic").as_deref(),
-            Some("Foo")
+            strip_style_suffix("Foo Bold Italic"),
+            Some(("Foo".to_string(), Some(700)))
         );
         // Families whose last word is a style word must survive.
         assert_eq!(strip_style_suffix("Times New Roman"), None);
         assert_eq!(strip_style_suffix("Century Schoolbook"), None);
         // Never strip down to nothing.
         assert_eq!(strip_style_suffix("Bold"), None);
+    }
+
+    #[test]
+    fn style_suffix_surrenders_the_weight_it_strips() {
+        // The case the `wght` fix exists for: a weight-named variable family.
+        // Stripping "SemiBold" is what lets the query find Montserrat at all,
+        // so the 600 has to survive as a coordinate or the run renders at the
+        // file's default instance — Thin.
+        assert_eq!(
+            strip_style_suffix("Montserrat SemiBold"),
+            Some(("Montserrat".to_string(), Some(600)))
+        );
+        assert_eq!(
+            strip_style_suffix("Open Sans Light"),
+            Some(("Open Sans".to_string(), Some(300)))
+        );
+        // Rightmost weight word wins: this mangled name is in the corpus.
+        assert_eq!(
+            strip_style_suffix("Albert Sans Regular Light"),
+            Some(("Albert Sans".to_string(), Some(300)))
+        );
+        // Slant words name no weight, and must not fabricate one.
+        assert_eq!(
+            strip_style_suffix("Garamond Italic"),
+            Some(("Garamond".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn a_resolution_carries_the_weight_it_asked_for() {
+        let reg = FontRegistry::new();
+        if reg.db.faces().next().is_none() {
+            return; // fontless CI host: nothing to assert against
+        }
+        // Host-independent by construction: whichever rung answers, the entry
+        // reports the request, not the matched face's own weight. Without this
+        // the coordinate has nothing to carry and every variable face renders
+        // its default instance.
+        assert_eq!(reg.resolve("Arial", FontStyle::bold()).wght, 700);
+        assert_eq!(reg.resolve("Arial", FontStyle::normal()).wght, 400);
+        assert_eq!(
+            reg.resolve("Definitely Not A Font 123", FontStyle::bold())
+                .wght,
+            700
+        );
     }
 
     #[test]

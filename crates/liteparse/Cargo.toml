@@ -15,6 +15,10 @@ name = "lit"
 path = "src/main.rs"
 
 [[example]]
+name = "bold_census"
+required-features = ["docx-native", "pptx-native"]
+
+[[example]]
 name = "docx_blocks"
 required-features = ["docx-native"]
 
@@ -86,3 +90,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "fs", "process"] }
 serial_test = "3"
 crc32fast = "1"
 regex = "1"
+# `bold_census` only. Same pins as liteparse-ooxml's C′ measurer stack, so the
+# example inspects faces through exactly the types the render path resolves to.
+fontdb = "0.22"
+skrifa = "0.45"
