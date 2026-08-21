@@ -137,10 +137,12 @@ pub(crate) fn extract_pages_and_images(
             extract_page_image_refs(&page, page_number, output_options.extract_images);
         let mut image_refs = extracted_refs.refs;
         image_error_count += extracted_refs.error_count;
-        let pdf_annotations = (output_options.extract_annotations
-            || output_options.extract_structure_tree)
-            .then(|| page.annotations(&view_box))
-            .unwrap_or_default();
+        let pdf_annotations =
+            if output_options.extract_annotations || output_options.extract_structure_tree {
+                page.annotations(&view_box)
+            } else {
+                Default::default()
+            };
         let annotations = output_options
             .extract_annotations
             .then(|| pdf_annotations.iter().map(document_annotation).collect());

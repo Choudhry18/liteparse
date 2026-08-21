@@ -1634,7 +1634,7 @@ pub(crate) fn validated_ruled_table_rects(
                 x1 = x1.max(b.x + b.width);
                 y1 = y1.max(b.y + b.height);
             }
-            (x1 > x0 && y1 > y0).then(|| Rect {
+            (x1 > x0 && y1 > y0).then_some(Rect {
                 x: x0,
                 y: y0,
                 width: x1 - x0,
@@ -4836,20 +4836,20 @@ fn merge_continuation_rows(rows: &mut Vec<Vec<String>>) {
     }
     let mut out: Vec<Vec<String>> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
-        if let Some(prev) = out.last_mut() {
-            if is_continuation_row(prev, &row) {
-                for (i, cell) in row.iter().enumerate() {
-                    let t = cell.trim();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    // `prev[i]` is non-empty for every filled column of `row`;
-                    // that is the subset rule `is_continuation_row` enforces.
-                    prev[i].push(' ');
-                    prev[i].push_str(t);
+        if let Some(prev) = out.last_mut()
+            && is_continuation_row(prev, &row)
+        {
+            for (i, cell) in row.iter().enumerate() {
+                let t = cell.trim();
+                if t.is_empty() {
+                    continue;
                 }
-                continue;
+                // `prev[i]` is non-empty for every filled column of `row`;
+                // that is the subset rule `is_continuation_row` enforces.
+                prev[i].push(' ');
+                prev[i].push_str(t);
             }
+            continue;
         }
         out.push(row);
     }

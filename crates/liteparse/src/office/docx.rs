@@ -487,7 +487,7 @@ impl<'a> Emitter<'a> {
                 // Emitted as declared. A dense 1..N remap was measured on the
                 // 48-doc corpus and lost 39 of 66 heading rules; see the
                 // "heading levels" note in NATIVE_OFFICE_PLAN.md.
-                level: OutlineLevel::value(lvl).clamp(1, 6) as u8,
+                level: OutlineLevel::value(lvl).clamp(1, 6),
                 text: self.escape(text.trim()),
             });
             self.flush_pending(out);
