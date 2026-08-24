@@ -40,7 +40,7 @@ export interface LiteParseConfig {
   extractLinks: boolean;
   /** Keep running headers/footers in markdown output instead of stripping repeated page-band lines and page chrome (default: false). */
   keepHeadersFooters: boolean;
-  /** Parse DOCX natively instead of converting via LibreOffice (default: true; other formats always use the conversion path). */
+  /** Parse DOCX/PPTX/XLSX natively instead of converting via LibreOffice (default: true; other formats always use the conversion path). */
   officeNative: boolean;
   /** Extract all PDF annotations into each parsed page (default: false). */
   extractAnnotations: boolean;

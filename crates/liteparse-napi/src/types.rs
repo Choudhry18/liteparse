@@ -59,9 +59,10 @@ pub struct JsLiteParseConfig {
     /// Keep running headers/footers in markdown output instead of stripping
     /// repeated page-band lines and page chrome (default false).
     pub keep_headers_footers: Option<bool>,
-    /// Parse DOCX natively instead of converting via LibreOffice (default
-    /// true in builds with the docx-native feature; other formats always use
-    /// the conversion path). Set false to force the LibreOffice path.
+    /// Parse DOCX/PPTX/XLSX natively instead of converting via LibreOffice
+    /// (default true in builds with the docx-native/pptx-native/xlsx-native
+    /// features; other formats always use the conversion path). Set false to
+    /// force the LibreOffice path.
     pub office_native: Option<bool>,
     /// Extract all PDF annotations as page-scoped structured data.
     pub extract_annotations: Option<bool>,

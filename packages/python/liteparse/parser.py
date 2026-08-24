@@ -436,8 +436,8 @@ class LiteParse:
             keep_headers_footers: Keep running headers/footers in markdown
                 output instead of stripping repeated page-band lines and page
                 chrome (default: False).
-            office_native: Parse DOCX natively instead of converting via
-                LibreOffice (default: True; other formats always use the
+            office_native: Parse DOCX/PPTX/XLSX natively instead of converting
+                via LibreOffice (default: True; other formats always use the
                 conversion path). Set False to force the LibreOffice path.
             image_output_dir: Directory where extracted embedded images are
                 written. Requires ``extract_images=True`` and returns file

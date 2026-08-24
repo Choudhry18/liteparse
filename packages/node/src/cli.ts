@@ -89,7 +89,7 @@ program
   .option("--no-ocr", "Disable OCR")
   .option(
     "--no-office-native",
-    "Force the LibreOffice conversion path for DOCX instead of the native parser",
+    "Force the LibreOffice conversion path for DOCX/PPTX/XLSX instead of the native parsers",
   )
   .option("--ocr-language <lang>", "OCR language (default: eng)")
   .option("--max-pages <n>", "Max pages to parse", parseInt)
@@ -324,7 +324,7 @@ program
   .option("--no-ocr", "Disable OCR")
   .option(
     "--no-office-native",
-    "Force the LibreOffice conversion path for DOCX instead of the native parser",
+    "Force the LibreOffice conversion path for DOCX/PPTX/XLSX instead of the native parsers",
   )
   .option("--ocr-language <lang>", "OCR language (default: eng)")
   .option("--ocr-server-url <url>", "HTTP OCR server URL")

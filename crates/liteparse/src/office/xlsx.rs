@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use liteparse_ooxml::xlsx::{self, Cell as GridCell, CellValue, Row, Sheet, Workbook};
+use liteparse_ooxml::xlsx::{self, Cell as GridCell, CellValue, Row, Sheet, SheetPic, Workbook};
 
 use crate::error::LiteParseError;
 use crate::markdown_layout::{Block, Cell, apply_link, escape_inline};
@@ -67,6 +67,13 @@ pub struct EmitOptions {
     /// Render external hyperlinks as `[text](url)` on the cell the link
     /// anchors to. Mirrors `LiteParseConfig::extract_links`.
     pub links: bool,
+    /// Emit `Block::Figure` refs for the sheet's pictures. Mirrors the PDF,
+    /// DOCX and PPTX paths' `image_mode != Off`.
+    pub figures: bool,
+    /// Collect picture bytes as `ExtractedImage`s. Read by the geometry pass
+    /// (`xlsx_layout`), which is where pages — and so image ids' page
+    /// numbers — exist; the block emitter ignores it.
+    pub images: bool,
 }
 
 /// What one native-parsed workbook yields: the block stream, tagged with the
@@ -121,11 +128,56 @@ pub fn emit_workbook(wb: &Workbook, opts: EmitOptions) -> NativeWorkbook {
                 }
             }
         }
+        if opts.figures {
+            for b in figure_blocks(sheet, si) {
+                blocks.push((b, si));
+            }
+        }
     }
     NativeWorkbook {
         blocks,
         sheet_names,
     }
+}
+
+/// A sheet's pictures in reading order — sorted by anchor cell, top-left
+/// first, with the (single corpus) absolute anchor sorting after every cell
+/// anchor. This order is the id order: the geometry pass numbers
+/// `s{sheet}_{n}` walking the same list, so a `![](…)` ref and its
+/// `ExtractedImage` cannot disagree.
+pub(crate) fn ordered_pics(sheet: &Sheet) -> Vec<&SheetPic> {
+    let mut pics: Vec<&SheetPic> = sheet.pics.iter().collect();
+    pics.sort_by_key(|p| match p.anchor.from_cell() {
+        Some(c) => (c.row as i64, c.col as i64, c.row_off_emu, c.col_off_emu),
+        None => match p.anchor {
+            xlsx::PicAnchor::Absolute { pos_emu, .. } => (i64::MAX, pos_emu.1, pos_emu.0, 0),
+            _ => unreachable!("from_cell is None only for Absolute"),
+        },
+    });
+    pics
+}
+
+/// The `Block::Figure` refs for a sheet's pictures, in [`ordered_pics`]
+/// order. Emitted after the sheet's table: the pictures float *over* the
+/// grid, so any interleaving with specific rows would be false precision —
+/// and it keeps the doc emitter geometry-free.
+///
+/// Media the platform does not surface (EMF, SVG with no raster fallback)
+/// takes no ref and no id, matching `FigureSink::place`.
+pub(crate) fn figure_blocks(sheet: &Sheet, sheet_index: usize) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut n = 0u32;
+    for pic in ordered_pics(sheet) {
+        let Some(ext) = super::docx_layout::media_extension(pic.format) else {
+            continue;
+        };
+        n += 1;
+        out.push(Block::Figure {
+            id: format!("s{}_{n}", sheet_index + 1),
+            format: ext.to_string(),
+        });
+    }
+    out
 }
 
 /// A merge's place in the emitted grid: spans counted over *emitted* rows and
@@ -925,7 +977,13 @@ pub(crate) mod tests {
   <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
 </Relationships>"#;
         let wb = workbook_from(sheet, &[("xl/worksheets/_rels/sheet1.xml.rels", rels)]);
-        let with = emit_workbook(&wb, EmitOptions { links: true });
+        let with = emit_workbook(
+            &wb,
+            EmitOptions {
+                links: true,
+                ..Default::default()
+            },
+        );
         let without = emit_workbook(&wb, EmitOptions::default());
         let cell = |nw: &NativeWorkbook| match &nw.blocks[1].0 {
             Block::MergedTable { rows, .. } => rows[0][0].text.clone(),

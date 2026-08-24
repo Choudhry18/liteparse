@@ -43,6 +43,7 @@
 //!   keeping it out of here is what lets this module be tested against a
 //!   corpus with no renderer in the loop.
 
+pub mod drawings;
 pub mod numfmt;
 pub mod package;
 pub mod refs;
@@ -51,6 +52,7 @@ pub mod styles;
 pub mod text;
 mod xml;
 
+pub use drawings::{CellAnchor, PicAnchor, SheetPic};
 pub use package::{SheetEntry, WorkbookPackage, walk};
 pub use refs::{CellRef, RangeRef, column_label, parse_cell, parse_column, parse_range};
 pub use sheet::{Cell, CellValue, ColInfo, Hyperlink, Row, Sheet, SheetStats};
@@ -59,6 +61,7 @@ pub use text::{RichText, RunProps, TextRun, VertAlign, parse_shared_strings};
 
 use crate::docx::error::Result;
 use crate::docx::relationships::TargetMode;
+use crate::docx::zip::{part_directory, resolve_target};
 
 /// A workbook read end to end.
 pub struct Workbook {
@@ -89,7 +92,7 @@ pub struct Workbook {
 /// malformed is the fail-closed behaviour this vendor has already had to
 /// retire repeatedly.
 pub fn read(data: &[u8]) -> Result<Workbook> {
-    let pkg = walk(data)?;
+    let mut pkg = walk(data)?;
 
     let shared_strings = match pkg.shared_strings_xml.as_deref() {
         Some(xml) => parse_shared_strings(xml).unwrap_or_else(|e| {
@@ -111,6 +114,10 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
 
     let mut sheets = Vec::new();
     let mut non_worksheet_sheets = Vec::new();
+    // Pictures found while walking the sheets, resolved down to a media part
+    // path. The bytes move out of the package afterwards, when the immutable
+    // borrows this loop holds are gone.
+    let mut pending_pics: Vec<(usize, drawings::PicAnchor, Option<String>, String)> = Vec::new();
     for entry in &pkg.sheets {
         if !entry.is_worksheet {
             non_worksheet_sheets.push(entry.name.clone());
@@ -133,10 +140,75 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
                         .filter(|r| r.target_mode == TargetMode::External)
                         .map(|r| r.target.clone());
                 }
+                // The drawing part hangs off the same per-part rels; a
+                // picture's `r:embed` then resolves against the *drawing's*
+                // rels, one scope further down. Fail-open at every rung: a
+                // broken drawing costs its pictures, never the sheet.
+                if let Some(id) = s.drawing_rel_id.as_deref()
+                    && let Some(rel) = entry.rels.find_by_id(id)
+                {
+                    let drawing_path = resolve_target(part_directory(&entry.path), &rel.target);
+                    if let Some(dxml) = pkg.package.get_part(&drawing_path) {
+                        match drawings::parse_drawing(dxml) {
+                            Ok(raws) if !raws.is_empty() => {
+                                let drels = package::load_rels(&pkg.package, &drawing_path);
+                                let ddir = part_directory(&drawing_path).to_string();
+                                for raw in raws {
+                                    let Some(r) = drels
+                                        .find_by_id(&raw.rel_id)
+                                        .filter(|r| r.target_mode != TargetMode::External)
+                                    else {
+                                        continue;
+                                    };
+                                    pending_pics.push((
+                                        sheets.len(),
+                                        raw.anchor,
+                                        raw.name,
+                                        resolve_target(&ddir, &r.target),
+                                    ));
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::warn!("drawing part {drawing_path} failed to parse: {e}")
+                            }
+                        }
+                    }
+                }
                 sheets.push(s);
             }
             Err(e) => log::warn!("sheet {:?} failed to parse: {e}", entry.name),
         }
+    }
+
+    // Move each referenced media part out of the package exactly once; every
+    // placement of the same part shares the one `Arc`, which is the identity
+    // downstream dedup keys on.
+    let mut media: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>> =
+        std::collections::HashMap::new();
+    for (si, anchor, name, media_path) in pending_pics {
+        let bytes = match media.get(&media_path) {
+            Some(b) => b.clone(),
+            None => match pkg.package.take_part(&media_path) {
+                Some(b) => {
+                    let arc = std::sync::Arc::new(b);
+                    media.insert(media_path.clone(), arc.clone());
+                    arc
+                }
+                None => {
+                    log::warn!("picture media part missing: {media_path}");
+                    continue;
+                }
+            },
+        };
+        let format = crate::model::ImageFormat::detect(&media_path, &bytes);
+        sheets[si].pics.push(drawings::SheetPic {
+            anchor,
+            name,
+            media_path,
+            format,
+            bytes,
+        });
     }
 
     Ok(Workbook {
@@ -373,6 +445,67 @@ mod tests {
         assert_eq!(links[0].url.as_deref(), Some("https://example.com/x"));
         assert_eq!(links[1].url, None);
         assert_eq!(links[1].location.as_deref(), Some("Sheet2!A1"));
+    }
+
+    /// End to end through the two rels scopes: sheet → drawing part via the
+    /// sheet's rels, blip → media via the *drawing's* rels — and one media
+    /// part referenced twice becomes one `Arc` shared by both placements.
+    #[test]
+    fn pictures_resolve_through_the_drawing_part_to_shared_media_bytes() {
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>
+  <row r="1"><c r="A1"><v>1</v></c></row>
+</sheetData><drawing r:id="rId7"/></worksheet>"#;
+        let sheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>"#;
+        let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:ext cx="914400" cy="457200"/>
+    <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+    <xdr:clientData/>
+  </xdr:oneCellAnchor>
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>9</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:ext cx="914400" cy="457200"/>
+    <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="3" name="Logo again"/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+    <xdr:clientData/>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#;
+        let drawing_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>"#;
+        // A real PNG signature so `ImageFormat::detect`'s magic fallback also
+        // has something honest to look at.
+        let png = "\u{89}PNG-not-really-but-the-extension-decides";
+        let wb = read(&build(&[
+            ("[Content_Types].xml", "<Types/>"),
+            ("_rels/.rels", ROOT_RELS),
+            ("xl/workbook.xml", WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", WB_RELS),
+            ("xl/worksheets/sheet1.xml", sheet),
+            ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+            ("xl/drawings/drawing1.xml", drawing),
+            ("xl/drawings/_rels/drawing1.xml.rels", drawing_rels),
+            ("xl/media/image1.png", png),
+        ]))
+        .unwrap();
+        let pics = &wb.sheets[0].pics;
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].name.as_deref(), Some("Logo"));
+        assert_eq!(pics[0].media_path, "xl/media/image1.png");
+        assert_eq!(pics[0].format, crate::model::ImageFormat::Png);
+        assert_eq!(pics[0].bytes.as_slice(), png.as_bytes());
+        // One media part, one allocation: both placements share the Arc.
+        assert!(std::sync::Arc::ptr_eq(&pics[0].bytes, &pics[1].bytes));
+        assert_eq!(
+            pics[1].anchor.from_cell().unwrap(),
+            drawings::CellAnchor {
+                col: 5,
+                row: 9,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

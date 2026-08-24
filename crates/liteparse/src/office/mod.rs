@@ -19,6 +19,8 @@ pub mod docx;
 #[cfg(feature = "office-native")]
 pub mod docx_layout;
 #[cfg(feature = "office-native")]
+pub(crate) mod figures;
+#[cfg(feature = "office-native")]
 pub(crate) mod inline;
 #[cfg(feature = "pptx-native")]
 pub mod pptx;

@@ -26,6 +26,7 @@ use std::collections::HashMap;
 
 use crate::error::LiteParseError;
 use crate::markdown_layout::{Block, Cell};
+use crate::office::figures::FigureSink;
 use crate::office::inline::{Chunk, Fmt, render_chunks};
 use crate::types::{ExtractedImage, Rect};
 
@@ -556,7 +557,7 @@ impl Deck {
             let Some(prepared) = self.prepare(pkg, slide) else {
                 continue;
             };
-            figures.start_slide();
+            figures.reset_ordinal();
             let mut ctx = SlideCtx {
                 cascade: prepared.cascade(),
                 part: &slide.slide,
@@ -708,125 +709,6 @@ fn inherited_shapes(shapes: &[Shape]) -> Vec<Shape> {
 }
 
 // ── figures ─────────────────────────────────────────────────────────────────
-
-/// Assigns figure ids and accumulates the bytes behind them, deck-wide.
-///
-/// Ids follow the platform extractor's `p{page}_{n}` naming, 1-based on both
-/// halves, so `img_{id}.{ext}` file names line up with the PDF and DOCX paths'.
-/// A slide *is* a page, so `page` is intrinsic here rather than recovered.
-///
-/// **`n` counts in reading order, not draw order**, which is the one place this
-/// diverges from its siblings. Draw order is available — it is source order —
-/// but using it would mean a second walk purely to number things, and reading
-/// order is the order the `![](…)` refs appear in the markdown, so a reader
-/// scanning down the page sees `_1` before `_2`. The platform's caveat about
-/// index drift (its extractor increments even for images it skips) already
-/// means these indices are names, not positions.
-#[derive(Default)]
-struct FigureSink {
-    images: Vec<ExtractedImage>,
-    /// Same media `Arc` ⇒ same bytes. Free dedup for the repeated-logo case,
-    /// which on this corpus is 3,602 placements behind 1,322 distinct images —
-    /// and `MediaCache` pools bytes by package path, so a logo a slide and its
-    /// master both reference is one allocation and hits here rather than in
-    /// the hash map below.
-    by_ptr: HashMap<usize, usize>,
-    /// Distinct rels can still hold identical bytes; hash → candidate
-    /// canonical indices, confirmed by full compare like the DOCX path's.
-    by_hash: HashMap<u64, Vec<usize>>,
-    /// 1-based within the current slide, reset by [`FigureSink::start_slide`].
-    n: u32,
-}
-
-impl FigureSink {
-    fn start_slide(&mut self) {
-        self.n = 0;
-    }
-
-    /// Record one placed picture and return the `(id, extension)` its
-    /// `Block::Figure` should carry, or `None` for media we do not surface
-    /// bytes for — the 29 corpus EMF references and the 154 SVG-only blips,
-    /// which have no raster fallback anywhere in the package.
-    fn place(
-        &mut self,
-        blip: &liteparse_ooxml::render::layout::draw_command::ResolvedBlip,
-        page: u32,
-        bbox: Rect,
-    ) -> Option<(String, String)> {
-        use std::hash::{Hash, Hasher};
-
-        let ext = super::docx_layout::media_extension(blip.format)?;
-        self.n += 1;
-        let id = format!("p{page}_{}", self.n);
-        let ptr = blip.data.as_ptr() as usize;
-
-        let canonical = self.by_ptr.get(&ptr).copied().or_else(|| {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            blip.data.hash(&mut h);
-            self.by_hash
-                .get(&h.finish())?
-                .iter()
-                .copied()
-                .find(|&i| *self.images[i].bytes == *blip.data)
-        });
-
-        let entry = match canonical {
-            Some(ci) => {
-                let canonical = &self.images[ci];
-                ExtractedImage {
-                    id: id.clone(),
-                    name: format!("img_{id}.{ext}"),
-                    path: None,
-                    page,
-                    bbox,
-                    width: canonical.width,
-                    height: canonical.height,
-                    rotation: 0.0,
-                    format: ext.to_string(),
-                    duplicate_of: Some(canonical.id.clone()),
-                    bytes: std::sync::Arc::clone(&canonical.bytes),
-                }
-            }
-            None => {
-                let bytes = std::sync::Arc::new(blip.data.to_vec());
-                // The *natural* size of the image, not the placed box —
-                // `bbox` already carries the placement. A crop is not applied
-                // to either: `src_rect` describes a visible sub-rectangle the
-                // bytes still contain, and 44% of corpus pictures declare one,
-                // so re-encoding to honour it would re-encode nearly half the
-                // corpus to change a number no consumer reads.
-                let (width, height) =
-                    image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
-                        .with_guessed_format()
-                        .ok()
-                        .and_then(|r| r.into_dimensions().ok())
-                        .unwrap_or((0, 0));
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                blip.data.hash(&mut h);
-                self.by_hash
-                    .entry(h.finish())
-                    .or_default()
-                    .push(self.images.len());
-                self.by_ptr.insert(ptr, self.images.len());
-                ExtractedImage {
-                    id: id.clone(),
-                    name: format!("img_{id}.{ext}"),
-                    path: None,
-                    page,
-                    bbox,
-                    width,
-                    height,
-                    rotation: 0.0,
-                    format: ext.to_string(),
-                    duplicate_of: None,
-                    bytes,
-                }
-            }
-        };
-        self.images.push(entry);
-        Some((id, ext.to_string()))
-    }
-}
 
 /// The blip fill a shape carries as its *picture*, if it is one.
 ///
@@ -1184,7 +1066,13 @@ fn emit_figure(
         width: emu_to_pt(box_.size.width.raw()),
         height: emu_to_pt(box_.size.height.raw()),
     };
-    let Some((id, format)) = ctx.figures.place(&blip, ctx.page, bbox) else {
+    let Some((id, format)) = ctx.figures.place(
+        &blip.data,
+        blip.format,
+        &format!("p{}", ctx.page),
+        ctx.page,
+        bbox,
+    ) else {
         return;
     };
     if ctx.opts.figures {
@@ -1913,111 +1801,6 @@ mod tests {
     fn an_ordinary_shape_is_not_a_picture() {
         let shapes = tree(&text_shape(2, 0, 0, &["just words"]));
         assert!(picture_fill(&shapes[0]).is_none());
-    }
-
-    fn blip(bytes: &std::sync::Arc<[u8]>) -> ResolvedBlipFor {
-        liteparse_ooxml::render::layout::draw_command::ResolvedBlip {
-            data: std::sync::Arc::clone(bytes),
-            format: liteparse_ooxml::model::ImageFormat::Png,
-            src_rect: None,
-        }
-    }
-    type ResolvedBlipFor = liteparse_ooxml::render::layout::draw_command::ResolvedBlip;
-
-    /// A 1x1 PNG, so `image::ImageReader` reports real dimensions.
-    fn png() -> Vec<u8> {
-        vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ]
-    }
-
-    fn rect() -> Rect {
-        Rect {
-            x: 1.0,
-            y: 2.0,
-            width: 3.0,
-            height: 4.0,
-        }
-    }
-
-    /// Ids are `p{page}_{n}`, 1-based on both halves and restarted per slide,
-    /// so they line up with the platform extractor's and the PDF path's.
-    #[test]
-    fn figure_ids_are_page_scoped_and_one_based() {
-        let mut sink = FigureSink::default();
-        let a: std::sync::Arc<[u8]> = png().into();
-        let b: std::sync::Arc<[u8]> = {
-            let mut v = png();
-            v.extend_from_slice(&[0u8; 4]);
-            v.into()
-        };
-        sink.start_slide();
-        assert_eq!(sink.place(&blip(&a), 1, rect()).unwrap().0, "p1_1");
-        assert_eq!(sink.place(&blip(&b), 1, rect()).unwrap().0, "p1_2");
-        sink.start_slide();
-        assert_eq!(sink.place(&blip(&b), 2, rect()).unwrap().0, "p2_1");
-    }
-
-    /// The repeated-logo case, which is what makes emitting a master's picture
-    /// on all 47 of its slides affordable: every placement keeps its own name,
-    /// and all but the first point at one canonical entry's bytes.
-    #[test]
-    fn a_repeated_picture_collapses_onto_one_canonical_entry() {
-        let mut sink = FigureSink::default();
-        let logo: std::sync::Arc<[u8]> = png().into();
-        for page in 1..=3 {
-            sink.start_slide();
-            sink.place(&blip(&logo), page, rect()).expect("placed");
-        }
-        assert_eq!(sink.images.len(), 3, "one entry per placement");
-        assert_eq!(sink.images[0].duplicate_of, None);
-        assert_eq!(
-            sink.images[1].duplicate_of.as_deref(),
-            Some("p1_1"),
-            "later placements name the canonical id"
-        );
-        assert_eq!(sink.images[2].duplicate_of.as_deref(), Some("p1_1"));
-        // Distinct names, shared bytes — the platform's contract exactly.
-        assert_eq!(sink.images[1].name, "img_p2_1.png");
-        assert!(std::sync::Arc::ptr_eq(
-            &sink.images[0].bytes,
-            &sink.images[2].bytes
-        ));
-    }
-
-    /// Two *different* relationships can hold identical bytes — a logo the
-    /// author pasted into the slide and into the master. The `Arc` pointers
-    /// differ, so only the content hash catches this one.
-    #[test]
-    fn identical_bytes_behind_different_rels_still_dedupe() {
-        let mut sink = FigureSink::default();
-        let one: std::sync::Arc<[u8]> = png().into();
-        let two: std::sync::Arc<[u8]> = png().into();
-        assert!(!std::sync::Arc::ptr_eq(&one, &two), "distinct allocations");
-        sink.start_slide();
-        sink.place(&blip(&one), 1, rect()).expect("placed");
-        sink.place(&blip(&two), 1, rect()).expect("placed");
-        assert_eq!(sink.images[1].duplicate_of.as_deref(), Some("p1_1"));
-    }
-
-    /// Media we do not surface bytes for is not a figure and does not consume
-    /// an id — 29 corpus EMF references and 154 SVG-only blips land here, and
-    /// a ref numbered around them would name a file nothing writes.
-    #[test]
-    fn media_we_cannot_surface_takes_no_id() {
-        let mut sink = FigureSink::default();
-        let emf: std::sync::Arc<[u8]> = png().into();
-        sink.start_slide();
-        let mut b = blip(&emf);
-        b.format = liteparse_ooxml::model::ImageFormat::Emf;
-        assert!(sink.place(&b, 1, rect()).is_none());
-        assert!(sink.images.is_empty());
-        // The next real picture is still `_1`.
-        assert_eq!(sink.place(&blip(&emf), 1, rect()).unwrap().0, "p1_1");
     }
 
     /// A rung's pictures reach the reading order, and they arrive flagged as

@@ -43,6 +43,10 @@ name = "xlsx_emit"
 required-features = ["xlsx-native"]
 
 [[example]]
+name = "xlsx_pics_check"
+required-features = ["xlsx-native"]
+
+[[example]]
 name = "xlsx_layout_check"
 required-features = ["xlsx-native"]
 

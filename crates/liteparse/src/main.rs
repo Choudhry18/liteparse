@@ -54,9 +54,9 @@ struct ParseCommand {
     #[arg(long)]
     no_ocr: bool,
 
-    /// Force the LibreOffice conversion path for DOCX instead of the native
-    /// parser (builds with the docx-native feature parse DOCX natively by
-    /// default)
+    /// Force the LibreOffice conversion path for DOCX/PPTX/XLSX instead of
+    /// the native parsers (builds with the docx-native/pptx-native/
+    /// xlsx-native features parse those formats natively by default)
     #[arg(long)]
     no_office_native: bool,
 
@@ -218,9 +218,9 @@ struct BatchParseCommand {
     #[arg(long)]
     no_ocr: bool,
 
-    /// Force the LibreOffice conversion path for DOCX instead of the native
-    /// parser (builds with the docx-native feature parse DOCX natively by
-    /// default)
+    /// Force the LibreOffice conversion path for DOCX/PPTX/XLSX instead of
+    /// the native parsers (builds with the docx-native/pptx-native/
+    /// xlsx-native features parse those formats natively by default)
     #[arg(long)]
     no_office_native: bool,
 

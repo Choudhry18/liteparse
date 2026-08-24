@@ -147,6 +147,13 @@ pub struct Sheet {
     pub frozen_cols: u32,
     /// `<autoFilter ref=…>`, the other explicit header signal.
     pub auto_filter: Option<RangeRef>,
+    /// `<drawing r:id>`: the sheet's DrawingML part, scoped to the sheet's
+    /// own relationships. At most one per §18.3.1.36.
+    pub drawing_rel_id: Option<String>,
+    /// Pictures placed over the grid, resolved by [`crate::xlsx::read`] from
+    /// the drawing part — empty until then, and empty for the 69% of corpus
+    /// workbooks whose sheets draw nothing.
+    pub pics: Vec<crate::xlsx::drawings::SheetPic>,
     pub stats: SheetStats,
 }
 
@@ -321,6 +328,9 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
                     }
                     b"autoFilter" => {
                         sheet.auto_filter = attr(e, b"ref").as_deref().and_then(parse_range);
+                    }
+                    b"drawing" => {
+                        sheet.drawing_rel_id = attr(e, b"r:id");
                     }
                     _ => {}
                 }

@@ -53,15 +53,15 @@ pub struct LiteParseConfig {
     /// downstream than risk losing content. Only affects Markdown output.
     #[serde(default)]
     pub keep_headers_footers: bool,
-    /// Parse DOCX natively (vendored layout engine) instead of converting via
-    /// LibreOffice. Default `true`; effective only when built with the
-    /// `docx-native` cargo feature and the input is a `.docx` — every other
-    /// format always takes the conversion path. Set `false` to force the
-    /// LibreOffice path (A/B comparison). The native path never runs OCR
-    /// (text is born digital; a text-sparse DOCX falls back to conversion so
-    /// scanned images still OCR), produces no screenshots, and falls back to
-    /// conversion for config it cannot honor (image/annotation/form/structure
-    /// extraction, crop, complexity).
+    /// Parse DOCX/PPTX/XLSX natively (vendored readers + layout) instead of
+    /// converting via LibreOffice. Default `true`; each format is gated by
+    /// its cargo feature (`docx-native`, `pptx-native`, `xlsx-native`) and
+    /// every other format always takes the conversion path. Set `false` to
+    /// force the LibreOffice path (A/B comparison). The native paths never
+    /// run OCR (text is born digital; a text-sparse document falls back to
+    /// conversion so scanned images still OCR), produce no screenshots, and
+    /// fall back to conversion for config they cannot honor (image/
+    /// annotation/form/structure extraction, crop, complexity).
     #[serde(default = "default_true")]
     pub office_native: bool,
     /// Extract all PDF annotations into each parsed page. Default `false`.

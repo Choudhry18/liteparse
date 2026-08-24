@@ -59,7 +59,7 @@ pub struct LiteParseConfig {
     /// Keep running headers/footers in markdown output instead of stripping
     /// repeated page-band lines and page chrome. Default false.
     keep_headers_footers: Option<bool>,
-    /// Parse DOCX natively instead of converting via LibreOffice. Accepted
+    /// Parse DOCX/PPTX/XLSX natively instead of converting via LibreOffice. Accepted
     /// and echoed for config round-trip parity; the native path is not
     /// compiled into the wasm build yet, so it has no effect here.
     office_native: Option<bool>,

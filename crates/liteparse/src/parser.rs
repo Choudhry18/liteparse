@@ -900,18 +900,17 @@ impl LiteParse {
     /// Config options the native XLSX path cannot honor. Hitting one with
     /// `office_native` on is a hard `Config` error, not a fallback.
     ///
-    /// Two entries are XLSX-specific:
+    /// One entry is XLSX-specific:
     ///
     /// * `extract_annotations` — hyperlinks reach `TextItem::link`, but no
     ///   `DocumentAnnotation` list is built (same v1 state the PPTX path
     ///   started in).
-    /// * `extract_images` / `image_mode = embed` — the reader does not parse
-    ///   `xl/drawings`, so a workbook's embedded pictures and charts are
-    ///   invisible to the native path; an explicit ask routes to the
-    ///   conversion path instead of silently under-delivering. The default
-    ///   `image_mode = placeholder` is *not* gated: a native parse emits no
-    ///   figure refs where the conversion path could — accepted and recorded,
-    ///   because gating the default would turn the native path off.
+    ///
+    /// `extract_images` / `image_mode = embed` **were** here, for as long as
+    /// the reader ignored `xl/drawings`. The drawing layer's pictures now
+    /// extract (charts and drawing shapes remain out of scope — a chart has
+    /// no image bytes and either engine's conversion path also extracts none
+    /// for it), so both flags are honored rather than rejected.
     #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
     fn native_xlsx_ineligible_reason(&self) -> Option<&'static str> {
         let c = &self.config;
@@ -927,8 +926,6 @@ impl LiteParse {
             Some("skip_diagonal_text")
         } else if c.extract_annotations {
             Some("extract_annotations")
-        } else if c.effective_extract_images() {
-            Some("extract_images")
         } else {
             None
         }
@@ -955,10 +952,15 @@ impl LiteParse {
 
         let wb = liteparse_ooxml::xlsx::read(data)
             .map_err(|e| LiteParseError::Conversion(format!("xlsx parse failed: {e}")))?;
+        // Same two gates as the PDF, DOCX and PPTX paths: figures interleave
+        // when `image_mode != Off`, pixel bytes surface under
+        // `effective_extract_images`.
         let nx = xlsx_layout::workbook_to_pages(
             &wb,
             xlsx::EmitOptions {
                 links: self.config.extract_links,
+                figures: self.config.image_mode != crate::config::ImageMode::Off,
+                images: self.config.effective_extract_images(),
             },
         );
 
@@ -977,8 +979,8 @@ impl LiteParse {
         }
 
         // Per-page complexity from native facts: the page's table blocks
-        // (exact, not detected), no media rects (drawings are unparsed), and
-        // a column count of 1 — a spreadsheet has no section columns.
+        // (exact, not detected), the drawing layer's picture rects, and a
+        // column count of 1 — a spreadsheet has no section columns.
         let complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>> =
             if self.config.include_complexity {
                 nx.pages
@@ -997,7 +999,7 @@ impl LiteParse {
                             .count();
                         Some(crate::ocr_merge::calculate_native_page_complexity(
                             p,
-                            &[],
+                            nx.pic_rects.get(i).map(Vec::as_slice).unwrap_or(&[]),
                             tables,
                             1,
                         ))
@@ -1036,14 +1038,27 @@ impl LiteParse {
             page_stats.push(s);
         }
 
-        Ok(Some(self.parse_from_native_blocks(
+        let mut result = self.parse_from_native_blocks(
             pages,
             page_blocks,
             (!page_filtered).then_some(nx.all_blocks),
             nx.outline,
-            Vec::new(),
+            nx.images,
             page_stats,
-        )))
+        );
+
+        // Same post-passes as the PDF, DOCX and PPTX paths, same order:
+        // duplicate figure refs point at the canonical name, then only
+        // canonical files are written.
+        if self.config.output_format == crate::config::OutputFormat::Markdown {
+            rewrite_duplicate_image_refs(&mut result.pages, &mut result.text, &result.images);
+        }
+        if self.config.effective_extract_images()
+            && let Some(output_dir) = self.config.image_output_dir.as_deref()
+        {
+            write_extracted_images(output_dir, &mut result.images)?;
+        }
+        Ok(Some(result))
     }
 
     /// Run the native PPTX pipeline. Contract matches the DOCX sibling:

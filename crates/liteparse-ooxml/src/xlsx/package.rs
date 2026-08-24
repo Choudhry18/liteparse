@@ -121,7 +121,7 @@ pub fn walk(data: &[u8]) -> Result<WorkbookPackage> {
     })
 }
 
-fn load_rels(package: &PackageContents, part_path: &str) -> Relationships {
+pub(crate) fn load_rels(package: &PackageContents, part_path: &str) -> Relationships {
     let rels_path = if part_path.is_empty() {
         "_rels/.rels".to_string()
     } else {
