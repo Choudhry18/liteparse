@@ -95,6 +95,10 @@ pub struct Hyperlink {
     /// The `r:id` to resolve against the sheet's own relationships. Absent for
     /// an in-workbook link, which carries only a `location`.
     pub rel_id: Option<String>,
+    /// The external URL [`rel_id`](Self::rel_id) resolves to. Filled by
+    /// [`crate::xlsx::read`], which holds the sheet's relationships part; this
+    /// parser alone cannot resolve it and leaves `None`.
+    pub url: Option<String>,
     /// `location=`: a defined name or `Sheet2!A1` target within the workbook.
     pub location: Option<String>,
     pub tooltip: Option<String>,
@@ -309,6 +313,7 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
                             sheet.hyperlinks.push(Hyperlink {
                                 at,
                                 rel_id: attr(e, b"r:id"),
+                                url: None,
                                 location: attr(e, b"location"),
                                 tooltip: attr(e, b"tooltip"),
                             });

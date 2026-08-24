@@ -58,6 +58,7 @@ pub use styles::{Alignment, CellXf, Font, HorizontalAlign, Styles};
 pub use text::{RichText, RunProps, TextRun, VertAlign, parse_shared_strings};
 
 use crate::docx::error::Result;
+use crate::docx::relationships::TargetMode;
 
 /// A workbook read end to end.
 pub struct Workbook {
@@ -119,7 +120,21 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
             continue;
         };
         match sheet::parse(&entry.name, entry.visible, xml) {
-            Ok(s) => sheets.push(s),
+            Ok(mut s) => {
+                // A hyperlink's `r:id` is scoped to the sheet part that wrote
+                // it — the same per-part rule the PPTX blip work established —
+                // so resolution has to happen here, where the entry's own
+                // relationships are still in hand.
+                for h in &mut s.hyperlinks {
+                    h.url = h
+                        .rel_id
+                        .as_deref()
+                        .and_then(|id| entry.rels.find_by_id(id))
+                        .filter(|r| r.target_mode == TargetMode::External)
+                        .map(|r| r.target.clone());
+                }
+                sheets.push(s);
+            }
             Err(e) => log::warn!("sheet {:?} failed to parse: {e}", entry.name),
         }
     }
@@ -329,6 +344,35 @@ mod tests {
             wb.sheets[0].rows[1].cells[0].value,
             CellValue::Number(1234.5)
         );
+    }
+
+    /// A hyperlink's `r:id` resolves against the *sheet's* relationships part,
+    /// not the workbook's — the per-part scoping rule. An in-workbook link
+    /// (`location` only) has no rel and stays `None`.
+    #[test]
+    fn hyperlinks_resolve_to_external_urls_through_sheet_rels() {
+        let sheet = r#"<worksheet><sheetData>
+  <row r="1"><c r="A1"><v>1</v></c></row>
+</sheetData><hyperlinks>
+  <hyperlink ref="A1" r:id="rId9"/>
+  <hyperlink ref="B1" location="Sheet2!A1"/>
+</hyperlinks></worksheet>"#;
+        let sheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/x" TargetMode="External"/>
+</Relationships>"#;
+        let wb = read(&build(&[
+            ("[Content_Types].xml", "<Types/>"),
+            ("_rels/.rels", ROOT_RELS),
+            ("xl/workbook.xml", WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", WB_RELS),
+            ("xl/worksheets/sheet1.xml", sheet),
+            ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+        ]))
+        .unwrap();
+        let links = &wb.sheets[0].hyperlinks;
+        assert_eq!(links[0].url.as_deref(), Some("https://example.com/x"));
+        assert_eq!(links[1].url, None);
+        assert_eq!(links[1].location.as_deref(), Some("Sheet2!A1"));
     }
 
     #[test]

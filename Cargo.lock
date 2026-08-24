@@ -2070,6 +2070,7 @@ dependencies = [
  "url",
  "usvg",
  "web-time",
+ "zip",
 ]
 
 [[package]]

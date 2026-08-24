@@ -24,6 +24,12 @@ pub(crate) mod inline;
 pub mod pptx;
 #[cfg(feature = "pptx-native")]
 pub mod pptx_layout;
+// Markdown-only for now: `parser.rs` does not route `.xlsx` here yet, because
+// `parse_from_native_blocks` needs real pages and the XLSX geometry pass is a
+// later step — the same order the PPTX path landed in (emitter first, wiring
+// once geometry existed).
+#[cfg(feature = "xlsx-native")]
+pub mod xlsx;
 
 /// The input's bytes when it is a `.docx` the native path should try, `None`
 /// otherwise. Path inputs are matched on extension only (`.doc`/`.docm`/

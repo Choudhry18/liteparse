@@ -163,7 +163,20 @@ fn render_text(code: &str, text: &str) -> String {
     }
     let out = ssf_rs::format(code, &Value::Text(text.to_string()), false)
         .unwrap_or_else(|_| text.to_string());
-    strip_nan(code, out, Some(text))
+    let out = strip_nan(code, out, Some(text));
+    // `ssf-rs` 0.1 truncates the text at the fill character when `*`'s fill
+    // char also occurs in the text: `@*.` renders `"1. kvartal:"` as `"1."`.
+    // (`@* ` is unaffected — the defect is per fill char, and `.` is the one
+    // the corpus hits.) A section with `@` places the text verbatim, so an
+    // output that lost it is a wrong answer, not a presentation choice; fall
+    // back to the raw text — keep the data, lose the fill. Detect on the
+    // output, not the input: same rule as the `NaN` guard above, and for the
+    // same reason (the first version of that guard rejected inputs and
+    // regressed 1,100 correct renders).
+    if code.contains('*') && code.contains('@') && !out.contains(text) {
+        return text.to_string();
+    }
+    out
 }
 
 /// Remove a `NaN` the interpreter leaked into a cell.
@@ -394,6 +407,20 @@ mod tests {
             render_text("@*.", "Networking and Network Applications (NaNA)"),
             "Networking and Network Applications (NaNA)."
         );
+    }
+
+    /// The upstream defect the emitter's recall gate caught: `ssf-rs` 0.1
+    /// truncates the text at the fill character when it also occurs in the
+    /// text — `@*.` on `"1. kvartal:"` came back `"1."`. The guard keeps the
+    /// data and drops the fill, and must not disturb the two behaviours next
+    /// to it: an intact render keeps its fill, and the empty fourth section
+    /// still blanks (no `@` in that code, so the guard stays out of its way).
+    #[test]
+    fn a_fill_char_inside_the_text_does_not_truncate_it() {
+        assert_eq!(render_text("@*.", "1. kvartal:"), "1. kvartal:");
+        assert_eq!(render_text("@*.", "a.b c:"), "a.b c:");
+        assert_eq!(render_text("@*.", "no dot"), "no dot.");
+        assert_eq!(render_text("#,##0.00;;;", "hidden"), "");
     }
 
     #[test]

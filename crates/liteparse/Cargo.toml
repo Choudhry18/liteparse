@@ -38,8 +38,12 @@ required-features = ["pptx-native"]
 name = "pptx_raster_dump"
 required-features = ["pptx-native"]
 
+[[example]]
+name = "xlsx_emit"
+required-features = ["xlsx-native"]
+
 [features]
-default = ["tesseract", "docx-native", "pptx-native"]
+default = ["tesseract", "docx-native", "pptx-native", "xlsx-native"]
 oar-ocr = ["dep:oar-ocr"]
 oar-ocr-auto-download = ["oar-ocr", "oar-ocr/auto-download"]
 oar-ocr-cuda = ["oar-ocr", "oar-ocr/cuda"]
@@ -56,6 +60,9 @@ tesseract = ["dep:tesseract-rs"]
 office-native = []
 docx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
 pptx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
+# Emitter only so far — `parser.rs` routes `.xlsx` through LibreOffice until
+# the XLSX geometry pass lands (`office/mod.rs` says why). No raster needed.
+xlsx-native = ["dep:liteparse-ooxml", "office-native"]
 
 [dependencies]
 blake3 = "1"
@@ -90,6 +97,9 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "fs", "process"] }
 serial_test = "3"
 crc32fast = "1"
 regex = "1"
+# `office::xlsx` tests build minimal workbooks in memory, same pin as
+# liteparse-ooxml's own reader tests.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # `bold_census` only. Same pins as liteparse-ooxml's C′ measurer stack, so the
 # example inspects faces through exactly the types the render path resolves to.
 fontdb = "0.22"
