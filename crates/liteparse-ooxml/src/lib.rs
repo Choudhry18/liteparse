@@ -28,5 +28,6 @@ pub mod field;
 pub mod model;
 pub mod pptx;
 pub mod render;
+pub mod xlsx;
 
 pub use error::Error;

@@ -73,6 +73,21 @@ pub enum RelationshipType {
     NotesMaster,
     /// §13.3.3: the handout master (PresentationML).
     HandoutMaster,
+    /// §12.3.24: a worksheet (SpreadsheetML).
+    Worksheet,
+    /// §12.3.4: a chartsheet — declared in `<sheets>` like a worksheet but
+    /// holding a chart instead of a cell grid.
+    ChartSheet,
+    /// §12.3.7: a dialog sheet, the same shape of exception as a chartsheet.
+    DialogSheet,
+    /// §12.3.15: the shared-string table (SpreadsheetML).
+    SharedStrings,
+    /// §12.3.20: a table part (`xl/tables/tableN.xml`).
+    Table,
+    /// §12.3.2: the calculation chain — cached formula ordering, never text.
+    CalcChain,
+    /// §12.3.11: a drawing part (also §13.3.1 in PresentationML).
+    Drawing,
     /// Any relationship type not listed above.
     Unknown(String),
 }
@@ -138,6 +153,23 @@ impl RelationshipType {
             Self::HandoutMaster
         } else if uri.ends_with("/slide") {
             Self::Slide
+        // SpreadsheetML (§12.3). As above, no type here is a `/`-suffix of
+        // another — `/pivotTable` does not end with `/table`, `/chartsheet`
+        // does not end with `/chart` — but longer names stay first anyway.
+        } else if uri.ends_with("/worksheet") {
+            Self::Worksheet
+        } else if uri.ends_with("/chartsheet") {
+            Self::ChartSheet
+        } else if uri.ends_with("/dialogsheet") {
+            Self::DialogSheet
+        } else if uri.ends_with("/sharedStrings") {
+            Self::SharedStrings
+        } else if uri.ends_with("/calcChain") {
+            Self::CalcChain
+        } else if uri.ends_with("/table") {
+            Self::Table
+        } else if uri.ends_with("/drawing") {
+            Self::Drawing
         } else {
             warn!("unknown relationship type: {}", uri);
             Self::Unknown(uri.to_string())
