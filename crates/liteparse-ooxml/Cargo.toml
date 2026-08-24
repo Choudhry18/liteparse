@@ -13,6 +13,11 @@ quick-xml = { version = "0.39", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 thiserror = "2"
+# XLSX number formatting (§18.8.31). A faithful port of SheetJS's `ssf`, which
+# is what makes it worth taking as a dependency: the reference implementation is
+# JS, so a port can be diffed against its origin rather than only against a
+# spec reading. Apache-2.0, one transitive dep (`regex`).
+ssf-rs = "0.1"
 log = "0.4"
 rustc-hash = "2"
 # C′ measurer stack (spikes 6–8): resolution via fontdb, metrics/advances via

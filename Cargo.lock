@@ -2101,6 +2101,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skrifa",
+ "ssf-rs",
  "thiserror 2.0.19",
  "tiny-skia",
  "unicode-normalization",
@@ -4145,6 +4146,15 @@ dependencies = [
  "nom 7.1.3",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "ssf-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b553b4f0a04a9d3c330973c51f285f25315f56931522ebf101bd5c5ebc613f9"
+dependencies = [
+ "regex",
 ]
 
 [[package]]

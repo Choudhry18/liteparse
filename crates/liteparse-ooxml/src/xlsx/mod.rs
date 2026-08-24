@@ -24,7 +24,10 @@
 //! for sheet in &wb.sheets {
 //!     for row in &sheet.rows {
 //!         for cell in &row.cells {
+//!             // The raw value and its format code, kept apart …
 //!             let text = wb.cell_text(cell);
+//!             // … and joined on demand: `0.155` + `0.0%` → `15.5%`.
+//!             let shown = wb.display_text(cell);
 //!         }
 //!     }
 //! }
@@ -33,12 +36,6 @@
 //!
 //! # What this layer does *not* do
 //!
-//! * **Number formatting.** A cell keeps its raw `f64` and its format code;
-//!   turning `0.155` into `15.5%` is an interpreter, and the corpus says it is
-//!   a real one — 665 distinct format codes, 50.0% of documents needing
-//!   multi-section `pos;neg;zero;text` dispatch, 34.9% needing `_` skip-width
-//!   padding. That is a vendored component (`ssf-rs` / `ironcalc`), landing
-//!   separately, and [`Workbook::format_code`] is the seam it plugs into.
 //! * **Geometry.** Column widths stay in Excel's character unit and row
 //!   heights in points; converting to a page needs the Normal font's digit
 //!   width. That is the geometry pass.
@@ -46,6 +43,7 @@
 //!   keeping it out of here is what lets this module be tested against a
 //!   corpus with no renderer in the loop.
 
+pub mod numfmt;
 pub mod package;
 pub mod refs;
 pub mod sheet;
@@ -272,6 +270,18 @@ mod tests {
         assert_eq!(pct.value, CellValue::Number(0.155));
         assert_eq!(wb.format_code(pct), "0.0%");
         assert!(wb.cell_text(pct).is_none());
+        // …and joining them is `display_text`, not the reader's business.
+        assert_eq!(wb.display_text(pct).unwrap(), "15.5%");
+        assert_eq!(wb.display_text(plain).unwrap(), "1234.5");
+    }
+
+    /// A shared string reaches the formatter through the table, so the text
+    /// path cannot be exercised by [`numfmt::render`] alone.
+    #[test]
+    fn display_text_resolves_a_shared_string_before_formatting_it() {
+        let wb = workbook();
+        let cell = &wb.sheets[0].rows[0].cells[0];
+        assert_eq!(wb.display_text(cell).unwrap(), "Total assets");
     }
 
     /// A chartsheet is declared in `<sheets>` exactly like a worksheet. Parsing
