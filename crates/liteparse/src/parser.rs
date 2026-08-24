@@ -441,6 +441,42 @@ impl LiteParse {
             }
         }
 
+        // Native XLSX path, same contract again. The workbook states its own
+        // geometry, so this one has no layout engine to fail — the fallback
+        // exists for reader errors (and the text-sparse OCR case, where a
+        // pasted scan is only reachable by rendering through LibreOffice).
+        #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+        if self.config.office_native {
+            if let Some(reason) = self.native_xlsx_ineligible_reason() {
+                if crate::office::xlsx_bytes(&input).is_some() {
+                    return Err(LiteParseError::Config(format!(
+                        "`{reason}` is not supported by the native XLSX path; \
+                         disable it, or set office_native = false \
+                         (CLI: --no-office-native) to parse via the conversion path"
+                    )));
+                }
+            } else if let Some(bytes) = crate::office::xlsx_bytes(&input) {
+                match self.try_parse_xlsx_native(&bytes) {
+                    Ok(Some(result)) => {
+                        let total =
+                            web_time::Instant::now().duration_since(t0).as_secs_f64() * 1000.0;
+                        log(&format!("[liteparse] native xlsx total: {:.1}ms", total));
+                        return Ok(result);
+                    }
+                    Ok(None) => {
+                        log(
+                            "[liteparse] office_native: text-sparse xlsx, falling back to conversion path for OCR",
+                        );
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "[liteparse] office_native failed ({e}); falling back to conversion path"
+                        ));
+                    }
+                }
+            }
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         let (validated_input, _guard) =
             conversion::resolve_pdf_input(input, self.config.password.as_deref(), false).await?;
@@ -859,6 +895,155 @@ impl LiteParse {
         } else {
             None
         }
+    }
+
+    /// Config options the native XLSX path cannot honor. Hitting one with
+    /// `office_native` on is a hard `Config` error, not a fallback.
+    ///
+    /// Two entries are XLSX-specific:
+    ///
+    /// * `extract_annotations` — hyperlinks reach `TextItem::link`, but no
+    ///   `DocumentAnnotation` list is built (same v1 state the PPTX path
+    ///   started in).
+    /// * `extract_images` / `image_mode = embed` — the reader does not parse
+    ///   `xl/drawings`, so a workbook's embedded pictures and charts are
+    ///   invisible to the native path; an explicit ask routes to the
+    ///   conversion path instead of silently under-delivering. The default
+    ///   `image_mode = placeholder` is *not* gated: a native parse emits no
+    ///   figure refs where the conversion path could — accepted and recorded,
+    ///   because gating the default would turn the native path off.
+    #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+    fn native_xlsx_ineligible_reason(&self) -> Option<&'static str> {
+        let c = &self.config;
+        if c.extract_form_fields {
+            Some("extract_form_fields")
+        } else if c.extract_structure_tree {
+            Some("extract_structure_tree")
+        } else if c.extract_vector_graphics {
+            Some("extract_vector_graphics")
+        } else if c.crop_box.is_some() {
+            Some("crop_box")
+        } else if c.skip_diagonal_text {
+            Some("skip_diagonal_text")
+        } else if c.extract_annotations {
+            Some("extract_annotations")
+        } else if c.effective_extract_images() {
+            Some("extract_images")
+        } else {
+            None
+        }
+    }
+
+    /// Run the native XLSX pipeline. Contract matches the DOCX/PPTX siblings:
+    /// `Ok(None)` is an eligible fallback (text-sparse workbook with OCR on),
+    /// and panics map to `Err` so the caller degrades to LibreOffice.
+    #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+    fn try_parse_xlsx_native(&self, data: &[u8]) -> Result<Option<ParseResult>, LiteParseError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parse_xlsx_native_inner(data)
+        }))
+        .unwrap_or_else(|_| {
+            Err(LiteParseError::Conversion(
+                "native xlsx layout panicked".to_string(),
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+    fn parse_xlsx_native_inner(&self, data: &[u8]) -> Result<Option<ParseResult>, LiteParseError> {
+        use crate::office::{xlsx, xlsx_layout};
+
+        let wb = liteparse_ooxml::xlsx::read(data)
+            .map_err(|e| LiteParseError::Conversion(format!("xlsx parse failed: {e}")))?;
+        let nx = xlsx_layout::workbook_to_pages(
+            &wb,
+            xlsx::EmitOptions {
+                links: self.config.extract_links,
+            },
+        );
+
+        // A text-sparse workbook with OCR on is likely a pasted scan; only
+        // the conversion path can render and OCR it.
+        if self.config.ocr_enabled {
+            let total_chars: usize = nx
+                .pages
+                .iter()
+                .flat_map(|p| &p.text_items)
+                .map(|i| i.text.trim().len())
+                .sum();
+            if total_chars < Self::NATIVE_TEXT_SPARSE_CHARS {
+                return Ok(None);
+            }
+        }
+
+        // Per-page complexity from native facts: the page's table blocks
+        // (exact, not detected), no media rects (drawings are unparsed), and
+        // a column count of 1 — a spreadsheet has no section columns.
+        let complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>> =
+            if self.config.include_complexity {
+                nx.pages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let tables = nx.page_blocks[i]
+                            .iter()
+                            .filter(|b| {
+                                matches!(
+                                    b,
+                                    crate::markdown_layout::Block::Table { .. }
+                                        | crate::markdown_layout::Block::MergedTable { .. }
+                                )
+                            })
+                            .count();
+                        Some(crate::ocr_merge::calculate_native_page_complexity(
+                            p,
+                            &[],
+                            tables,
+                            1,
+                        ))
+                    })
+                    .collect()
+            } else {
+                vec![None; nx.pages.len()]
+            };
+
+        // Page selection mirrors the other native paths: `target_pages`
+        // filters by 1-based number, then `max_pages` truncates. The outline
+        // stays whole-document.
+        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> = nx
+            .pages
+            .into_iter()
+            .zip(nx.page_blocks)
+            .zip(complexity)
+            .collect();
+        let mut page_filtered = false;
+        if let Some(targets) = self.resolve_target_pages()? {
+            let keep: std::collections::HashSet<usize> =
+                targets.iter().map(|p| *p as usize).collect();
+            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
+            page_filtered = true;
+        }
+        if selected.len() > self.config.max_pages {
+            selected.truncate(self.config.max_pages);
+            page_filtered = true;
+        }
+        let mut pages = Vec::with_capacity(selected.len());
+        let mut page_blocks = Vec::with_capacity(selected.len());
+        let mut page_stats = Vec::with_capacity(selected.len());
+        for ((p, b), s) in selected {
+            pages.push(p);
+            page_blocks.push(b);
+            page_stats.push(s);
+        }
+
+        Ok(Some(self.parse_from_native_blocks(
+            pages,
+            page_blocks,
+            (!page_filtered).then_some(nx.all_blocks),
+            nx.outline,
+            Vec::new(),
+            page_stats,
+        )))
     }
 
     /// Run the native PPTX pipeline. Contract matches the DOCX sibling:

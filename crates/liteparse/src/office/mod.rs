@@ -24,12 +24,10 @@ pub(crate) mod inline;
 pub mod pptx;
 #[cfg(feature = "pptx-native")]
 pub mod pptx_layout;
-// Markdown-only for now: `parser.rs` does not route `.xlsx` here yet, because
-// `parse_from_native_blocks` needs real pages and the XLSX geometry pass is a
-// later step — the same order the PPTX path landed in (emitter first, wiring
-// once geometry existed).
 #[cfg(feature = "xlsx-native")]
 pub mod xlsx;
+#[cfg(feature = "xlsx-native")]
+pub mod xlsx_layout;
 
 /// The input's bytes when it is a `.docx` the native path should try, `None`
 /// otherwise. Path inputs are matched on extension only (`.doc`/`.docm`/
@@ -49,6 +47,27 @@ pub(crate) fn docx_bytes(input: &crate::types::PdfInput) -> Option<std::borrow::
         }
         PdfInput::Bytes(b) => (crate::conversion::guess_extension_from_data(b).as_deref()
             == Some("docx"))
+        .then_some(std::borrow::Cow::Borrowed(b.as_slice())),
+    }
+}
+
+/// The input's bytes when it is an `.xlsx` the native path should try, `None`
+/// otherwise. Mirrors [`docx_bytes`]: extension-matched for paths (`.xls`,
+/// `.xlsm`, `.xlsb`, `.csv` stay on the conversion path), container-sniffed
+/// for bytes.
+#[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+pub(crate) fn xlsx_bytes(input: &crate::types::PdfInput) -> Option<std::borrow::Cow<'_, [u8]>> {
+    use crate::types::PdfInput;
+    match input {
+        PdfInput::Path(p) => {
+            let ext = std::path::Path::new(p).extension()?;
+            if !ext.eq_ignore_ascii_case("xlsx") {
+                return None;
+            }
+            std::fs::read(p).ok().map(std::borrow::Cow::Owned)
+        }
+        PdfInput::Bytes(b) => (crate::conversion::guess_extension_from_data(b).as_deref()
+            == Some("xlsx"))
         .then_some(std::borrow::Cow::Borrowed(b.as_slice())),
     }
 }

@@ -32,8 +32,14 @@
 //! tables, `&<>` for HTML) on the way out. Paragraph text (banners, one-column
 //! sheets) is escaped here, before the hyperlink wraps it, so a URL's own
 //! underscores survive.
+//!
+//! The grid is planned once per sheet ([`SheetPlan`]) and shared between the
+//! doc-level emitter, the per-page block slices, and the geometry pass
+//! (`xlsx_layout`), so the three can never disagree on which rows and columns
+//! exist. Doc-level emission *is* a single full-range slice.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use liteparse_ooxml::xlsx::{self, Cell as GridCell, CellValue, Row, Sheet, Workbook};
 
@@ -42,7 +48,7 @@ use crate::markdown_layout::{Block, Cell, apply_link, escape_inline};
 
 /// Sheet names become `#` — the workbook's only structural rank, mirroring
 /// slide titles on the PPTX path.
-const SHEET_HEADING_LEVEL: u8 = 1;
+pub(crate) const SHEET_HEADING_LEVEL: u8 = 1;
 
 /// A leading merge is a banner when it spans at least this fraction of the
 /// sheet's retained width (and at least [`BANNER_MIN_COLS`] columns, so a
@@ -94,7 +100,7 @@ pub fn emit_with_sources(data: &[u8], opts: EmitOptions) -> Result<NativeWorkboo
 }
 
 /// Emit an already-read workbook. Split from the bytes entry point so tests
-/// and the future geometry pass can share one parse.
+/// and the geometry pass can share one parse.
 pub fn emit_workbook(wb: &Workbook, opts: EmitOptions) -> NativeWorkbook {
     let mut blocks = Vec::new();
     let mut sheet_names = Vec::new();
@@ -107,7 +113,14 @@ pub fn emit_workbook(wb: &Workbook, opts: EmitOptions) -> NativeWorkbook {
             },
             si,
         ));
-        emit_sheet(wb, sheet, opts, si, &mut blocks);
+        if let Some(plan) = SheetPlan::build(wb, sheet, opts) {
+            let n = plan.rows.len();
+            for page in plan.page_blocks(wb, &[0..n]) {
+                for b in page {
+                    blocks.push((b, si));
+                }
+            }
+        }
     }
     NativeWorkbook {
         blocks,
@@ -118,59 +131,189 @@ pub fn emit_workbook(wb: &Workbook, opts: EmitOptions) -> NativeWorkbook {
 /// A merge's place in the emitted grid: spans counted over *emitted* rows and
 /// *retained* columns, so a merge across skipped-empty rows does not claim
 /// table rows that do not exist.
-struct MergePlan {
+pub(crate) struct MergePlan {
     /// Anchor in sheet coordinates, re-anchored to the first emitted row /
     /// retained column inside the merge when the declared corner is empty.
-    anchor: (u32, u32),
-    colspan: u16,
-    rowspan: u16,
+    pub(crate) anchor: (u32, u32),
+    pub(crate) colspan: u16,
     /// Clamped sheet-coordinate ranges, for coverage tests.
-    col_range: (u32, u32),
-    row_range: (u32, u32),
+    pub(crate) col_range: (u32, u32),
+    pub(crate) row_range: (u32, u32),
 }
 
-fn emit_sheet(
-    wb: &Workbook,
-    sheet: &Sheet,
-    opts: EmitOptions,
-    si: usize,
-    out: &mut Vec<(Block, usize)>,
-) {
-    // Rows the file wrote with at least one valued cell, in index order.
-    // Cells are sorted within each row too — ascending is what every producer
-    // writes, but §18.3.1.4 does not require it.
-    let mut rows: Vec<(&Row, Vec<&GridCell>)> = sheet
-        .rows
-        .iter()
-        .filter(|r| !r.cells.is_empty())
-        .map(|r| {
-            let mut cells: Vec<&GridCell> = r.cells.iter().collect();
-            cells.sort_by_key(|c| c.at.col);
-            (r, cells)
-        })
-        .collect();
-    rows.sort_by_key(|(r, _)| r.index);
-    if rows.is_empty() {
-        return;
+/// One sheet's emitted grid, planned once: which rows and columns exist, what
+/// the merges claim, where the banners stop and how many rows are headers.
+/// The markdown emitter, the per-page slicer and the geometry pass all read
+/// this one structure.
+pub(crate) struct SheetPlan<'a> {
+    /// Rows the file wrote with at least one cell, in index order, each with
+    /// its cells sorted by column (ascending is what every producer writes,
+    /// but §18.3.1.4 does not require it). Banner rows included.
+    pub(crate) rows: Vec<(&'a Row, Vec<&'a GridCell>)>,
+    /// Retained columns: every column that holds at least one cell. Wholly
+    /// empty columns inside the bbox carry no text and are compacted out —
+    /// padding 16,384 pipes onto every row of a sheet whose stray formatting
+    /// touched column XFD is the failure this prevents.
+    pub(crate) cols: Vec<u32>,
+    pub(crate) plans: Vec<MergePlan>,
+    pub(crate) anchors: HashMap<(u32, u32), usize>,
+    /// Emitted-row index → merges whose clamped range includes that row.
+    cover: HashMap<u32, Vec<usize>>,
+    /// Text folded into each merge (pass A): every covered cell's text, the
+    /// anchor's own first. A *valued* cell under a neighbour's merge is a
+    /// producer bug Excel never writes — folding keeps its text, because
+    /// "absorbed" must never mean "silently gone".
+    merge_text: Vec<Vec<String>>,
+    /// Plan index of each leading banner row, in row order. `len()` is the
+    /// number of leading rows emitted as paragraphs instead of table rows.
+    banners: Vec<usize>,
+    /// Header rows of the grid (the rows after the banners).
+    header_rows: usize,
+    links: HashMap<(u32, u32), &'a str>,
+}
+
+impl<'a> SheetPlan<'a> {
+    /// `None` when the sheet has no written row with cells — the emitter
+    /// produces only the sheet heading, and the geometry pass one empty page.
+    pub(crate) fn build(wb: &Workbook, sheet: &'a Sheet, opts: EmitOptions) -> Option<Self> {
+        let mut rows: Vec<(&Row, Vec<&GridCell>)> = sheet
+            .rows
+            .iter()
+            .filter(|r| !r.cells.is_empty())
+            .map(|r| {
+                let mut cells: Vec<&GridCell> = r.cells.iter().collect();
+                cells.sort_by_key(|c| c.at.col);
+                (r, cells)
+            })
+            .collect();
+        rows.sort_by_key(|(r, _)| r.index);
+        if rows.is_empty() {
+            return None;
+        }
+
+        let links: HashMap<(u32, u32), &str> = if opts.links {
+            sheet
+                .hyperlinks
+                .iter()
+                .filter_map(|h| {
+                    h.url
+                        .as_deref()
+                        .map(|u| ((h.at.start.row, h.at.start.col), u))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let mut cols: Vec<u32> = rows
+            .iter()
+            .flat_map(|(_, cells)| cells.iter().map(|c| c.at.col))
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        let width = cols.len();
+
+        let mut plan = SheetPlan {
+            rows,
+            cols,
+            plans: Vec::new(),
+            anchors: HashMap::new(),
+            cover: HashMap::new(),
+            merge_text: Vec::new(),
+            banners: Vec::new(),
+            header_rows: 0,
+            links,
+        };
+
+        // A one-column sheet is prose with an address, not a table. Merges
+        // cannot move text between rows here — an absorbed cell is value-less
+        // — so the grid machinery below is skipped rather than degenerated.
+        if width == 1 {
+            return Some(plan);
+        }
+
+        let row_indices: Vec<u32> = plan.rows.iter().map(|(r, _)| r.index).collect();
+        let max_row = *row_indices.last().unwrap();
+        let max_col = *plan.cols.last().unwrap();
+
+        // Plan the merges against the emitted grid. First-wins on a shared
+        // anchor: overlapping merges are invalid and Excel repairs them on
+        // open.
+        for m in &sheet.merges {
+            let Some((p, _rowspan)) = plan_merge(m, &row_indices, &plan.cols, max_row, max_col)
+            else {
+                continue;
+            };
+            if plan.anchors.contains_key(&p.anchor) {
+                continue;
+            }
+            let idx = plan.plans.len();
+            plan.anchors.insert(p.anchor, idx);
+            let lo = row_indices.partition_point(|&r| r < p.row_range.0);
+            let hi = row_indices.partition_point(|&r| r <= p.row_range.1);
+            for &ri in &row_indices[lo..hi] {
+                plan.cover.entry(ri).or_default().push(idx);
+            }
+            plan.plans.push(p);
+        }
+
+        // Pass A: fold the text of every cell a merge covers into that merge.
+        // The anchor's own cell lands first (its row precedes the others).
+        plan.merge_text = vec![Vec::new(); plan.plans.len()];
+        for (row, cells) in &plan.rows {
+            if !plan.cover.contains_key(&row.index) {
+                continue;
+            }
+            for cell in cells {
+                if let Some(idx) = plan.covering_plan(row.index, cell.at.col) {
+                    let text = plan.cell_text(wb, cell, false);
+                    if !text.is_empty() {
+                        plan.merge_text[idx].push(text);
+                    }
+                }
+            }
+        }
+
+        // Banners: leading rows whose every valued cell sits inside one
+        // shallow near-full-width merge anchored on that row. 42.1% of sheets
+        // open with one; it reads as a title and is emitted as one.
+        let min_banner_cols =
+            BANNER_MIN_COLS.max((width as f64 * BANNER_MIN_WIDTH_FRACTION) as usize);
+        for (row, cells) in &plan.rows {
+            let Some(idx) = banner_plan(
+                row,
+                cells,
+                &plan.plans,
+                &plan.anchors,
+                &row_indices,
+                min_banner_cols,
+            ) else {
+                break;
+            };
+            plan.banners.push(idx);
+        }
+
+        plan.header_rows = header_rows(wb, sheet, &plan.rows[plan.banners.len()..]);
+        Some(plan)
     }
 
-    let links: HashMap<(u32, u32), &str> = if opts.links {
-        sheet
-            .hyperlinks
-            .iter()
-            .filter_map(|h| {
-                h.url
-                    .as_deref()
-                    .map(|u| ((h.at.start.row, h.at.start.col), u))
-            })
-            .collect()
-    } else {
-        HashMap::new()
-    };
-    // `escape` is true for text bound for a paragraph, false for a table
-    // cell (the renderer escapes those per dialect). Escape happens *before*
-    // the link wraps the text so the URL half stays raw.
-    let cell_text = |cell: &GridCell, escape: bool| -> String {
+    /// One retained column means paragraphs, never a one-pipe table.
+    pub(crate) fn is_prose(&self) -> bool {
+        self.cols.len() == 1
+    }
+
+    fn covering_plan(&self, row: u32, col: u32) -> Option<usize> {
+        self.cover.get(&row)?.iter().copied().find(|&i| {
+            let (lo, hi) = self.plans[i].col_range;
+            col >= lo && col <= hi
+        })
+    }
+
+    /// A cell's rendered text. `escape` is true for text bound for a
+    /// paragraph, false for a table cell (the renderer escapes those per
+    /// dialect). Escape happens *before* the link wraps the text so the URL
+    /// half stays raw.
+    pub(crate) fn cell_text(&self, wb: &Workbook, cell: &GridCell, escape: bool) -> String {
         // `_(* #,##0_)` pads for column alignment; markdown aligns itself, so
         // the padding is trimmed here and only here (the reader keeps it, per
         // the numfmt step's contract).
@@ -181,201 +324,194 @@ fn emit_sheet(
         } else {
             raw.to_string()
         };
-        match links.get(&(cell.at.row, cell.at.col)) {
+        match self.links.get(&(cell.at.row, cell.at.col)) {
             Some(url) => apply_link(if text.is_empty() { url } else { &text }, url),
             None => text,
         }
-    };
-
-    // Retained columns: every column that holds at least one cell. Wholly
-    // empty columns inside the bbox carry no text and are compacted out —
-    // padding 16,384 pipes onto every row of a sheet whose stray formatting
-    // touched column XFD is the failure this prevents.
-    let mut cols: Vec<u32> = rows
-        .iter()
-        .flat_map(|(_, cells)| cells.iter().map(|c| c.at.col))
-        .collect();
-    cols.sort_unstable();
-    cols.dedup();
-    let width = cols.len();
-
-    // A one-column sheet is prose with an address, not a table. Merges cannot
-    // move text between rows here — an absorbed cell is value-less — so the
-    // grid machinery below is skipped rather than degenerated.
-    if width == 1 {
-        for (_, cells) in &rows {
-            let cell = cells[0];
-            let text = cell_text(cell, true);
-            if text.is_empty() {
-                continue;
-            }
-            let font = wb.styles.font(cell.style);
-            out.push((
-                Block::Paragraph {
-                    text,
-                    bold: font.bold,
-                    italic: font.italic,
-                },
-                si,
-            ));
-        }
-        return;
     }
 
-    let row_indices: Vec<u32> = rows.iter().map(|(r, _)| r.index).collect();
-    let max_row = *row_indices.last().unwrap();
-    let max_col = *cols.last().unwrap();
-
-    // Plan the merges against the emitted grid. First-wins on a shared
-    // anchor: overlapping merges are invalid and Excel repairs them on open.
-    let mut plans: Vec<MergePlan> = Vec::new();
-    let mut anchors: HashMap<(u32, u32), usize> = HashMap::new();
-    // Emitted-row index → merges whose clamped range includes that row.
-    let mut cover: HashMap<u32, Vec<usize>> = HashMap::new();
-    for m in &sheet.merges {
-        let Some(plan) = plan_merge(m, &row_indices, &cols, max_row, max_col) else {
-            continue;
-        };
-        if anchors.contains_key(&plan.anchor) {
-            continue;
-        }
-        let idx = plans.len();
-        anchors.insert(plan.anchor, idx);
-        let lo = row_indices.partition_point(|&r| r < plan.row_range.0);
-        let hi = row_indices.partition_point(|&r| r <= plan.row_range.1);
-        for &ri in &row_indices[lo..hi] {
-            cover.entry(ri).or_default().push(idx);
-        }
-        plans.push(plan);
+    /// The external hyperlink anchored on this cell, if links are enabled.
+    pub(crate) fn link_at(&self, row: u32, col: u32) -> Option<&str> {
+        self.links.get(&(row, col)).copied()
     }
-    let covering_plan = |row: u32, col: u32| -> Option<usize> {
-        cover.get(&row)?.iter().copied().find(|&i| {
-            let (lo, hi) = plans[i].col_range;
-            col >= lo && col <= hi
-        })
-    };
 
-    // Pass A: fold the text of every cell a merge covers into that merge. The
-    // anchor's own cell lands first (its row precedes the others). A *valued*
-    // cell under a neighbour's merge is a producer bug Excel never writes —
-    // folding keeps its text, because "absorbed" must never mean "silently
-    // gone".
-    let mut merge_text: Vec<Vec<String>> = vec![Vec::new(); plans.len()];
-    for (row, cells) in &rows {
-        if !cover.contains_key(&row.index) {
-            continue;
-        }
-        for cell in cells {
-            if let Some(idx) = covering_plan(row.index, cell.at.col) {
-                let text = cell_text(cell, false);
-                if !text.is_empty() {
-                    merge_text[idx].push(text);
-                }
-            }
-        }
+    fn merge_string(&self, idx: usize) -> String {
+        self.merge_text[idx].join(" ")
     }
-    let merge_string = |idx: usize| merge_text[idx].join(" ");
 
-    // Banners: leading rows whose every valued cell sits inside one shallow
-    // near-full-width merge anchored on that row. 42.1% of sheets open with
-    // one; it reads as a title and is emitted as one.
-    let min_banner_cols = BANNER_MIN_COLS.max((width as f64 * BANNER_MIN_WIDTH_FRACTION) as usize);
-    let mut banner_rows = 0usize;
-    for (row, cells) in &rows {
-        let Some(idx) = banner_plan(row, cells, &plans, &anchors, min_banner_cols) else {
-            break;
-        };
+    /// The banner paragraph for banner row `i`, or `None` when its text is
+    /// empty (the row is still consumed — it does not fall back into the
+    /// table).
+    fn banner_paragraph(&self, wb: &Workbook, i: usize) -> Option<Block> {
+        let (_, cells) = &self.rows[i];
+        let idx = self.banners[i];
         // A banner merge is one row tall, so its text is this row's cells —
         // re-rendered escaped, since it is bound for a paragraph.
-        let (lo, hi) = plans[idx].col_range;
+        let (lo, hi) = self.plans[idx].col_range;
         let text = cells
             .iter()
             .filter(|c| c.at.col >= lo && c.at.col <= hi)
-            .map(|c| cell_text(c, true))
+            .map(|c| self.cell_text(wb, c, true))
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        if !text.is_empty() {
-            let font = cells
-                .iter()
-                .find(|c| (c.at.row, c.at.col) == plans[idx].anchor)
-                .map(|c| wb.styles.font(c.style));
-            out.push((
-                Block::Paragraph {
-                    text,
-                    bold: font.as_ref().is_some_and(|f| f.bold),
-                    italic: font.as_ref().is_some_and(|f| f.italic),
-                },
-                si,
-            ));
+        if text.is_empty() {
+            return None;
         }
-        banner_rows += 1;
+        let font = cells
+            .iter()
+            .find(|c| (c.at.row, c.at.col) == self.plans[idx].anchor)
+            .map(|c| wb.styles.font(c.style));
+        Some(Block::Paragraph {
+            text,
+            bold: font.as_ref().is_some_and(|f| f.bold),
+            italic: font.as_ref().is_some_and(|f| f.italic),
+        })
     }
 
-    let grid = &rows[banner_rows..];
-    if grid.is_empty() {
-        return;
+    /// A prose row's paragraph (one-column sheets), or `None` when empty.
+    fn prose_paragraph(&self, wb: &Workbook, i: usize) -> Option<Block> {
+        let (_, cells) = &self.rows[i];
+        let cell = cells[0];
+        let text = self.cell_text(wb, cell, true);
+        if text.is_empty() {
+            return None;
+        }
+        let font = wb.styles.font(cell.style);
+        Some(Block::Paragraph {
+            text,
+            bold: font.bold,
+            italic: font.italic,
+        })
     }
 
-    // Pass B: assemble the table, walking each row's sorted cells in step
-    // with the retained columns.
-    let mut table: Vec<Vec<Cell>> = Vec::with_capacity(grid.len());
-    for (row, cells) in grid {
-        let mut cells_out: Vec<Cell> = Vec::with_capacity(width);
-        let mut it = cells.iter().copied().peekable();
-        for &col in &cols {
-            // Duplicate cells at one address are malformed; first wins, the
-            // rest are skipped by the cursor.
-            let mut at_col: Option<&GridCell> = None;
-            while let Some(&c) = it.peek() {
-                if c.at.col < col {
-                    it.next();
-                } else {
-                    if c.at.col == col {
-                        at_col = Some(c);
+    /// Assemble the table rows for a slice of the grid (indices into the rows
+    /// *after* the banners), walking each row's sorted cells in step with the
+    /// retained columns.
+    ///
+    /// Spans are counted within the slice: a merge cut by a page break keeps
+    /// its text in the first fragment, and the continuation emits an empty
+    /// spanning cell at the merge's column so the rows below it do not shift
+    /// left. For the full grid range this reproduces doc-level emission.
+    fn table_slice(&self, wb: &Workbook, slice: Range<usize>) -> Vec<Vec<Cell>> {
+        let grid = &self.rows[self.banners.len()..];
+        let rows = &grid[slice];
+        let Some((first, _)) = rows.first() else {
+            return Vec::new();
+        };
+        let slice_lo = first.index;
+        // Rowspan in emitted units *within this slice* — never claim rows on
+        // another page.
+        let span_rows = |p: &MergePlan| -> u16 {
+            rows.iter()
+                .filter(|(r, _)| r.index >= p.row_range.0 && r.index <= p.row_range.1)
+                .count()
+                .min(u16::MAX as usize) as u16
+        };
+
+        let width = self.cols.len();
+        let mut table: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+        for (row, cells) in rows {
+            let mut cells_out: Vec<Cell> = Vec::with_capacity(width);
+            let mut it = cells.iter().copied().peekable();
+            for &col in &self.cols {
+                // Duplicate cells at one address are malformed; first wins,
+                // the rest are skipped by the cursor.
+                let mut at_col: Option<&GridCell> = None;
+                while let Some(&c) = it.peek() {
+                    if c.at.col < col {
                         it.next();
+                    } else {
+                        if c.at.col == col {
+                            at_col = Some(c);
+                            it.next();
+                        }
+                        break;
                     }
-                    break;
+                }
+                let pos = (row.index, col);
+                if let Some(&idx) = self.anchors.get(&pos) {
+                    let plan = &self.plans[idx];
+                    cells_out.push(Cell::spanning(
+                        self.merge_string(idx),
+                        plan.colspan,
+                        span_rows(plan),
+                    ));
+                } else if let Some(idx) = self.covering_plan(pos.0, pos.1) {
+                    let plan = &self.plans[idx];
+                    if plan.anchor.0 < slice_lo && row.index == slice_lo && col == plan.anchor.1 {
+                        // The rest of a merge whose anchor is on an earlier
+                        // page. Its text already rendered there.
+                        cells_out.push(Cell::spanning(
+                            String::new(),
+                            plan.colspan,
+                            span_rows(plan),
+                        ));
+                    }
+                    // Otherwise absorbed by a span; any text already folded
+                    // into the anchor in pass A.
+                } else {
+                    let text = at_col
+                        .map(|c| self.cell_text(wb, c, false))
+                        .unwrap_or_default();
+                    cells_out.push(Cell::new(text));
                 }
             }
-            let pos = (row.index, col);
-            if let Some(&idx) = anchors.get(&pos) {
-                let plan = &plans[idx];
-                cells_out.push(Cell::spanning(
-                    merge_string(idx),
-                    plan.colspan,
-                    plan.rowspan,
-                ));
-            } else if covering_plan(pos.0, pos.1).is_some() {
-                // Absorbed by a span; any text already folded in pass A.
-            } else {
-                let text = at_col.map(|c| cell_text(c, false)).unwrap_or_default();
-                cells_out.push(Cell::new(text));
-            }
+            table.push(cells_out);
         }
-        table.push(cells_out);
+        table
     }
 
-    let header_rows = header_rows(wb, sheet, grid);
-    out.push((
-        Block::MergedTable {
-            rows: table,
-            header_rows,
-        },
-        si,
-    ));
+    /// The block stream for each range of emitted rows (banner rows counted).
+    /// One range spanning all rows yields the doc-level emission; the
+    /// geometry pass hands one range per page so per-page markdown holds the
+    /// rows that are actually on that page. `header_rows` marks only the
+    /// slice that contains the grid's first row.
+    pub(crate) fn page_blocks(&self, wb: &Workbook, ranges: &[Range<usize>]) -> Vec<Vec<Block>> {
+        let nb = self.banners.len();
+        ranges
+            .iter()
+            .map(|range| {
+                let mut out = Vec::new();
+                if self.is_prose() {
+                    for i in range.clone() {
+                        if let Some(p) = self.prose_paragraph(wb, i) {
+                            out.push(p);
+                        }
+                    }
+                    return out;
+                }
+                for i in range.start..range.end.min(nb) {
+                    if let Some(p) = self.banner_paragraph(wb, i) {
+                        out.push(p);
+                    }
+                }
+                let g0 = range.start.saturating_sub(nb);
+                let g1 = range.end.saturating_sub(nb);
+                if g1 > g0 {
+                    let rows = self.table_slice(wb, g0..g1);
+                    out.push(Block::MergedTable {
+                        rows,
+                        header_rows: if g0 == 0 { self.header_rows } else { 0 },
+                    });
+                }
+                out
+            })
+            .collect()
+    }
 }
 
 /// Clamp a merge to the emitted grid and count its spans in emitted units.
 /// `None` means the merge touches no emitted row or retained column and
-/// renders as nothing.
+/// renders as nothing. The rowspan is returned for the census-facing tests;
+/// emission recounts spans per slice.
 fn plan_merge(
     m: &xlsx::RangeRef,
     row_indices: &[u32],
     cols: &[u32],
     max_row: u32,
     max_col: u32,
-) -> Option<MergePlan> {
+) -> Option<(MergePlan, u16)> {
     if m.start.row > max_row || m.start.col > max_col {
         return None;
     }
@@ -388,16 +524,18 @@ fn plan_merge(
     if col_lo == col_hi || row_lo == row_hi {
         return None;
     }
-    Some(MergePlan {
-        // Re-anchoring moves the visual corner to the first position the
-        // emitted grid still has, so a merge whose declared corner sits on a
-        // skipped-empty row keeps claiming its cells.
-        anchor: (row_indices[row_lo], cols[col_lo]),
-        colspan: (col_hi - col_lo).min(u16::MAX as usize) as u16,
-        rowspan: (row_hi - row_lo).min(u16::MAX as usize) as u16,
-        col_range: (m.start.col, end_col),
-        row_range: (m.start.row, end_row),
-    })
+    Some((
+        MergePlan {
+            // Re-anchoring moves the visual corner to the first position the
+            // emitted grid still has, so a merge whose declared corner sits
+            // on a skipped-empty row keeps claiming its cells.
+            anchor: (row_indices[row_lo], cols[col_lo]),
+            colspan: (col_hi - col_lo).min(u16::MAX as usize) as u16,
+            col_range: (m.start.col, end_col),
+            row_range: (m.start.row, end_row),
+        },
+        (row_hi - row_lo).min(u16::MAX as usize) as u16,
+    ))
 }
 
 /// The banner test: some merge is anchored on this row, one emitted row tall
@@ -408,12 +546,18 @@ fn banner_plan(
     cells: &[&GridCell],
     plans: &[MergePlan],
     anchors: &HashMap<(u32, u32), usize>,
+    row_indices: &[u32],
     min_cols: usize,
 ) -> Option<usize> {
+    let one_row_tall = |p: &MergePlan| {
+        let lo = row_indices.partition_point(|&r| r < p.row_range.0);
+        let hi = row_indices.partition_point(|&r| r <= p.row_range.1);
+        hi - lo == 1
+    };
     let idx = cells.iter().find_map(|c| {
         let &idx = anchors.get(&(row.index, c.at.col))?;
         let plan = &plans[idx];
-        (plan.rowspan == 1 && (plan.colspan as usize) >= min_cols).then_some(idx)
+        (one_row_tall(plan) && (plan.colspan as usize) >= min_cols).then_some(idx)
     })?;
     let (lo, hi) = plans[idx].col_range;
     cells
@@ -432,6 +576,9 @@ fn banner_plan(
 /// 3. First grid row entirely bold with ≥2 cells (12.7%).
 /// 4. Type transition: first grid row has no numbers, second does (14.3%).
 fn header_rows(wb: &Workbook, sheet: &Sheet, grid: &[(&Row, Vec<&GridCell>)]) -> usize {
+    if grid.is_empty() {
+        return 0;
+    }
     let frozen = grid
         .iter()
         .take_while(|(r, _)| r.index < sheet.frozen_rows)
@@ -465,14 +612,14 @@ fn header_rows(wb: &Workbook, sheet: &Sheet, grid: &[(&Row, Vec<&GridCell>)]) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write as _;
 
     /// Build a one-sheet workbook from a worksheet XML body (and optional
     /// extra parts), the same in-memory container trick as the reader's own
     /// tests — stating exactly which parts each rule is being tested against.
-    fn workbook_from(sheet_xml: &str, extra: &[(&str, &str)]) -> Workbook {
+    pub(crate) fn workbook_from(sheet_xml: &str, extra: &[(&str, &str)]) -> Workbook {
         let mut parts: Vec<(&str, &str)> = vec![
             ("[Content_Types].xml", "<Types/>"),
             (
@@ -793,5 +940,81 @@ mod tests {
         let blocks = blocks_of("<worksheet><sheetData/></worksheet>");
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], Block::Heading { .. }));
+    }
+
+    /// Page slicing: a rowspan cut by a page break keeps its text on the
+    /// first page, and the continuation emits an empty spanning cell so the
+    /// columns below do not shift left.
+    #[test]
+    fn a_page_break_splits_a_rowspan_without_shifting_columns() {
+        let wb = workbook_from(
+            r#"<worksheet><sheetData>
+                <row r="1"><c r="A1" t="inlineStr"><is><t>tall</t></is></c><c r="B1"><v>1</v></c></row>
+                <row r="2"><c r="B2"><v>2</v></c></row>
+                <row r="3"><c r="B3"><v>3</v></c></row>
+                <row r="4"><c r="A4" t="inlineStr"><is><t>d</t></is></c><c r="B4"><v>4</v></c></row>
+            </sheetData><mergeCells><mergeCell ref="A1:A3"/></mergeCells></worksheet>"#,
+            &[],
+        );
+        let plan = SheetPlan::build(&wb, &wb.sheets[0], EmitOptions::default()).unwrap();
+        let pages = plan.page_blocks(&wb, &[0..2, 2..4]);
+        let table = |page: &[Block]| match &page[0] {
+            Block::MergedTable { rows, .. } => rows.clone(),
+            b => panic!("expected table, got {b:?}"),
+        };
+        let first = table(&pages[0]);
+        assert_eq!(first[0][0], Cell::spanning("tall", 1, 2), "clamped to page");
+        let second = table(&pages[1]);
+        // Continuation: empty spanning cell holds the merge's column.
+        assert_eq!(second[0], vec![Cell::spanning("", 1, 1), Cell::new("3")]);
+        assert_eq!(second[1], vec![Cell::new("d"), Cell::new("4")]);
+    }
+
+    /// The full-range slice must reproduce doc-level emission exactly — the
+    /// doc path *is* this call.
+    #[test]
+    fn one_full_range_reproduces_the_doc_table() {
+        let wb = workbook_from(
+            r#"<worksheet><sheetData>
+                <row r="1"><c r="A1" t="inlineStr"><is><t>t</t></is></c></row>
+                <row r="2"><c r="A2" t="inlineStr"><is><t>h1</t></is></c><c r="B2" t="inlineStr"><is><t>h2</t></is></c><c r="C2" t="inlineStr"><is><t>h3</t></is></c></row>
+                <row r="3"><c r="A3"><v>1</v></c><c r="B3"><v>2</v></c><c r="C3"><v>3</v></c></row>
+            </sheetData><mergeCells><mergeCell ref="A1:C1"/></mergeCells></worksheet>"#,
+            &[],
+        );
+        let doc: Vec<Block> = emit_workbook(&wb, EmitOptions::default())
+            .blocks
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect();
+        let plan = SheetPlan::build(&wb, &wb.sheets[0], EmitOptions::default()).unwrap();
+        let pages = plan.page_blocks(&wb, &[0..plan.rows.len()]);
+        assert_eq!(
+            format!("{:?}", &doc[1..]),
+            format!("{:?}", &pages[0][..]),
+            "doc emission is the full slice"
+        );
+    }
+
+    /// Header rows mark only the slice containing the grid's first row —
+    /// a continuation page's table has no header.
+    #[test]
+    fn header_rows_do_not_repeat_on_continuation_pages() {
+        let wb = workbook_from(
+            r#"<worksheet><sheetData>
+                <row r="1"><c r="A1" t="inlineStr"><is><t>name</t></is></c><c r="B1" t="inlineStr"><is><t>score</t></is></c></row>
+                <row r="2"><c r="A2" t="inlineStr"><is><t>ann</t></is></c><c r="B2"><v>4</v></c></row>
+                <row r="3"><c r="A3" t="inlineStr"><is><t>bob</t></is></c><c r="B3"><v>5</v></c></row>
+            </sheetData></worksheet>"#,
+            &[],
+        );
+        let plan = SheetPlan::build(&wb, &wb.sheets[0], EmitOptions::default()).unwrap();
+        let pages = plan.page_blocks(&wb, &[0..2, 2..3]);
+        let header = |page: &[Block]| match &page[0] {
+            Block::MergedTable { header_rows, .. } => *header_rows,
+            b => panic!("expected table, got {b:?}"),
+        };
+        assert_eq!(header(&pages[0]), 1);
+        assert_eq!(header(&pages[1]), 0);
     }
 }

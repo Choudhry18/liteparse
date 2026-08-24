@@ -42,6 +42,10 @@ required-features = ["pptx-native"]
 name = "xlsx_emit"
 required-features = ["xlsx-native"]
 
+[[example]]
+name = "xlsx_layout_check"
+required-features = ["xlsx-native"]
+
 [features]
 default = ["tesseract", "docx-native", "pptx-native", "xlsx-native"]
 oar-ocr = ["dep:oar-ocr"]
