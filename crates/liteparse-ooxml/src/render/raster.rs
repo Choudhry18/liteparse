@@ -170,9 +170,17 @@ pub fn rasterize_page(
     //   < Shading (highlight/cell-shading rects, tied to the text flow)
     //   < Media (placed images; inline ones must beat cell shading)
     //   < Ink (glyphs, rules, borders)
+    //   < Float (images that declared themselves above the flow)
     //
-    // Cost of the approximation: a deliberately in-front float no longer
-    // covers text/shading — rare, and its fill still paints. A shape's own
+    // The last layer is the exception a producer can ask for, and it exists
+    // because for one format the approximation below is not rare but the
+    // norm: an XLSX picture floats over the grid *and* its values, and a
+    // corpus census found painted glyphs on 29.2% of placements. Everything
+    // a DOCX layout emits stays `float: false` and keeps the flow order.
+    //
+    // Cost of the approximation: a deliberately in-front float that does not
+    // set that flag no longer covers text/shading — rare, and its fill still
+    // paints. A shape's own
     // text-box text is emitted as separate `Text` commands, so it stays over
     // its fill in the ink pass.
     // Outside the pass loop: the same image can be a shape fill and a placed
@@ -183,6 +191,7 @@ pub fn rasterize_page(
         RasterPass::Shading,
         RasterPass::Media,
         RasterPass::Ink,
+        RasterPass::Float,
     ] {
         // The shape-local → page transform opened by the innermost
         // `DrawCommand::Transform` bracket, or the identity outside one.
@@ -253,6 +262,9 @@ pub fn rasterize_page(
                     rect,
                     image_data,
                     src_rect,
+                    // Read by `raster_pass` to pick the layer; the paint
+                    // itself is identical either way.
+                    float: _,
                 } => {
                     draw_image(&mut pixmap, image_data, rect, src_rect.as_ref(), device);
                 }
@@ -327,17 +339,25 @@ enum RasterPass {
     Shape,
     /// Highlight and cell/paragraph shading rects.
     Shading,
-    /// Placed raster images.
+    /// Placed raster images that sit in the flow — an inline DOCX picture.
     Media,
     /// Glyphs, emoji, underlines, table/border lines.
     Ink,
+    /// Images that float above the text (`DrawCommand::Image { float: true }`)
+    /// — the XLSX floating layer. The one place a producer can say the flow
+    /// order does not apply to it.
+    Float,
 }
 
 fn raster_pass(cmd: &DrawCommand) -> Option<RasterPass> {
     match cmd {
         DrawCommand::Path { .. } => Some(RasterPass::Shape),
         DrawCommand::Rect { .. } => Some(RasterPass::Shading),
-        DrawCommand::Image { .. } => Some(RasterPass::Media),
+        DrawCommand::Image { float, .. } => Some(if *float {
+            RasterPass::Float
+        } else {
+            RasterPass::Media
+        }),
         DrawCommand::Text { .. }
         | DrawCommand::Underline { .. }
         | DrawCommand::Line { .. }
@@ -1018,6 +1038,59 @@ mod tests {
         assert!(inked(&r, 55, 55), "shading pass placed by the bracket");
         assert!(inked(&r, 55, 65), "shape pass placed by the bracket too");
         assert!(!inked(&r, 5, 15), "neither drew at the page origin");
+    }
+
+    /// A page holding one black ink line, and one white image covering it.
+    fn line_under_image(float: bool) -> LayoutedPage {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode");
+        LayoutedPage {
+            commands: vec![
+                DrawCommand::Line {
+                    line: crate::render::geometry::PtLineSegment {
+                        start: PtOffset::new(Pt::new(10.0), Pt::new(30.0)),
+                        end: PtOffset::new(Pt::new(50.0), Pt::new(30.0)),
+                    },
+                    color: RgbColor { r: 0, g: 0, b: 0 },
+                    width: Pt::new(4.0),
+                },
+                DrawCommand::Image {
+                    rect: rect(0.0, 10.0, 60.0, 40.0),
+                    image_data: crate::render::resolve::images::MediaEntry {
+                        data: std::sync::Arc::from(png.into_inner().as_slice()),
+                        format: crate::model::ImageFormat::Png,
+                    },
+                    src_rect: None,
+                    float,
+                },
+            ],
+            page_size: PtSize::new(Pt::new(100.0), Pt::new(100.0)),
+            block_starts: Vec::new(),
+        }
+    }
+
+    /// The flow order, and the one exception to it. Command order is the same
+    /// in both pages — only the flag differs — because the painter reads
+    /// layers, not position: an inline image cannot hide the line of text it
+    /// sits on, and an XLSX float has to hide the grid values under it.
+    #[test]
+    fn a_floating_image_covers_ink_and_an_inline_one_does_not() {
+        let inline =
+            rasterize_page(&line_under_image(false), &FontRegistry::new(), 1.0).expect("raster");
+        assert!(inked(&inline, 30, 30), "ink paints over an in-flow image");
+
+        let floating =
+            rasterize_page(&line_under_image(true), &FontRegistry::new(), 1.0).expect("raster");
+        assert!(!inked(&floating, 30, 30), "a float paints over the ink");
+        // Same page, outside the picture: the float covers what it covers and
+        // nothing else — this is what separates a fifth pass from disabling
+        // the ink pass.
+        assert!(
+            inked(&floating, 30, 5) == inked(&inline, 30, 5),
+            "pixels outside the image are untouched by the flag"
+        );
     }
 
     /// The clamp must be inert for every page that already fits, or it is a

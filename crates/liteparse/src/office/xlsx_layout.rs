@@ -48,6 +48,7 @@ use liteparse_ooxml::render::layout::draw_command::{DrawCommand, LayoutedPage};
 use liteparse_ooxml::render::layout::fragment::FontProps;
 use liteparse_ooxml::render::layout::measurer::TextMeasurer;
 use liteparse_ooxml::render::resolve::color::RgbColor;
+use liteparse_ooxml::render::resolve::images::MediaEntry;
 use liteparse_ooxml::xlsx::{
     Alignment, Border, BorderEdge, CellAnchor, CellValue, HorizontalAlign, PatternType, PicAnchor,
     Row, Sheet, SheetShape, VerticalAlign, Workbook,
@@ -116,9 +117,16 @@ pub struct NativeXlsx {
     pub pic_rects: Vec<Vec<Rect>>,
     /// The paint of each page, aligned with `pages`: gridlines, cell fills
     /// and cell borders as [`DrawCommand::Rect`]s, then the cell text as
-    /// [`DrawCommand::Text`]s — ready for `render::raster::rasterize_page`.
+    /// [`DrawCommand::Text`]s, then each picture on the page as a
+    /// [`DrawCommand::Image`] — ready for `render::raster::rasterize_page`.
     /// Empty unless `EmitOptions::paint`; textless unless a font registry was
     /// supplied too.
+    ///
+    /// Command order carries no z-order here: the rasterizer paints in fixed
+    /// passes (`Path` → `Rect` → `Image` → ink), so a picture always covers
+    /// the grid beneath it and cell text always covers the picture. Excel
+    /// floats a picture above cell text, so that last relation is inverted —
+    /// see the overlap census for how often it can be seen.
     pub layouts: Vec<LayoutedPage>,
     /// What the text pass met, summed over the workbook. Zero when nothing
     /// was painted; read by the corpus gate, not by `parser.rs`.
@@ -226,6 +234,10 @@ pub fn workbook_to_pages(
     // one canonical entry, the same cross-page rule the PPTX path applies
     // across slides.
     let mut sink = FigureSink::default();
+    // Workbook-scoped so every placement of one media part shares one `Arc`,
+    // which is the identity the painter's bitmap cache keys on. Populated
+    // only under `EmitOptions::paint`.
+    let mut media: std::collections::HashMap<&str, MediaEntry> = std::collections::HashMap::new();
 
     for (si, sheet) in wb.sheets.iter().enumerate() {
         let heading = Block::Heading {
@@ -324,6 +336,7 @@ pub fn workbook_to_pages(
         // local ordinal mirrors `figure_blocks` (both skip media we do not
         // surface), and the sink's id must agree with it by construction.
         let mut rects_per_page: Vec<Vec<Rect>> = vec![Vec::new(); ranges.len()];
+        let mut pic_cmds_per_page: Vec<Vec<DrawCommand>> = vec![Vec::new(); ranges.len()];
         sink.reset_ordinal();
         let mut n_fig = 0u32;
         for pic in super::xlsx::ordered_pics(sheet) {
@@ -341,6 +354,41 @@ pub fn workbook_to_pages(
                 &pic.anchor,
             );
             rects_per_page[page_local].push(rect.clone());
+            if opts.paint {
+                // One `MediaEntry` per media part for the whole workbook, not
+                // per placement: the painter's bitmap cache keys on the `Arc`
+                // pointer, so a logo anchored on every sheet decodes once.
+                // The copy out of the reader's `Arc<Vec<u8>>` is paid here
+                // rather than at read time so a parse — which never paints —
+                // keeps costing zero byte copies.
+                let entry = media
+                    .entry(pic.media_path.as_str())
+                    .or_insert_with(|| MediaEntry {
+                        data: std::sync::Arc::from(pic.bytes.as_slice()),
+                        format: pic.format,
+                    })
+                    .clone();
+                pic_cmds_per_page[page_local].push(DrawCommand::Image {
+                    rect: PtRect::from_xywh(
+                        Pt::new(rect.x),
+                        Pt::new(rect.y),
+                        Pt::new(rect.width),
+                        Pt::new(rect.height),
+                    ),
+                    image_data: entry,
+                    // `a:srcRect` is not read by the XLSX drawing parser, so
+                    // a cropped picture paints uncropped. Recorded, not
+                    // guessed: the crop math already exists for the DOCX and
+                    // PPTX paths and can be threaded through when the anchor
+                    // parser grows the element.
+                    src_rect: None,
+                    // Excel floats a picture above the grid *and* its values,
+                    // so this is the one producer that opts out of the
+                    // painter's flow order — without it 29.2% of corpus
+                    // placements have cell text drawn through them.
+                    float: true,
+                });
+            }
             if opts.figures {
                 blocks_per_page[page_local].push(Block::Figure {
                     id: id.clone(),
@@ -378,17 +426,23 @@ pub fn workbook_to_pages(
                 Pt::new(page.page_width),
                 Pt::new(page.page_height),
             ));
-            if let (true, Some(p)) = (opts.paint, &plan) {
-                let (cmds, stats) = geo.paint_page(
-                    wb,
-                    sheet,
-                    p,
-                    &col_styles,
-                    ranges[i].clone(),
-                    measurer.as_ref(),
-                );
-                layout.commands = cmds;
-                out.text_stats.add(stats);
+            if opts.paint {
+                if let Some(p) = &plan {
+                    let (cmds, stats) = geo.paint_page(
+                        wb,
+                        sheet,
+                        p,
+                        &col_styles,
+                        ranges[i].clone(),
+                        measurer.as_ref(),
+                    );
+                    layout.commands = cmds;
+                    out.text_stats.add(stats);
+                }
+                // Outside the `plan` arm on purpose: a sheet whose only
+                // content is a picture has no grid to paint and still has
+                // something to draw.
+                layout.commands.append(&mut pic_cmds_per_page[i]);
             }
             out.layouts.push(layout);
             out.pages.push(page);
@@ -1887,6 +1941,118 @@ mod tests {
         assert_eq!(nx.images[0].page, 2);
         assert_eq!(nx.images[0].bbox.y, rect.y);
         assert_eq!(nx.images[0].bytes.as_slice(), b"not-really-png-but-bytes");
+    }
+
+    /// `paint` alone paints the picture: neither `figures` nor `images` is
+    /// what reaches the bytes, which is the contract the screenshot path
+    /// depends on (it asks for neither). The command's rect is the same rect
+    /// `pic_rects` reports, so a raster and a bbox consumer cannot disagree.
+    #[test]
+    fn paint_emits_one_image_command_per_placement() {
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>
+            <row r="1"><c r="A1"><v>1</v></c></row>
+        </sheetData><drawing r:id="rId7"/></worksheet>"#;
+        let anchor = pic_anchor(
+            r#"<xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="914400" cy="457200"/>"#,
+        );
+        let nx = layout_with_pic(
+            sheet,
+            &format!("{anchor}</xdr:oneCellAnchor>"),
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+        );
+        assert!(nx.images.is_empty(), "paint collects no extraction entries");
+        let images: Vec<_> = nx.layouts[0]
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Image {
+                    rect,
+                    image_data,
+                    src_rect,
+                    float,
+                } => Some((rect, image_data, src_rect, float)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1);
+        let (rect, data, src_rect, float) = images[0];
+        assert!(src_rect.is_none(), "a:srcRect is not read for XLSX yet");
+        assert!(*float, "an XLSX picture paints above the grid's text");
+        assert_eq!(&*data.data, b"not-really-png-but-bytes");
+        let r = &nx.pic_rects[0][0];
+        assert_eq!(
+            (
+                rect.origin.x.raw(),
+                rect.origin.y.raw(),
+                rect.size.width.raw(),
+                rect.size.height.raw()
+            ),
+            (r.x, r.y, r.width, r.height),
+            "the painted box and the reported box are one box"
+        );
+        // The grid still painted underneath — the floating layer appends, it
+        // does not replace.
+        assert!(
+            nx.layouts[0]
+                .commands
+                .iter()
+                .any(|c| matches!(c, DrawCommand::Rect { .. }))
+        );
+    }
+
+    /// Without `paint` there is no image command and no byte copy — the
+    /// parse path's cost is unchanged by this layer existing.
+    #[test]
+    fn a_parse_paints_no_pictures() {
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>
+            <row r="1"><c r="A1"><v>1</v></c></row>
+        </sheetData><drawing r:id="rId7"/></worksheet>"#;
+        let anchor = pic_anchor(
+            r#"<xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="914400" cy="457200"/>"#,
+        );
+        let nx = layout_with_pic(
+            sheet,
+            &format!("{anchor}</xdr:oneCellAnchor>"),
+            EmitOptions::default(),
+        );
+        assert_eq!(nx.pic_rects[0].len(), 1, "the rect is still reported");
+        assert!(nx.layouts[0].commands.is_empty());
+    }
+
+    /// An image-only sheet has no grid to paint and still has something to
+    /// draw: the picture command lives outside the `SheetPlan` arm.
+    #[test]
+    fn a_plan_less_sheet_still_paints_its_picture() {
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData/><drawing r:id="rId7"/></worksheet>"#;
+        let anchor = pic_anchor(
+            r#"<xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="914400" cy="914400"/>"#,
+        );
+        let nx = layout_with_pic(
+            sheet,
+            &format!("{anchor}</xdr:oneCellAnchor>"),
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(nx.layouts.len(), 1);
+        assert_eq!(
+            nx.layouts[0]
+                .commands
+                .iter()
+                .filter(|c| matches!(c, DrawCommand::Image { .. }))
+                .count(),
+            1
+        );
     }
 
     /// `figures` without `images`: refs appear, no bytes are collected —

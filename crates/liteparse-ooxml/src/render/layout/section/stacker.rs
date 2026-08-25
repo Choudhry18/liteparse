@@ -157,6 +157,7 @@ pub fn stack_blocks(
                             ),
                             image_data: fi.image_data.clone(),
                             src_rect: fi.src_rect,
+                            float: false,
                         });
                         let bottom = img_y + fi.size.height;
                         band_bottom = Some(match band_bottom {
@@ -323,6 +324,7 @@ pub fn stack_blocks(
                         ),
                         image_data: fi.image_data.clone(),
                         src_rect: fi.src_rect,
+                        float: false,
                     });
                     // Extend cursor to encompass the image so table cells
                     // expand to contain floating images.

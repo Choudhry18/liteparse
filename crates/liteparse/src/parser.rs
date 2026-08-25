@@ -1582,10 +1582,11 @@ impl LiteParse {
         let registry = liteparse_ooxml::render::fonts::FontRegistry::build(&[], &[])
             .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
         // The one call that differs from the parse side: `paint: true` plus a
-        // registry, which is what turns the pass's grid and cell values into
-        // draw commands. Figures and image bytes stay off — the floating
-        // layer does not paint yet, so asking for it would only copy bytes
-        // nothing draws.
+        // registry, which is what turns the pass's grid, cell values and
+        // pictures into draw commands. `figures` and `images` stay off —
+        // those are the *emission* side (markdown refs and extracted byte
+        // entries), which a raster has no use for; `paint` reaches the
+        // picture bytes on its own.
         let nx = xlsx_layout::workbook_to_pages(
             &wb,
             xlsx::EmitOptions {

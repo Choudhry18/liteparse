@@ -458,6 +458,7 @@ fn register_paragraph_floats(
                 rect: PtRect::from_xywh(fi.x.resolve(parity), img_y, fi.size.width, fi.size.height),
                 image_data: fi.image_data.clone(),
                 src_rect: fi.src_rect,
+                float: false,
             });
             if y_end > state.cursor_y {
                 state.cursor_y = y_end;
@@ -1857,6 +1858,7 @@ pub(crate) fn layout_section_with_clearance(
                         ),
                         image_data: fi.image_data.clone(),
                         src_rect: fi.src_rect,
+                        float: false,
                     });
                 }
 
