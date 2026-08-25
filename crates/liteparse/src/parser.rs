@@ -965,6 +965,7 @@ impl LiteParse {
                 // screenshot path only.
                 paint: false,
             },
+            None,
         );
 
         // A text-sparse workbook with OCR on is likely a pasted scan; only

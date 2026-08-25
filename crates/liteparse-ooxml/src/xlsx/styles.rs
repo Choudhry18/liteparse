@@ -448,9 +448,23 @@ pub enum HorizontalAlign {
     Distributed,
 }
 
+/// §18.18.88 `ST_VerticalAlignment`. Excel's default is **bottom**, not top —
+/// a one-line label in a tall row sits on the row's floor, and taking top
+/// instead lifts every heading in a spreadsheet off its own gridline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VerticalAlign {
+    Top,
+    Center,
+    #[default]
+    Bottom,
+    Justify,
+    Distributed,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Alignment {
     pub horizontal: HorizontalAlign,
+    pub vertical: VerticalAlign,
     pub wrap_text: bool,
     /// Indent steps, each 3 spaces' worth in Excel's rendering. Load-bearing
     /// for structure: indented labels are how spreadsheets express hierarchy.
@@ -633,6 +647,13 @@ impl Styles {
                                 Some("centerContinuous") => HorizontalAlign::CenterContinuous,
                                 Some("distributed") => HorizontalAlign::Distributed,
                                 _ => HorizontalAlign::General,
+                            },
+                            vertical: match attr(e, b"vertical").as_deref() {
+                                Some("top") => VerticalAlign::Top,
+                                Some("center") => VerticalAlign::Center,
+                                Some("justify") => VerticalAlign::Justify,
+                                Some("distributed") => VerticalAlign::Distributed,
+                                _ => VerticalAlign::Bottom,
                             },
                             wrap_text: attr_bool(e, b"wrapText", false),
                             indent: attr_parse(e, b"indent").unwrap_or(0),
@@ -1032,7 +1053,7 @@ mod tests {
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
     <xf numFmtId="164" fontId="1" fillId="2" borderId="1" applyNumberFormat="1"/>
     <xf numFmtId="3" fontId="2" quotePrefix="1"/>
-    <xf numFmtId="0" fontId="0"><alignment horizontal="center" wrapText="1" indent="2"/></xf>
+    <xf numFmtId="0" fontId="0"><alignment horizontal="center" vertical="top" wrapText="1" indent="2"/></xf>
     <xf numFmtId="0" fontId="3" fillId="3" borderId="2"/>
   </cellXfs>
   <dxfs count="1"><dxf>
@@ -1108,11 +1129,15 @@ mod tests {
     fn alignment_is_read_from_the_xf_child() {
         let a = styles().alignment(Some(3));
         assert_eq!(a.horizontal, HorizontalAlign::Center);
+        assert_eq!(a.vertical, VerticalAlign::Top);
         assert!(a.wrap_text);
         assert_eq!(a.indent, 2);
         // An xf with no <alignment> child gets the default, not the previous
         // xf's — the classic streaming-parser carry-over bug.
         assert_eq!(styles().alignment(Some(0)), Alignment::default());
+        // §18.18.88's default is bottom, and a cell that states no
+        // `vertical=` must resolve to it rather than to top.
+        assert_eq!(styles().alignment(Some(0)).vertical, VerticalAlign::Bottom);
     }
 
     #[test]

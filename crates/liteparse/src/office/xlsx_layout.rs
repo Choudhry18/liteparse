@@ -4,7 +4,14 @@
 //! *stated*: the file declares every column width and row height, so this
 //! pass is unit conversion plus pagination — no fonts, no measurement, no
 //! host dependence. Every constant traces to `xlsx_geometry_census` over the
-//! 1,248-workbook corpus:
+//! 1,248-workbook corpus.
+//!
+//! The **paint** built on top of it does measure, and that is a deliberate
+//! divergence between the two consumers of one read rather than a crack in
+//! the claim above: a raster has to decide where a glyph lands and where a
+//! string stops, and a `TextItem` does not. Nothing the measurer returns
+//! reaches a [`Page`] — the items are byte-identical with and without a font
+//! registry, and a test says so. Constants:
 //!
 //! * **Packed, not canvas.** Item positions honour the emitted grid (rows
 //!   the file wrote, columns holding at least one cell), the same sparse
@@ -32,13 +39,18 @@
 //! between cells on a line.
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use liteparse_ooxml::render::dimension::Pt;
-use liteparse_ooxml::render::geometry::{PtRect, PtSize};
+use liteparse_ooxml::render::fonts::FontRegistry;
+use liteparse_ooxml::render::geometry::{PtOffset, PtRect, PtSize};
 use liteparse_ooxml::render::layout::draw_command::{DrawCommand, LayoutedPage};
+use liteparse_ooxml::render::layout::fragment::FontProps;
+use liteparse_ooxml::render::layout::measurer::TextMeasurer;
 use liteparse_ooxml::render::resolve::color::RgbColor;
 use liteparse_ooxml::xlsx::{
-    Border, BorderEdge, CellAnchor, PatternType, PicAnchor, Row, Sheet, SheetShape, Workbook,
+    Alignment, Border, BorderEdge, CellAnchor, CellValue, HorizontalAlign, PatternType, PicAnchor,
+    Row, Sheet, SheetShape, VerticalAlign, Workbook,
 };
 
 use super::figures::FigureSink;
@@ -103,10 +115,14 @@ pub struct NativeXlsx {
     /// for (a rectangle costs no byte copies).
     pub pic_rects: Vec<Vec<Rect>>,
     /// The paint of each page, aligned with `pages`: gridlines, cell fills
-    /// and cell borders as [`DrawCommand::Rect`]s, ready for
-    /// `render::raster::rasterize_page`. Cell *text* is not here yet — this
-    /// is the grid, not the sheet.
+    /// and cell borders as [`DrawCommand::Rect`]s, then the cell text as
+    /// [`DrawCommand::Text`]s — ready for `render::raster::rasterize_page`.
+    /// Empty unless `EmitOptions::paint`; textless unless a font registry was
+    /// supplied too.
     pub layouts: Vec<LayoutedPage>,
+    /// What the text pass met, summed over the workbook. Zero when nothing
+    /// was painted; read by the corpus gate, not by `parser.rs`.
+    pub text_stats: TextPaintStats,
 }
 
 /// EMU → points: 914,400 EMU to the inch, 72 points to the inch.
@@ -184,7 +200,18 @@ fn col_px(w: f64) -> f64 {
 
 /// Lay out a whole workbook. Infallible past a successful `xlsx::read`, like
 /// the emitter: a sheet with no content still yields one empty page.
-pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
+///
+/// `fonts` is the registry the *text* paint measures with, and is needed only
+/// under `EmitOptions::paint`: a parse wants `TextItem`s, whose boxes are the
+/// declared grid and so cost no measurement at all — that is this pass's whole
+/// host-independence claim, and it survives here because nothing the measurer
+/// returns reaches a `Page`. Painting with `None` draws the grid and no text.
+pub fn workbook_to_pages(
+    wb: &Workbook,
+    opts: EmitOptions,
+    fonts: Option<&FontRegistry>,
+) -> NativeXlsx {
+    let measurer = fonts.map(TextMeasurer::new);
     let mut out = NativeXlsx {
         pages: Vec::new(),
         page_blocks: Vec::new(),
@@ -193,6 +220,7 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
         images: Vec::new(),
         pic_rects: Vec::new(),
         layouts: Vec::new(),
+        text_stats: TextPaintStats::default(),
     };
     // One sink across the workbook: a logo placed on every sheet dedups to
     // one canonical entry, the same cross-page rule the PPTX path applies
@@ -351,7 +379,16 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
                 Pt::new(page.page_height),
             ));
             if let (true, Some(p)) = (opts.paint, &plan) {
-                layout.commands = geo.paint_page(wb, sheet, p, &col_styles, ranges[i].clone());
+                let (cmds, stats) = geo.paint_page(
+                    wb,
+                    sheet,
+                    p,
+                    &col_styles,
+                    ranges[i].clone(),
+                    measurer.as_ref(),
+                );
+                layout.commands = cmds;
+                out.text_stats.add(stats);
             }
             out.layouts.push(layout);
             out.pages.push(page);
@@ -565,6 +602,328 @@ fn push_border(
     }
 }
 
+// ── cell text ───────────────────────────────────────────────────────────────
+
+/// Excel's own defaults when the styles part names neither.
+const DEFAULT_FONT_FAMILY: &str = "Calibri";
+const DEFAULT_FONT_SIZE: f32 = 11.0;
+/// §18.8.1: one `indent` step is three characters' worth of the cell's font.
+const INDENT_STEP: &str = "   ";
+
+/// What the text pass did with the overflow it met, per the four rules Excel
+/// applies — the counters the corpus gate reads back against the paint
+/// census's independent predictions (12.8% clipped, 6.1% spilled, 2.0%
+/// hashed, 6.9% wrapped).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextPaintStats {
+    /// Cells that painted at least one line.
+    pub cells: u64,
+    /// Cells with text that painted nothing: the fit left no character at
+    /// all, which is a hidden (zero-width) column or a number in a column too
+    /// narrow for one `#`. Named rather than silent — `cells + blank` is what
+    /// the recall oracle must equal.
+    pub blank: u64,
+    /// Cells whose style declares `wrapText`. The census's denominator.
+    pub wrap_declared: u64,
+    /// Cells whose text actually broke over more than one line — a declared
+    /// wrap on a string that fits does not.
+    pub wrapped: u64,
+    /// Cells that ran into at least one empty neighbour.
+    pub spilled: u64,
+    /// Overflowing cells whose *declared* right neighbour is unwritten but
+    /// whose *packed* one is not: the spill Excel would do and this pass
+    /// cannot, because the empty column between them is compacted out of the
+    /// page. The size of the one divergence between this pass's grid and
+    /// Excel's that the text rules can see.
+    pub spill_lost_to_packing: u64,
+    /// Cells whose text was cut because the room ran out.
+    pub clipped: u64,
+    /// Numeric cells replaced by `#######`.
+    pub hashed: u64,
+}
+
+impl TextPaintStats {
+    fn add(&mut self, o: TextPaintStats) {
+        self.cells += o.cells;
+        self.blank += o.blank;
+        self.wrap_declared += o.wrap_declared;
+        self.wrapped += o.wrapped;
+        self.spilled += o.spilled;
+        self.spill_lost_to_packing += o.spill_lost_to_packing;
+        self.clipped += o.clipped;
+        self.hashed += o.hashed;
+    }
+}
+
+/// A cell's font as the measurer wants it. Underline and strike are read by
+/// the reader but not drawn: both are separate commands in a stream whose Ink
+/// pass would put them over the text, and neither changes where a glyph lands.
+fn font_props(font: &liteparse_ooxml::xlsx::Font) -> FontProps {
+    FontProps {
+        family: Rc::from(font.name.as_deref().unwrap_or(DEFAULT_FONT_FAMILY)),
+        size: Pt::new(font.size.unwrap_or(DEFAULT_FONT_SIZE)),
+        bold: font.bold,
+        italic: font.italic,
+        underline: false,
+        char_spacing: Pt::ZERO,
+        text_scale: 1.0,
+        underline_position: Pt::ZERO,
+        underline_thickness: Pt::ZERO,
+    }
+}
+
+fn width_of(m: &TextMeasurer, fp: &FontProps, text: &str) -> f64 {
+    f64::from(f32::from(m.measure(text, fp).0))
+}
+
+/// The longest prefix of `text` that fits in `avail`, at a **character**
+/// boundary — Excel clips mid-glyph, and stopping one glyph early is the whole
+/// difference. Binary search, so a long string costs log(n) measures against
+/// the memo rather than one per character.
+fn fit_prefix<'a>(m: &TextMeasurer, fp: &FontProps, text: &'a str, avail: f64) -> &'a str {
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if width_of(m, fp, &text[..bounds[mid]]) <= avail {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    &text[..bounds[lo]]
+}
+
+/// Greedy word wrap inside `avail`, honouring the cell's own newlines. A word
+/// longer than the whole box is broken at the character that overflows rather
+/// than hanging out of it — Excel does the same.
+fn wrap_lines(m: &TextMeasurer, fp: &FontProps, text: &str, avail: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            let candidate = if line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{line} {word}")
+            };
+            if width_of(m, fp, &candidate) <= avail || line.is_empty() && avail <= 0.0 {
+                line = candidate;
+                continue;
+            }
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            // The word alone, broken as many times as it takes.
+            let mut rest = word;
+            while !rest.is_empty() && width_of(m, fp, rest) > avail {
+                let head = fit_prefix(m, fp, rest, avail);
+                // An `avail` too small for one character would loop forever;
+                // emit that character and let it overhang.
+                let head = if head.is_empty() {
+                    &rest[..rest.chars().next().map_or(0, char::len_utf8)]
+                } else {
+                    head
+                };
+                out.push(head.to_string());
+                rest = &rest[head.len()..];
+            }
+            line = rest.to_string();
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Which retained columns of one row hold something text may not run into: a
+/// cell with display text, or any column a merge on this row covers (its box
+/// is already claimed, even where the merge itself is blank).
+///
+/// Excel's rule is content, not style — a filled but empty cell does not stop
+/// a spill — which is why this is derived from the row's valued cells rather
+/// than from the paint cascade beside it.
+fn occupied_columns(
+    wb: &Workbook,
+    geo: &SheetGeometry,
+    plan: &SheetPlan<'_>,
+    range: &Range<usize>,
+    i: usize,
+) -> Vec<bool> {
+    let (_, cells) = &plan.rows[i];
+    let mut occupied = vec![false; plan.cols.len()];
+    for cell in cells {
+        let b = geo.cell_box(plan, range, i, cell);
+        let has_text = wb.display_text(cell).is_some_and(|t| !t.trim().is_empty());
+        if !has_text && b.cols.len() <= 1 {
+            continue;
+        }
+        for ci in b.cols {
+            occupied[ci] = true;
+        }
+    }
+    occupied
+}
+
+/// One cell's text as [`DrawCommand::Text`]s, one per line.
+///
+/// The rules are Excel's, and each carries the census number that justified
+/// building it (paint census, 1,247 workbooks):
+///
+/// * **`wrapText` or an embedded newline** (6.9% + 76,952 cells) breaks over
+///   lines inside the box.
+/// * **Text wider than its box spills** into the run of empty neighbours in
+///   the direction its alignment points (6.1% of unwrapped text cells), and is
+///   **clipped** where a written neighbour stops it (12.8%) — the case a
+///   painter that just draws the string at its origin turns into overlapping
+///   mush.
+/// * **A number wider than its column becomes `#######`** (2.0% of unwrapped
+///   numeric cells). Numbers never spill; that is Excel's rule, not a
+///   simplification.
+/// * **`General` is "numbers right, text left"** — the alignment nobody
+///   declares, and the reason a spreadsheet reads as a table.
+///
+/// The clip is at a character boundary rather than mid-glyph: the command
+/// stream has no clip bracket, and adding one to paint half a glyph would put
+/// a variant in front of every consumer that matches on `DrawCommand`.
+#[allow(clippy::too_many_arguments)]
+fn paint_cell_text(
+    out: &mut Vec<DrawCommand>,
+    m: &TextMeasurer,
+    text: &str,
+    numeric: bool,
+    font: &liteparse_ooxml::xlsx::Font,
+    align: &Alignment,
+    color: RgbColor,
+    b: &CellBox,
+    y: f64,
+    room: (f64, f64),
+    declared_neighbour_free: bool,
+) -> TextPaintStats {
+    let mut stats = TextPaintStats::default();
+    if align.wrap_text {
+        stats.wrap_declared += 1;
+    }
+    let fp = font_props(font);
+    let indent = if align.indent > 0 {
+        width_of(m, &fp, INDENT_STEP) * f64::from(align.indent)
+    } else {
+        0.0
+    };
+    let right_aligned = matches!(align.horizontal, HorizontalAlign::Right)
+        || (numeric && align.horizontal == HorizontalAlign::General);
+
+    let mut x0 = b.x + f64::from(TEXT_INSET) + if right_aligned { 0.0 } else { indent };
+    let mut avail = (b.w - 2.0 * f64::from(TEXT_INSET) - indent).max(0.0);
+
+    let mut lines: Vec<String> = if align.wrap_text || text.contains('\n') {
+        wrap_lines(m, &fp, text, avail)
+    } else {
+        vec![text.to_string()]
+    };
+    if lines.len() > 1 {
+        stats.wrapped += 1;
+    }
+
+    // The overflow rules apply to the single-line case only: a wrapped cell
+    // has already been fitted to its box.
+    if lines.len() == 1 {
+        let w = width_of(m, &fp, &lines[0]);
+        if w > avail {
+            if numeric {
+                let hash = width_of(m, &fp, "#");
+                let n = if hash > 0.0 {
+                    (avail / hash).floor() as usize
+                } else {
+                    0
+                };
+                lines[0] = "#".repeat(n);
+                stats.hashed += 1;
+            } else {
+                let (left, right) = room;
+                let (grow_l, grow_r) = match align.horizontal {
+                    HorizontalAlign::Right => (left, 0.0),
+                    HorizontalAlign::Center | HorizontalAlign::CenterContinuous => (left, right),
+                    _ => (0.0, right),
+                };
+                if grow_l > 0.0 || grow_r > 0.0 {
+                    stats.spilled += 1;
+                } else if declared_neighbour_free {
+                    stats.spill_lost_to_packing += 1;
+                }
+                x0 -= grow_l;
+                avail += grow_l + grow_r;
+                if w > avail {
+                    lines[0] = fit_prefix(m, &fp, &lines[0], avail).to_string();
+                    stats.clipped += 1;
+                }
+            }
+        }
+    }
+
+    let (_, metrics) = m.measure("", &fp);
+    let (ascent, descent) = (
+        f64::from(f32::from(metrics.ascent)),
+        f64::from(f32::from(metrics.descent)),
+    );
+    let line_h = ascent + descent + f64::from(f32::from(metrics.leading));
+    let n = lines.len() as f64;
+    let inset_v = f64::from(TEXT_INSET);
+    let first_baseline = match align.vertical {
+        VerticalAlign::Top => y + inset_v + ascent,
+        VerticalAlign::Center => y + (b.h - n * line_h) / 2.0 + ascent,
+        // Bottom is the default, and `justify`/`distributed` over a single
+        // line are bottom in Excel too.
+        _ => y + b.h - inset_v - descent - (n - 1.0) * line_h,
+    };
+
+    for (li, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let lw = width_of(m, &fp, line);
+        let x = match align.horizontal {
+            HorizontalAlign::Right => x0 + avail - lw,
+            HorizontalAlign::Center | HorizontalAlign::CenterContinuous => x0 + (avail - lw) / 2.0,
+            HorizontalAlign::General if numeric => x0 + avail - lw,
+            _ => x0,
+        };
+        out.push(DrawCommand::Text {
+            position: PtOffset {
+                x: Pt::new(MARGIN + x as f32),
+                y: Pt::new(MARGIN + (first_baseline + li as f64 * line_h) as f32),
+            },
+            text: Rc::from(line.as_str()),
+            font_family: Rc::clone(&fp.family),
+            char_spacing: Pt::ZERO,
+            font_size: fp.size,
+            bold: fp.bold,
+            italic: fp.italic,
+            color,
+            text_scale: 1.0,
+        });
+    }
+    if lines.iter().all(String::is_empty) {
+        stats.blank += 1;
+    } else {
+        stats.cells += 1;
+    }
+    stats
+}
+
+/// One cell's box on a page, grid-relative: the rectangle plus the retained
+/// columns it covers, which is what the spill rule needs to find the
+/// neighbours it may run into.
+struct CellBox {
+    x: f64,
+    w: f64,
+    h: f64,
+    cols: Range<usize>,
+}
+
 /// The resolved sizes of one sheet's emitted grid: prefix sums so a rect is
 /// two subtractions, in points throughout.
 struct SheetGeometry {
@@ -759,11 +1118,13 @@ impl SheetGeometry {
         plan: &SheetPlan<'_>,
         col_styles: &[Option<u32>],
         range: Range<usize>,
-    ) -> Vec<DrawCommand> {
+        measurer: Option<&TextMeasurer<'_>>,
+    ) -> (Vec<DrawCommand>, TextPaintStats) {
         let y_base = self.y_off[range.start];
         let grid_w = *self.x_off.last().unwrap();
         let grid_h = self.y_off[range.end] - y_base;
         let mut cmds = Vec::new();
+        let mut stats = TextPaintStats::default();
 
         // 1. Gridlines: one line per emitted-row and retained-column boundary,
         // under everything. They follow the *packed* grid, so a compacted-out
@@ -808,7 +1169,120 @@ impl SheetGeometry {
             }
         }
         cmds.append(&mut borders);
-        cmds
+
+        // 4. Cell text, over every rect: the raster's Ink pass paints `Text`
+        // after `Rect` whatever the emission order, so this is placement, not
+        // layering. The style cascade is the paint walk's — a cell with no
+        // `s=` takes its font from its row's `customFormat` or its column,
+        // exactly as its fill does.
+        if let Some(m) = measurer {
+            for i in range.clone() {
+                let (row, cells) = &plan.rows[i];
+                let y = self.y_off[i] - y_base;
+                row_paint_styles(row, cells, &plan.cols, col_styles, &mut styles);
+                let occupied = occupied_columns(wb, self, plan, &range, i);
+                for cell in cells {
+                    let text = wb.display_text(cell).unwrap_or_default();
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let b = self.cell_box(plan, &range, i, cell);
+                    if b.cols.is_empty() {
+                        continue;
+                    }
+                    let style = cell
+                        .style
+                        .or_else(|| styles.get(b.cols.start).copied().flatten());
+                    let color = wb
+                        .styles
+                        .font(style)
+                        .color
+                        .and_then(|c| wb.resolve_color(c))
+                        .map_or(RgbColor::BLACK, rgb_of);
+                    stats.add(paint_cell_text(
+                        &mut cmds,
+                        m,
+                        text,
+                        matches!(cell.value, CellValue::Number(_)),
+                        &wb.styles.font(style),
+                        &wb.styles.alignment(style),
+                        color,
+                        &b,
+                        y,
+                        self.spill_room(&occupied, &b.cols),
+                        !cells.iter().any(|n| {
+                            n.at.col == cell.at.col + 1
+                                && wb.display_text(n).is_some_and(|t| !t.trim().is_empty())
+                        }),
+                    ));
+                }
+            }
+        }
+        (cmds, stats)
+    }
+
+    /// How far a cell's text may run left and right before it meets written
+    /// content, in points: the widths of the unbroken runs of empty retained
+    /// columns on each side of the cell's own span.
+    fn spill_room(&self, occupied: &[bool], cols: &Range<usize>) -> (f64, f64) {
+        let mut lo = cols.start;
+        while lo > 0 && !occupied[lo - 1] {
+            lo -= 1;
+        }
+        let mut hi = cols.end;
+        while hi < occupied.len() && !occupied[hi] {
+            hi += 1;
+        }
+        (
+            self.x_off[cols.start] - self.x_off[lo],
+            self.x_off[hi] - self.x_off[cols.end],
+        )
+    }
+
+    /// One cell's box in grid-relative points: its own column and row, or the
+    /// merge's extent when it anchors one, clamped to the rows this page holds
+    /// (the block slicer clamps a cut merge's rowspan the same way).
+    ///
+    /// Shared by the item builder and the text painter so a glyph cannot be
+    /// laid out in a box the `TextItem` does not have — the two walk the same
+    /// rows for different outputs, and a merge rule stated twice is a merge
+    /// rule that drifts.
+    fn cell_box(
+        &self,
+        plan: &SheetPlan<'_>,
+        range: &Range<usize>,
+        i: usize,
+        cell: &liteparse_ooxml::xlsx::Cell,
+    ) -> CellBox {
+        let (row, _) = &plan.rows[i];
+        let ci = plan
+            .cols
+            .binary_search(&cell.at.col)
+            .unwrap_or_else(|_| unreachable!("retained columns are the union of all cells"));
+        match plan.anchors.get(&(row.index, cell.at.col)) {
+            Some(&idx) => {
+                let m = &plan.plans[idx];
+                let clo = plan.cols.partition_point(|&c| c < m.col_range.0);
+                let chi = plan.cols.partition_point(|&c| c <= m.col_range.1);
+                let mut j = i;
+                while j + 1 < range.end && plan.rows[j + 1].0.index <= m.row_range.1 {
+                    j += 1;
+                }
+                CellBox {
+                    x: self.x_off[clo],
+                    w: self.x_off[chi] - self.x_off[clo],
+                    h: self.y_off[j + 1] - self.y_off[i],
+                    cols: clo..chi,
+                }
+            }
+            None => CellBox {
+                x: self.x_off[ci],
+                w: self.x_off[ci + 1] - self.x_off[ci],
+                h: self.row_height(i),
+                cols: ci..ci + 1,
+            },
+        }
     }
 
     /// One page: the rows of `range`, each non-empty cell an item at its
@@ -828,36 +1302,14 @@ impl SheetGeometry {
         for i in range.clone() {
             let (row, cells) = &plan.rows[i];
             let y = MARGIN + (self.y_off[i] - y_base) as f32;
-            let row_h = self.row_height(i) as f32;
             for cell in cells {
                 let text = wb.display_text(cell).unwrap_or_default();
                 let text = text.trim();
                 if text.is_empty() {
                     continue;
                 }
-                let ci = plan.cols.binary_search(&cell.at.col).unwrap_or_else(|_| {
-                    unreachable!("retained columns are the union of all cells")
-                });
-                let (x, w, h) = match plan.anchors.get(&(row.index, cell.at.col)) {
-                    Some(&idx) => {
-                        let m = &plan.plans[idx];
-                        // Column extent of the merge over retained columns.
-                        let clo = plan.cols.partition_point(|&c| c < m.col_range.0);
-                        let chi = plan.cols.partition_point(|&c| c <= m.col_range.1);
-                        // Row extent, clamped to this page's rows: the block
-                        // slicer clamps the rowspan the same way.
-                        let mut j = i;
-                        while j + 1 < range.end && plan.rows[j + 1].0.index <= m.row_range.1 {
-                            j += 1;
-                        }
-                        (
-                            self.x_off[clo],
-                            self.x_off[chi] - self.x_off[clo],
-                            (self.y_off[j + 1] - self.y_off[i]) as f32,
-                        )
-                    }
-                    None => (self.x_off[ci], self.x_off[ci + 1] - self.x_off[ci], row_h),
-                };
+                let b = self.cell_box(plan, &range, i, cell);
+                let (x, w, h) = (b.x, b.w, b.h as f32);
                 let font = wb.styles.font(cell.style);
                 text_items.push(TextItem {
                     text: text.to_string(),
@@ -909,7 +1361,7 @@ mod tests {
 
     fn layout_of(sheet_xml: &str, extra: &[(&str, &str)]) -> NativeXlsx {
         let wb = workbook_from(sheet_xml, extra);
-        workbook_to_pages(&wb, EmitOptions::default())
+        workbook_to_pages(&wb, EmitOptions::default(), None)
     }
 
     /// w=10 → px = round(10×7)+5 = 75 → 56.25 pt. The second column starts
@@ -1098,6 +1550,7 @@ mod tests {
                 links: true,
                 ..Default::default()
             },
+            None,
         );
         let site = &nx.pages[0].text_items[0];
         assert_eq!(site.text, "site");
@@ -1139,6 +1592,9 @@ mod tests {
                 paint: true,
                 ..Default::default()
             },
+            // Grid only: the text pass has its own fixtures, and a measured
+            // string would make every rect assertion host-dependent.
+            None,
         )
     }
 
@@ -1359,7 +1815,7 @@ mod tests {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let wb = workbook_from(sheet_xml, &extra);
-        workbook_to_pages(&wb, opts)
+        workbook_to_pages(&wb, opts, None)
     }
 
     /// A picture anchored on page 2's rows gets its figure block and rect on
@@ -1530,7 +1986,7 @@ mod tests {
             .into_iter()
             .map(|(b, _)| b)
             .collect();
-        let nx = workbook_to_pages(&wb, opts);
+        let nx = workbook_to_pages(&wb, opts, None);
         assert_eq!(
             format!("{emitted:?}"),
             format!("{:?}", nx.all_blocks),
@@ -1589,7 +2045,7 @@ mod tests {
             .into_iter()
             .map(|(b, _)| b)
             .collect();
-        let nx = workbook_to_pages(&wb, opts);
+        let nx = workbook_to_pages(&wb, opts, None);
         assert_eq!(
             format!("{emitted:?}"),
             format!("{:?}", nx.all_blocks),
@@ -1649,7 +2105,7 @@ mod tests {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let wb = workbook_from(&sheet, &extra);
-        let nx = workbook_to_pages(&wb, EmitOptions::default());
+        let nx = workbook_to_pages(&wb, EmitOptions::default(), None);
         assert!(nx.pages.len() > 1, "60 rows at 20pt must paginate");
         let with_item: Vec<usize> = nx
             .pages
@@ -1672,5 +2128,281 @@ mod tests {
         assert_eq!(with_item, with_block, "item page and block page agree");
         assert_eq!(with_item.len(), 1);
         assert!(with_item[0] > 0, "row 50 is not on page 1");
+    }
+    // ── cell text ───────────────────────────────────────────────────────────
+
+    /// A styles part for the text tests: alignments, a wrap, an indent and a
+    /// coloured font. Sizes are stated so a host with a different default
+    /// cannot move the assertions.
+    const TEXT_STYLES: &str = r#"<styleSheet>
+      <fonts count="2">
+        <font><sz val="11"/><name val="Arial"/></font>
+        <font><sz val="11"/><name val="Arial"/><color rgb="FFCC0000"/></font>
+      </fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="6">
+        <xf numFmtId="0" fontId="0"/>
+        <xf numFmtId="0" fontId="0"><alignment horizontal="right"/></xf>
+        <xf numFmtId="0" fontId="0"><alignment horizontal="center"/></xf>
+        <xf numFmtId="0" fontId="0"><alignment wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="1"/>
+        <xf numFmtId="0" fontId="0"><alignment vertical="top"/></xf>
+      </cellXfs>
+    </styleSheet>"#;
+
+    /// The text pass measures, so its fixtures need the host's fonts. Every
+    /// assertion below is a *relation* between two measured runs — never an
+    /// absolute width — because the host that runs this test is not the host
+    /// that wrote the file.
+    fn texted(sheet_xml: &str) -> NativeXlsx {
+        let wb = workbook_from(sheet_xml, &[("xl/styles.xml", TEXT_STYLES)]);
+        let registry = FontRegistry::new();
+        workbook_to_pages(
+            &wb,
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+            Some(&registry),
+        )
+    }
+
+    /// (text, x, baseline y, colour) of every text command on a page, in
+    /// emission order.
+    fn texts(page: &LayoutedPage) -> Vec<(String, f32, f32, RgbColor)> {
+        page.commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text {
+                    text,
+                    position,
+                    color,
+                    ..
+                } => Some((text.to_string(), position.x.raw(), position.y.raw(), *color)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_paints_only_with_a_registry_and_never_into_the_items() {
+        let sheet = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" t="inlineStr"><is><t>label</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let with = texted(sheet);
+        assert_eq!(texts(&with.layouts[0]).len(), 1);
+        assert_eq!(with.text_stats.cells, 1);
+
+        // The same workbook painted without a registry: the grid, no text.
+        let wb = workbook_from(sheet, &[("xl/styles.xml", TEXT_STYLES)]);
+        let without = workbook_to_pages(
+            &wb,
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(texts(&without.layouts[0]).is_empty());
+        assert_eq!(without.text_stats, TextPaintStats::default());
+        // And the item — the thing a parse consumes — is identical either way.
+        assert_eq!(
+            format!("{:?}", with.pages[0].text_items),
+            format!("{:?}", without.pages[0].text_items),
+            "measuring must not move a TextItem"
+        );
+    }
+
+    /// `General` is the alignment nobody declares, and the reason a sheet
+    /// reads as a table: the number sits at its cell's right edge, the label
+    /// at its left.
+    #[test]
+    fn general_alignment_puts_numbers_right_and_text_left() {
+        let nx = texted(
+            r#"<worksheet><cols><col min="1" max="2" width="12" customWidth="1"/></cols><sheetData>
+            <row r="1"><c r="A1" t="inlineStr"><is><t>ab</t></is></c><c r="B1"><v>7</v></c></row>
+        </sheetData></worksheet>"#,
+        );
+        let t = texts(&nx.layouts[0]);
+        assert_eq!(t.len(), 2);
+        let (label, number) = (&t[0], &t[1]);
+        // The label starts at its cell's left inset; the number's right edge
+        // is at its own cell's right inset, so it starts well inside.
+        let col_w = nx.pages[0].text_items[1].x - nx.pages[0].text_items[0].x;
+        assert!(
+            number.1 - label.1 > col_w,
+            "a General number must hug its right edge: label at {}, number at {}, column {col_w}",
+            label.1,
+            number.1
+        );
+    }
+
+    #[test]
+    fn declared_alignments_place_the_line_in_its_box() {
+        let sheet = |style: u32| {
+            format!(
+                r#"<worksheet><cols><col min="1" max="1" width="20" customWidth="1"/></cols><sheetData>
+                <row r="1"><c r="A1" s="{style}" t="inlineStr"><is><t>ab</t></is></c></row>
+            </sheetData></worksheet>"#
+            )
+        };
+        let left = texted(&sheet(0)).layouts[0].commands.clone();
+        let right = texted(&sheet(1)).layouts[0].commands.clone();
+        let centre = texted(&sheet(2)).layouts[0].commands.clone();
+        let x = |cmds: &[DrawCommand]| {
+            cmds.iter()
+                .find_map(|c| match c {
+                    DrawCommand::Text { position, .. } => Some(position.x.raw()),
+                    _ => None,
+                })
+                .expect("one text command")
+        };
+        let (l, c, r) = (x(&left), x(&centre), x(&right));
+        assert!(l < c && c < r, "left {l} < centre {c} < right {r}");
+    }
+
+    /// Bottom is Excel's default vertical alignment, so a one-line label in a
+    /// tall row sits on the row's floor — the rule that keeps a heading on its
+    /// own gridline instead of floating at the top of the box.
+    #[test]
+    fn vertical_default_is_bottom_and_top_is_honoured() {
+        let sheet = |style: u32| {
+            format!(
+                r#"<worksheet><sheetData>
+                <row r="1" ht="80" customHeight="1"><c r="A1" s="{style}" t="inlineStr"><is><t>ab</t></is></c></row>
+            </sheetData></worksheet>"#
+            )
+        };
+        let bottom = texted(&sheet(0));
+        let top = texted(&sheet(5));
+        let y = |nx: &NativeXlsx| texts(&nx.layouts[0])[0].2;
+        assert!(
+            y(&bottom) - y(&top) > 40.0,
+            "an 80 pt row must separate a bottom baseline from a top one: {} vs {}",
+            y(&bottom),
+            y(&top)
+        );
+    }
+
+    #[test]
+    fn wrap_text_breaks_over_lines_inside_the_box() {
+        let sheet = |style: u32| {
+            format!(
+                r#"<worksheet><cols><col min="1" max="2" width="6" customWidth="1"/></cols><sheetData>
+                <row r="1" ht="60" customHeight="1"><c r="A1" s="{style}" t="inlineStr"><is><t>alpha beta gamma delta</t></is></c><c r="B1" t="inlineStr"><is><t>x</t></is></c></row>
+            </sheetData></worksheet>"#
+            )
+        };
+        let wrapped = texted(&sheet(3));
+        let lines = texts(&wrapped.layouts[0]);
+        assert!(lines.len() > 2, "a narrow wrapped cell breaks: {lines:?}");
+        assert_eq!(wrapped.text_stats.wrapped, 1);
+        // Every line stays inside the cell — the neighbour is written, so
+        // nothing may reach into it. The last command is the neighbour's own
+        // "x": the row walk paints A1's lines, then B1.
+        let (_, b_x, ..) = *lines.last().expect("the neighbour paints");
+        for (line, x, ..) in &lines[..lines.len() - 1] {
+            assert!(*x < b_x, "line {line:?} at {x} escaped into column B");
+        }
+    }
+
+    /// The 12.8% / 6.1% pair from the paint census, as one fixture: the same
+    /// oversized string clips against a written neighbour and spills past an
+    /// empty one.
+    #[test]
+    fn overflow_spills_into_an_empty_neighbour_and_clips_against_a_written_one() {
+        let long = "the quick brown fox jumps over the lazy dog";
+        let sheet = |neighbour: &str| {
+            format!(
+                r#"<worksheet><cols><col min="1" max="3" width="6" customWidth="1"/></cols><sheetData>
+                <row r="1"><c r="A1" t="inlineStr"><is><t>{long}</t></is></c>{neighbour}</row>
+                <row r="2"><c r="C2" t="inlineStr"><is><t>C</t></is></c></row>
+            </sheetData></worksheet>"#
+            )
+        };
+        let blocked = texted(&sheet(
+            r#"<c r="B1" t="inlineStr"><is><t>stop</t></is></c>"#,
+        ));
+        let spilled = texted(&sheet(""));
+
+        assert_eq!(blocked.text_stats.clipped, 1);
+        assert_eq!(blocked.text_stats.spilled, 0);
+        let cut = &texts(&blocked.layouts[0])[0].0;
+        assert!(
+            cut.len() < long.len() && long.starts_with(cut.as_str()),
+            "the clip is a prefix at a character boundary, got {cut:?}"
+        );
+
+        assert_eq!(spilled.text_stats.spilled, 1);
+        let run = &texts(&spilled.layouts[0])[0].0;
+        assert!(
+            run.len() > cut.len(),
+            "spilling past two empty columns must show more than clipping at one: {run:?} vs {cut:?}"
+        );
+    }
+
+    /// Numbers never spill — Excel's own rule, not a simplification — so a
+    /// number too wide for its column becomes hashes instead.
+    #[test]
+    fn a_number_too_wide_for_its_column_becomes_hashes() {
+        let nx = texted(
+            r#"<worksheet><cols><col min="1" max="2" width="3" customWidth="1"/></cols><sheetData>
+            <row r="1"><c r="A1"><v>123456789012345</v></c></row>
+        </sheetData></worksheet>"#,
+        );
+        let t = texts(&nx.layouts[0]);
+        assert_eq!(nx.text_stats.hashed, 1);
+        assert!(
+            !t[0].0.is_empty() && t[0].0.chars().all(|c| c == '#'),
+            "expected hashes, got {:?}",
+            t[0].0
+        );
+        // The item keeps the value's *display* text — General renders a
+        // number this large in scientific notation, which is Excel's own
+        // answer and fits nowhere near a 3-unit column either. Only the
+        // raster says it does not fit; an extraction consumer still reads it.
+        assert_eq!(nx.pages[0].text_items[0].text, "1.23457E+14");
+    }
+
+    #[test]
+    fn a_font_colour_reaches_the_command_and_an_absent_one_is_black() {
+        let nx = texted(
+            r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="4" t="inlineStr"><is><t>red</t></is></c><c r="B1" t="inlineStr"><is><t>plain</t></is></c></row>
+        </sheetData></worksheet>"#,
+        );
+        let t = texts(&nx.layouts[0]);
+        assert_eq!(
+            t[0].3,
+            RgbColor {
+                r: 0xCC,
+                g: 0,
+                b: 0
+            }
+        );
+        assert_eq!(t[1].3, RgbColor::BLACK);
+    }
+
+    /// A cell with no `s=` takes its font from the row's `customFormat` or its
+    /// column, exactly as its fill does — the cascade the paint walk already
+    /// owns, applied to text.
+    #[test]
+    fn an_unstyled_cell_takes_the_row_and_column_font_colour() {
+        let nx = texted(
+            r#"<worksheet><cols><col min="2" max="2" width="9" style="4"/></cols><sheetData>
+            <row r="1" s="4" customFormat="1"><c r="A1" t="inlineStr"><is><t>row</t></is></c></row>
+            <row r="2"><c r="B2" t="inlineStr"><is><t>col</t></is></c></row>
+        </sheetData></worksheet>"#,
+        );
+        let red = RgbColor {
+            r: 0xCC,
+            g: 0,
+            b: 0,
+        };
+        let t = texts(&nx.layouts[0]);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].3, red, "row customFormat font");
+        assert_eq!(t[1].3, red, "col style font");
     }
 }

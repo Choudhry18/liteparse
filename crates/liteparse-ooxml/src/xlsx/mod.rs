@@ -58,7 +58,7 @@ pub use refs::{CellRef, RangeRef, column_label, parse_cell, parse_column, parse_
 pub use sheet::{Cell, CellValue, ColInfo, Hyperlink, Row, Sheet, SheetStats, StyledBlank};
 pub use styles::{
     Alignment, Border, BorderEdge, BorderStyle, CellXf, ColorKind, ColorRef, Fill, Font,
-    HorizontalAlign, INDEXED_PALETTE, PatternType, Styles,
+    HorizontalAlign, INDEXED_PALETTE, PatternType, Styles, VerticalAlign,
 };
 pub use text::{RichText, RunProps, TextRun, VertAlign, parse_shared_strings};
 
