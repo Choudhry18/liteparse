@@ -1641,7 +1641,14 @@ fn collect_run_fragments(
     }
 }
 
-fn paragraph_style(resolved: &ResolvedTextStyle, auto_fit: ShapeAutoFit) -> ParagraphStyle {
+/// `pub(crate)` for the XLSX shape painter, which lays a DrawingML body out
+/// with the same `layout_shape_body` and so needs the same `a:pPr` → style
+/// mapping. Everything it reads is on `ResolvedTextStyle`, which is not
+/// PPTX-specific — only the *cascade* that fills it is.
+pub(crate) fn paragraph_style(
+    resolved: &ResolvedTextStyle,
+    auto_fit: ShapeAutoFit,
+) -> ParagraphStyle {
     let size = resolved
         .run_defaults
         .font_size

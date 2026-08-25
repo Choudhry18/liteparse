@@ -90,6 +90,10 @@ const GRIDLINE_COLOR: RgbColor = RgbColor {
     b: 0xE5,
 };
 const GRIDLINE_W: f64 = 0.75;
+/// §21.1.2.3 default run colour, and — until a shape's `a:solidFill` can be
+/// resolved against a font/colour scheme the workbook does not carry — the
+/// only colour shape text paints in.
+const SHAPE_TEXT_COLOR: RgbColor = RgbColor { r: 0, g: 0, b: 0 };
 
 /// Everything the native XLSX pipeline hands `parser.rs`.
 pub struct NativeXlsx {
@@ -115,6 +119,17 @@ pub struct NativeXlsx {
     /// input to page complexity, computed whether or not images were asked
     /// for (a rectangle costs no byte copies).
     pub pic_rects: Vec<Vec<Rect>>,
+    /// Every placed floating text shape, in the flat
+    /// [`super::xlsx::ordered_shapes`] walk across sheets, paired with the
+    /// 0-based index into `pages` its anchor landed on. One entry per shape
+    /// with no filter of any kind, so a consumer that re-walks the workbook
+    /// the same way pairs by construction rather than by matching rectangles
+    /// — the same contract the picture ordinal carries.
+    ///
+    /// The rectangle is the shape's box, which is *not* where its text is:
+    /// the items inside it are stacked evenly rather than laid out. That gap
+    /// is what this field exists to let a census measure.
+    pub shape_rects: Vec<(usize, Rect)>,
     /// The paint of each page, aligned with `pages`: gridlines, cell fills
     /// and cell borders as [`DrawCommand::Rect`]s, then the cell text as
     /// [`DrawCommand::Text`]s, then each picture on the page as a
@@ -227,6 +242,7 @@ pub fn workbook_to_pages(
         outline: Vec::new(),
         images: Vec::new(),
         pic_rects: Vec::new(),
+        shape_rects: Vec::new(),
         layouts: Vec::new(),
         text_stats: TextPaintStats::default(),
     };
@@ -312,6 +328,11 @@ pub fn workbook_to_pages(
         let first_row = super::xlsx::first_written_row(sheet);
         let mut shape_items_per_page: Vec<Vec<TextItem>> = vec![Vec::new(); ranges.len()];
         let mut above_blocks: Vec<Block> = Vec::new();
+        // Page-local here, rebased onto the workbook's page numbering below —
+        // `page_local` counts within this sheet, and `pages` runs across all
+        // of them.
+        let mut shape_rects: Vec<(usize, Rect)> = Vec::new();
+        let mut shape_cmds_per_page: Vec<Vec<DrawCommand>> = vec![Vec::new(); ranges.len()];
         for shape in super::xlsx::ordered_shapes(sheet) {
             let (page_local, rect) = geo.place_pic(
                 cols,
@@ -321,7 +342,13 @@ pub fn workbook_to_pages(
                 &canvas,
                 &shape.anchor,
             );
+            shape_rects.push((page_local, rect.clone()));
             shape_text_items(shape, &rect, &mut shape_items_per_page[page_local]);
+            // Painted from a real sub-layout, not from the items above — see
+            // `shape_commands` for why the two are allowed to disagree.
+            if let (true, Some(m)) = (opts.paint, measurer.as_ref()) {
+                shape_cmds_per_page[page_local].extend(shape_commands(shape, &rect, m));
+            }
             let blocks = super::xlsx::shape_paragraphs(shape);
             if super::xlsx::shape_is_above(shape, first_row) {
                 above_blocks.extend(blocks);
@@ -416,6 +443,10 @@ pub fn workbook_to_pages(
         // the painter asks for it on every row of every page.
         let col_styles: Vec<Option<u32>> = cols.iter().map(|&c| sheet.col_style(c)).collect();
 
+        let page_base = out.pages.len();
+        out.shape_rects
+            .extend(shape_rects.into_iter().map(|(p, r)| (page_base + p, r)));
+
         for (i, blocks) in blocks_per_page.into_iter().enumerate() {
             let mut page = match &plan {
                 Some(p) => geo.build_page(wb, p, ranges[i].clone(), out.pages.len() + 1),
@@ -440,8 +471,16 @@ pub fn workbook_to_pages(
                     out.text_stats.add(stats);
                 }
                 // Outside the `plan` arm on purpose: a sheet whose only
-                // content is a picture has no grid to paint and still has
-                // something to draw.
+                // content is a picture — or a text shape — has no grid to
+                // paint and still has something to draw.
+                //
+                // Shape text lands in the painter's `Ink` pass, so it draws
+                // over the grid and over cell values, and *under* a floating
+                // picture. That last relation is the same approximation the
+                // float-z census accepted for cell text and did not measure
+                // for shapes: undoing it needs a float flag on
+                // `DrawCommand::Text`, which is its own step.
+                layout.commands.append(&mut shape_cmds_per_page[i]);
                 layout.commands.append(&mut pic_cmds_per_page[i]);
             }
             out.layouts.push(layout);
@@ -495,6 +534,182 @@ fn shape_text_items(shape: &SheetShape, rect: &Rect, out: &mut Vec<TextItem>) {
             font_weight: props.and_then(|p| p.bold).unwrap_or(false).then_some(700),
             ..Default::default()
         });
+    }
+}
+
+/// One floating text shape's body as page-absolute [`DrawCommand`]s.
+///
+/// This is the *paint* half of a shape, and it is a real §20.1.10.60
+/// sub-layout — the same [`layout_shape_body`] the PPTX shape and DOCX
+/// textbox paths use, so insets, measured wrapping, `a:pPr/@algn`, the
+/// anchor and `@vertOverflow` all apply. The `TextItem`s beside it stay the
+/// even stack `shape_text_items` builds, and the two deliberately disagree
+/// about where a *line* falls inside the box.
+///
+/// That split is the same one the cell path already makes — an item is the
+/// cell box, the painted glyphs are measured inside it — and it is what keeps
+/// this module's host-independence claim intact: items come from declared
+/// geometry and need no registry, paint measures and does. Feeding items from
+/// the layout instead would make a plain parse depend on the host's fonts for
+/// 154 corpus workbooks, which is a far larger price than the disagreement.
+///
+/// The layout census (1,637 shapes) is what bought the sub-layout rather than
+/// painting the stack: 61.5% anchor non-top, 34.8% of paragraphs wrap (2.29x
+/// the line count the stack draws), 51.1% declare an alignment the stack
+/// cannot express, and the first line moves by more than 24pt on 19.2% of
+/// shapes.
+///
+/// Two simplifications, both measured rather than assumed:
+///
+/// * **Run colour is black.** `a:solidFill` on a run needs a `Theme` to
+///   resolve `schemeClr`, and a workbook carries only a
+///   [`ThemeColorScheme`](liteparse_ooxml::model::ThemeColorScheme). Nothing
+///   paints a shape's *fill* yet either, so this is black on the page's white
+///   rather than black on black.
+/// * **No theme face.** Same reason: there is no font scheme to read `+mn-lt`
+///   from, so a run naming no family gets Excel's `Calibri`. 96.9% of corpus
+///   shape runs state a size and most state a face.
+fn shape_commands(shape: &SheetShape, rect: &Rect, m: &TextMeasurer) -> Vec<DrawCommand> {
+    use liteparse_ooxml::model::BodyProperties;
+    use liteparse_ooxml::model::dimension::Dimension;
+    use liteparse_ooxml::pptx::textcascade::TextCascade;
+    use liteparse_ooxml::render::layout::ShapeAutoFit;
+    use liteparse_ooxml::render::layout::section::LayoutBlock;
+    use liteparse_ooxml::render::layout::shape_body::{BodyInsets, layout_shape_body};
+
+    let body_pr = shape.body.body_pr.as_ref();
+    let auto_fit = ShapeAutoFit::from_body(body_pr.and_then(|b| b.auto_fit));
+    // Rung 3 only. A sheet shape has no layout, master or deck above it, so
+    // the cascade's other rungs are genuinely absent rather than unwired —
+    // and rung 2 (the paragraph's own `a:pPr`) plus the spec default is what
+    // `resolve` seeds itself with.
+    let cascade = TextCascade {
+        shape: Some(&shape.body.list_style),
+        layout: None,
+        master: None,
+        deck: None,
+    };
+
+    let mut blocks: Vec<LayoutBlock> = Vec::with_capacity(shape.body.paragraphs.len());
+    let mut line_height = Pt::new(DEFAULT_FONT_SIZE * 1.2);
+    for (i, para) in shape.body.paragraphs.iter().enumerate() {
+        let resolved = cascade.resolve(&para.properties, None);
+        let mut fragments = Vec::new();
+        shape_fragments(&para.content, &resolved, auto_fit, m, &mut fragments);
+        if i == 0 {
+            // The fallback height for content that states none — an empty
+            // paragraph between two filled ones still occupies a line.
+            let size = auto_fit.scale_font(
+                resolved
+                    .run_defaults
+                    .font_size
+                    .map(Pt::from)
+                    .unwrap_or(Pt::new(DEFAULT_FONT_SIZE)),
+            );
+            line_height = m.default_line_height(DEFAULT_FONT_FAMILY, size);
+        }
+        blocks.push(LayoutBlock::Paragraph {
+            fragments,
+            style: super::pptx_layout::paragraph_style(&resolved, auto_fit),
+            page_break_before: false,
+            footnotes: Vec::new(),
+            floating_images: Vec::new(),
+            floating_shapes: Vec::new(),
+        });
+    }
+
+    // The insets cliff. `layout_shape_body` returns *nothing* when the left
+    // and right insets leave no width to wrap in, and the §20.1.2.1.1
+    // defaults are 7.2pt a side — so every shape narrower than 14.4pt paints
+    // empty. That is **6.5% of corpus shapes (106)**, and they are not
+    // decorative: they are the narrow vertical marker labels a timeline is
+    // made of. Excel draws them, overflowing the box rather than vanishing,
+    // so the horizontal insets are dropped for exactly those shapes. The
+    // clamp lives here rather than in the shared sub-layout because it is a
+    // statement about this producer's boxes, not about §20.1.10.60.
+    let extent = PtSize::new(Pt::new(rect.width), Pt::new(rect.height));
+    let squeezed = BodyInsets::resolve(body_pr).content_width(extent) <= Pt::ZERO;
+    let unsqueezed;
+    let body_pr = if squeezed {
+        let mut bp = body_pr.cloned().unwrap_or(BodyProperties {
+            rotation: None,
+            vert: None,
+            wrap: None,
+            left_inset: None,
+            top_inset: None,
+            right_inset: None,
+            bottom_inset: None,
+            anchor: None,
+            vert_overflow: None,
+            auto_fit: None,
+        });
+        bp.left_inset = Some(Dimension::new(0));
+        bp.right_inset = Some(Dimension::new(0));
+        unsqueezed = bp;
+        Some(&unsqueezed)
+    } else {
+        body_pr
+    };
+    let mut commands = layout_shape_body(&blocks, extent, body_pr, line_height);
+    // Shape-local → page-absolute. `place_pic` already returns the rect in
+    // the page's own point space, the same space the picture commands use.
+    for cmd in &mut commands {
+        cmd.shift(Pt::new(rect.x), Pt::new(rect.y));
+    }
+    commands
+}
+
+/// A shape paragraph's runs as measured [`Fragment`]s.
+///
+/// The XLSX-local twin of the PPTX `collect_run_fragments`: same shared
+/// word-splitter and measurer, minus the theme-font resolution and the colour
+/// cascade a slide has and a sheet does not.
+fn shape_fragments(
+    inlines: &[liteparse_ooxml::model::Inline],
+    resolved: &liteparse_ooxml::pptx::textcascade::ResolvedTextStyle,
+    auto_fit: liteparse_ooxml::render::layout::ShapeAutoFit,
+    m: &TextMeasurer,
+    out: &mut Vec<liteparse_ooxml::render::layout::fragment::Fragment>,
+) {
+    use liteparse_ooxml::model::{Inline, RunElement};
+    use liteparse_ooxml::render::layout::fragment::{
+        Fragment, emit_run_fragments, font_props_from_run,
+    };
+
+    for inline in inlines {
+        match inline {
+            Inline::TextRun(run) => {
+                let mut props = run.properties.clone();
+                resolved.apply_to_run(&mut props);
+                let font = font_props_from_run(
+                    &props,
+                    DEFAULT_FONT_FAMILY,
+                    Pt::new(DEFAULT_FONT_SIZE),
+                    auto_fit,
+                );
+                for element in &run.content {
+                    match element {
+                        RunElement::Text(text) => {
+                            emit_run_fragments(text, &font, SHAPE_TEXT_COLOR, None, m, out)
+                        }
+                        RunElement::Tab => out.push(Fragment::Tab {
+                            line_height: font.size,
+                            font: Rc::new(font.clone()),
+                            color: SHAPE_TEXT_COLOR,
+                            fitting_width: None,
+                        }),
+                        RunElement::LineBreak(_) => out.push(Fragment::LineBreak {
+                            line_height: font.size,
+                        }),
+                        _ => {}
+                    }
+                }
+            }
+            Inline::Hyperlink(link) => {
+                shape_fragments(&link.content, resolved, auto_fit, m, out);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2294,6 +2509,284 @@ mod tests {
         assert_eq!(with_item, with_block, "item page and block page agree");
         assert_eq!(with_item.len(), 1);
         assert!(with_item[0] > 0, "row 50 is not on page 1");
+        // The `shape_rects` pairing contract: one entry per shape, no
+        // filter, on the same page as the item — and the *global* page
+        // index, which is the part a per-sheet loop gets wrong.
+        assert_eq!(nx.shape_rects.len(), 1);
+        let (page, rect) = &nx.shape_rects[0];
+        assert_eq!(*page, with_item[0], "the shape's page, workbook-global");
+        let item = nx.pages[*page]
+            .text_items
+            .iter()
+            .find(|t| t.text == "deep note")
+            .expect("the item is on that page");
+        assert!(
+            (rect.x - item.x).abs() < 0.01 && (rect.width - item.width).abs() < 0.01,
+            "the reported box is the box the items were stacked in"
+        );
+        // 914400 x 457200 EMU = 72 x 36 pt.
+        assert!((rect.width - 72.0).abs() < 0.5 && (rect.height - 36.0).abs() < 0.5);
+    }
+
+    /// `shape_rects` pairs with `ordered_shapes` positionally, so the two
+    /// sides must apply the *same* filter — and neither applies one: the
+    /// textless shape is already gone by the time either sees it, dropped by
+    /// the reader. Pinning where that happens is the point: moving the filter
+    /// down here would shift every later entry against a consumer's walk.
+    #[test]
+    fn a_textless_shape_is_dropped_before_either_side_sees_it() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="Empty"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr/><a:p/></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let parts = shape_drawing_parts(anchor);
+        let extra: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="str"><v>x</v></c></row></sheetData><drawing r:id="rId7"/></worksheet>"#;
+        let wb = workbook_from(sheet, &extra);
+        let nx = workbook_to_pages(&wb, EmitOptions::default(), None);
+        assert!(
+            wb.sheets[0].shapes.is_empty(),
+            "the reader drops a textless shape"
+        );
+        assert_eq!(
+            nx.shape_rects.len(),
+            super::super::xlsx::ordered_shapes(&wb.sheets[0]).len(),
+            "both sides count the same shapes"
+        );
+    }
+
+    // ── shape text paint ────────────────────────────────────────────────────
+
+    /// A shape with `anchor_xml`, painted with a real registry.
+    fn painted_shape(anchor_xml: &str) -> NativeXlsx {
+        let parts = shape_drawing_parts(anchor_xml);
+        let extra: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="str"><v>grid</v></c></row></sheetData><drawing r:id="rId7"/></worksheet>"#;
+        let wb = workbook_from(sheet, &extra);
+        let registry = FontRegistry::new();
+        workbook_to_pages(
+            &wb,
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+            Some(&registry),
+        )
+    }
+
+    /// Every painted `Text` command's (x, y, text).
+    fn shape_texts(page: &LayoutedPage) -> Vec<(f32, f32, String)> {
+        page.commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { position, text, .. } => {
+                    Some((position.x.raw(), position.y.raw(), text.to_string()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A sentence too wide for its box paints as several measured lines while
+    /// the item stays the single unmeasured stack entry. This is the whole
+    /// shape of step 5b: paint is a layout, items are not, and the census
+    /// says 34.8% of corpus paragraphs are on this path.
+    #[test]
+    fn shape_text_wraps_in_the_paint_and_not_in_the_items() {
+        // 72 x 72 pt box, a sentence far wider than 72pt at 12pt Calibri.
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="914400"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="T"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr/><a:p><a:r><a:rPr sz="1200"/><a:t>one two three four five six seven eight</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        let painted = shape_texts(&nx.layouts[0]);
+        assert!(
+            painted.len() > 2,
+            "the sentence wraps over several lines, got {painted:?}"
+        );
+        let joined: String = painted
+            .iter()
+            .map(|(_, _, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("one") && joined.contains("eight"),
+            "{joined}"
+        );
+        // Lines descend, and each starts inside the box's left inset.
+        for w in painted.windows(2) {
+            assert!(w[1].1 >= w[0].1, "lines descend: {painted:?}");
+        }
+        let shape_items: Vec<&TextItem> = nx.pages[0]
+            .text_items
+            .iter()
+            .filter(|t| t.text.starts_with("one two"))
+            .collect();
+        assert_eq!(shape_items.len(), 1, "the item side is still one paragraph");
+    }
+
+    /// `anchor="ctr"` moves the painted body down the box — 61.5% of corpus
+    /// shapes, and the reason the even stack could not be painted as-is.
+    #[test]
+    fn a_centred_anchor_moves_the_painted_body_and_not_the_item() {
+        let shape = |anchor: &str| {
+            format!(
+                r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="1828800"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="T"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr{anchor}/><a:p><a:r><a:rPr sz="1000"/><a:t>hi</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#
+            )
+        };
+        let top = painted_shape(&shape(r#" anchor="t""#));
+        let ctr = painted_shape(&shape(r#" anchor="ctr""#));
+        // The sheet's own A1 value paints too, so pick the shape's line by
+        // its text rather than by position in the list.
+        let y_of = |nx: &NativeXlsx| {
+            shape_texts(&nx.layouts[0])
+                .into_iter()
+                .find(|(_, _, t)| t == "hi")
+                .expect("the shape's line")
+                .1
+        };
+        let (top_y, ctr_y) = (y_of(&top), y_of(&ctr));
+        // The box is 144pt tall and holds one short line, so centring it has
+        // most of that to give away.
+        assert!(
+            ctr_y - top_y > 50.0,
+            "centred body sits far below the top one: {top_y} -> {ctr_y}"
+        );
+        let item_y = |nx: &NativeXlsx| {
+            nx.pages[0]
+                .text_items
+                .iter()
+                .find(|t| t.text == "hi")
+                .expect("the item")
+                .y
+        };
+        assert!(
+            (item_y(&top) - item_y(&ctr)).abs() < 0.01,
+            "the item is unmoved by the anchor — items are not a layout"
+        );
+    }
+
+    /// The host-independence claim, restated for shapes: the items are
+    /// byte-identical with and without a registry, and without one nothing
+    /// is painted at all.
+    #[test]
+    fn shape_text_paints_only_with_a_registry_and_never_into_the_items() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="914400"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="T"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr/><a:p><a:r><a:rPr sz="1200"/><a:t>label</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let parts = shape_drawing_parts(anchor);
+        let extra: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="str"><v>grid</v></c></row></sheetData><drawing r:id="rId7"/></worksheet>"#;
+        let wb = workbook_from(sheet, &extra);
+        let with = painted_shape(anchor);
+        let without = workbook_to_pages(
+            &wb,
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let parsed = workbook_to_pages(&wb, EmitOptions::default(), None);
+
+        assert!(
+            shape_texts(&with.layouts[0])
+                .iter()
+                .any(|(_, _, t)| t == "label"),
+            "painted with a registry"
+        );
+        assert!(
+            shape_texts(&without.layouts[0]).is_empty(),
+            "and not without one"
+        );
+        let items = |nx: &NativeXlsx| {
+            nx.pages[0]
+                .text_items
+                .iter()
+                .map(|t| (t.text.clone(), t.x, t.y, t.width, t.height))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(items(&with), items(&parsed), "items never see the measurer");
+        assert_eq!(items(&without), items(&parsed));
+    }
+
+    /// A box narrower than the two default 7.2pt insets still paints. Without
+    /// the clamp `layout_shape_body` returns nothing at all, which is 6.5% of
+    /// corpus shapes — the narrow marker labels a timeline is made of.
+    #[test]
+    fn a_box_narrower_than_its_insets_still_paints() {
+        // 114300 EMU = 9pt wide, against 14.4pt of default horizontal inset.
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="114300" cy="914400"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="T"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr/><a:p><a:r><a:rPr sz="800"/><a:t>END</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        let painted = shape_texts(&nx.layouts[0]);
+        let joined: String = painted
+            .iter()
+            .filter(|(_, _, t)| t != "grid")
+            .map(|(_, _, t)| t.as_str())
+            .collect();
+        // It breaks per character in a 9pt box, which is what a square wrap
+        // does — but every character is drawn, and none of it is dropped.
+        assert_eq!(joined, "END", "got {painted:?}");
+    }
+
+    /// A shape on a sheet with no written cells still paints: the append sits
+    /// outside the `SheetPlan` arm, like the picture one.
+    #[test]
+    fn a_plan_less_sheet_still_paints_its_shape_text() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="T"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr/><a:p><a:r><a:rPr sz="1200"/><a:t>alone</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let parts = shape_drawing_parts(anchor);
+        let extra: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData/><drawing r:id="rId7"/></worksheet>"#;
+        let wb = workbook_from(sheet, &extra);
+        let registry = FontRegistry::new();
+        let nx = workbook_to_pages(
+            &wb,
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+            Some(&registry),
+        );
+        assert!(
+            shape_texts(&nx.layouts[0])
+                .iter()
+                .any(|(_, _, t)| t == "alone"),
+            "an image-less, grid-less sheet still draws its shape"
+        );
     }
     // ── cell text ───────────────────────────────────────────────────────────
 

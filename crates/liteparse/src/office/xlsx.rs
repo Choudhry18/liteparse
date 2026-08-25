@@ -202,7 +202,11 @@ pub(crate) fn figure_blocks(sheet: &Sheet, sheet_index: usize) -> Vec<Block> {
 /// [`ordered_pics`], and for the same reason: the geometry pass walks the
 /// same list, so a shape's blocks and its placed items cannot disagree on
 /// order.
-pub(crate) fn ordered_shapes(sheet: &Sheet) -> Vec<&SheetShape> {
+///
+/// Public because it is the pairing rule for
+/// [`super::xlsx_layout::NativeXlsx::shape_rects`]: a consumer that wants a
+/// placed shape's *body* walks this and zips.
+pub fn ordered_shapes(sheet: &Sheet) -> Vec<&SheetShape> {
     let mut shapes: Vec<&SheetShape> = sheet.shapes.iter().collect();
     shapes.sort_by_key(|s| match s.anchor.from_cell() {
         Some(c) => (c.row as i64, c.col as i64, c.row_off_emu, c.col_off_emu),
