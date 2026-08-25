@@ -62,9 +62,58 @@ pub struct RasterPage {
     /// viewport space.
     pub page_width_pt: f32,
     pub page_height_pt: f32,
+    /// Device pixels per Pt actually used. Equal to the requested `scale`
+    /// unless [`MAX_PAGE_PIXELS`] forced it down; see [`effective_scale`].
+    pub scale: f32,
 }
 
-/// Rasterize one page at `scale` device pixels per Pt (`dpi / 72`).
+/// Ceiling on a single page raster, in device pixels — 32 MP, i.e. 128 MB of
+/// RGBA before PNG encoding.
+///
+/// A DOCX or PPTX page is bounded by its own page setup and never comes near
+/// this. A *spreadsheet* page is not: the XLSX geometry pass deliberately
+/// never splits width (an unclipped row is the native path's whole advantage
+/// over LibreOffice's column-clipping), so page width is whatever the sheet
+/// writes. The paint census measured that tail across 103,014 pages — 99.4%
+/// land under 32 MP, 594 are above it, and the worst single page is 861,149 pt
+/// wide: 2,960 MP, ≈12 GB of RGBA. Without a clamp those pages do not render
+/// slowly, they fail to allocate.
+///
+/// The bound is deliberately at the census's own 32 MP bucket boundary so the
+/// clamp is inert for 99.4% of pages rather than a routine downscale.
+pub const MAX_PAGE_PIXELS: u64 = 32_000_000;
+
+/// The scale [`rasterize_page`] will actually use for a `page_w_pt` ×
+/// `page_h_pt` page asked for at `scale` device pixels per Pt.
+///
+/// The clamp is a *uniform* scale reduction — an effective DPI — and not a
+/// width split, because `rasterize_native_pages` maps page *n* to screenshot
+/// *n*, and that 1:1 correspondence is the reason a native screenshot shares
+/// the `TextItem` coordinate space at all. It dies the moment one page becomes
+/// three strips; a single scalar survives, because consumers recover it from
+/// `width / page_width_pt`.
+///
+/// Returns `scale` unchanged when the page already fits, so a clamped page is
+/// the only page whose result differs.
+pub fn effective_scale(page_w_pt: f32, page_h_pt: f32, scale: f32) -> f32 {
+    let (w, h) = (page_w_pt.max(1.0), page_h_pt.max(1.0));
+    // f64 throughout: a 861,149 × 1,965 pt page at 150 DPI is 7.3e9 px, which
+    // is exact in f64 and already lossy in f32.
+    let area = f64::from(w) * f64::from(h) * f64::from(scale) * f64::from(scale);
+    if !area.is_finite() || area <= MAX_PAGE_PIXELS as f64 {
+        return scale;
+    }
+    let clamped = (MAX_PAGE_PIXELS as f64 / (f64::from(w) * f64::from(h))).sqrt() as f32;
+    // `.max(f32::MIN_POSITIVE)`, not `.max(some_readable_floor)`: a floor
+    // would put the page back over the ceiling, which is the one thing this
+    // function exists to prevent. A page that only fits at an illegible scale
+    // renders illegibly; it does not fail to allocate.
+    clamped.max(f32::MIN_POSITIVE)
+}
+
+/// Rasterize one page at `scale` device pixels per Pt (`dpi / 72`), or at the
+/// largest scale that fits [`MAX_PAGE_PIXELS`] if the page is too big for the
+/// one asked for — [`RasterPage::scale`] reports which.
 ///
 /// `registry` must be the registry the layout ran with — resolution rules are
 /// per-registry state, and a different registry could pick different faces
@@ -76,8 +125,31 @@ pub fn rasterize_page(
 ) -> Result<RasterPage, String> {
     let page_w = page.page_size.width.raw();
     let page_h = page.page_size.height.raw();
-    let px_w = (page_w * scale).round().max(1.0) as u32;
-    let px_h = (page_h * scale).round().max(1.0) as u32;
+    // Clamp before allocating, not after failing: `Pixmap::new` on a 12 GB
+    // request does not return `None` politely on every platform.
+    let requested_scale = scale;
+    let scale = effective_scale(page_w, page_h, scale);
+    if scale < requested_scale {
+        log::warn!(
+            "page is {page_w:.0}x{page_h:.0}pt; clamping raster to \
+             {MAX_PAGE_PIXELS} px (effective {:.0} DPI, requested {:.0})",
+            scale * 72.0,
+            requested_scale * 72.0,
+        );
+    }
+    // A clamped page *floors* its dimensions where an unclamped one rounds:
+    // rounding up on both axes can carry the product back over the ceiling
+    // (200,000 × 500 pt lands at 32.02 MP), and the sub-pixel it gives up is
+    // invisible on a page that is thousands of pixels wide by definition.
+    let to_px = |v: f32| {
+        if scale < requested_scale {
+            v.floor()
+        } else {
+            v.round()
+        }
+    };
+    let px_w = to_px(page_w * scale).max(1.0) as u32;
+    let px_h = to_px(page_h * scale).max(1.0) as u32;
     let mut pixmap =
         Pixmap::new(px_w, px_h).ok_or_else(|| format!("cannot allocate {px_w}x{px_h} pixmap"))?;
     pixmap.fill(Color::WHITE);
@@ -243,6 +315,7 @@ pub fn rasterize_page(
         height: px_h,
         page_width_pt: page_w,
         page_height_pt: page_h,
+        scale,
     })
 }
 
@@ -945,5 +1018,51 @@ mod tests {
         assert!(inked(&r, 55, 55), "shading pass placed by the bracket");
         assert!(inked(&r, 55, 65), "shape pass placed by the bracket too");
         assert!(!inked(&r, 5, 15), "neither drew at the page origin");
+    }
+
+    /// The clamp must be inert for every page that already fits, or it is a
+    /// silent quality regression on 99.4% of the corpus rather than a
+    /// backstop for the 0.6%. Letter at 150 DPI is 1.6 MP.
+    #[test]
+    fn a_page_that_fits_keeps_the_scale_it_asked_for() {
+        let requested = 150.0 / 72.0;
+        assert_eq!(effective_scale(612.0, 792.0, requested), requested);
+        // Exactly at the ceiling is still "fits" — the comparison is `<=`.
+        let edge = (MAX_PAGE_PIXELS as f64 / (612.0 * 792.0)).sqrt() as f32;
+        assert_eq!(effective_scale(612.0, 792.0, edge), edge);
+    }
+
+    /// The census's worst page: `A1:XFD131` written out, 861,149 pt wide.
+    /// At 150 DPI that is 7.3e9 px / ≈12 GB of RGBA, so the unclamped
+    /// allocation is the failure mode, not the render time.
+    #[test]
+    fn the_widest_sheet_in_the_corpus_is_clamped_under_the_ceiling() {
+        let (w, h) = (861_149.0_f32, 1_965.0_f32);
+        let scale = effective_scale(w, h, 150.0 / 72.0);
+        assert!(scale < 150.0 / 72.0, "a 2,960 MP page must be clamped");
+        let px = (w * scale).round() as u64 * (h * scale).round() as u64;
+        assert!(
+            px <= MAX_PAGE_PIXELS,
+            "clamped raster is {px} px, over the {MAX_PAGE_PIXELS} ceiling"
+        );
+    }
+
+    /// The clamp is one scalar, not an axis-wise fit: page *n* maps to
+    /// screenshot *n*, so a consumer recovers the scale from either axis and
+    /// both must agree. An aspect change would silently skew every
+    /// highlight-on-screenshot rect.
+    #[test]
+    fn clamping_preserves_the_page_aspect_ratio() {
+        let (w, h) = (200_000.0_f32, 500.0_f32);
+        let page = LayoutedPage {
+            commands: Vec::new(),
+            page_size: PtSize::new(Pt::new(w), Pt::new(h)),
+            block_starts: Vec::new(),
+        };
+        let r = rasterize_page(&page, &FontRegistry::new(), 150.0 / 72.0).expect("raster");
+        assert!(r.scale < 150.0 / 72.0, "this page must have been clamped");
+        assert_eq!(r.width, (w * r.scale).floor() as u32);
+        assert_eq!(r.height, (h * r.scale).floor() as u32);
+        assert!(u64::from(r.width) * u64::from(r.height) <= MAX_PAGE_PIXELS);
     }
 }
