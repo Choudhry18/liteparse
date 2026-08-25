@@ -147,6 +147,13 @@ pub struct Sheet {
     pub frozen_cols: u32,
     /// `<autoFilter ref=…>`, the other explicit header signal.
     pub auto_filter: Option<RangeRef>,
+    /// `<sheetView showGridLines=…>`, from the first view only. `None` means
+    /// the file did not say, which is Excel's default of *visible* — read it
+    /// through [`Sheet::gridlines_visible`] rather than unwrapping to
+    /// `false`. It matters to the raster and nothing else: 12.1% of corpus
+    /// sheets declare neither a fill nor a border anywhere, so gridlines are
+    /// the only ink holding their numbers in a grid.
+    pub show_gridlines: Option<bool>,
     /// `<drawing r:id>`: the sheet's DrawingML part, scoped to the sheet's
     /// own relationships. At most one per §18.3.1.36.
     pub drawing_rel_id: Option<String>,
@@ -176,6 +183,11 @@ impl Sheet {
     /// The merge covering `at`, anchor or not.
     pub fn merge_covering(&self, at: CellRef) -> Option<&RangeRef> {
         self.merges.iter().find(|m| m.contains(at))
+    }
+
+    /// Are the sheet's gridlines drawn? Undeclared means yes (§18.3.1.87).
+    pub fn gridlines_visible(&self) -> bool {
+        self.show_gridlines.unwrap_or(true)
     }
 
     /// The declared width of a column, walking the `<col>` spans.
@@ -230,7 +242,16 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
                         sheet.default_col_width = attr_parse(e, b"defaultColWidth");
                         sheet.default_row_height = attr_parse(e, b"defaultRowHeight");
                     }
-                    b"sheetView" => in_sheet_view = !empty,
+                    b"sheetView" => {
+                        // First view only, for the reason `<pane>` below is
+                        // gated: later `<sheetView>` elements describe other
+                        // windows onto the same sheet, and a
+                        // `<customSheetView>` a saved one.
+                        if sheet.show_gridlines.is_none() {
+                            sheet.show_gridlines = Some(attr_bool(e, b"showGridLines", true));
+                        }
+                        in_sheet_view = !empty;
+                    }
                     b"pane" if in_sheet_view => {
                         // `state="split"` is a draggable divider, not a frozen
                         // header; only frozen panes state that rows above the

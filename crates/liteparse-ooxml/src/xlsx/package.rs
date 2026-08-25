@@ -43,6 +43,10 @@ pub struct WorkbookPackage {
     pub sheets: Vec<SheetEntry>,
     pub shared_strings_xml: Option<Vec<u8>>,
     pub styles_xml: Option<Vec<u8>>,
+    /// `xl/theme/theme1.xml`, present in 99.4% of corpus workbooks. Needed
+    /// only for colour: 29.8% of the colours `styles.xml` defines are
+    /// `theme=` references, which resolve to nothing without it.
+    pub theme_xml: Option<Vec<u8>>,
     /// `<workbookPr date1904="1"/>`: the epoch serial dates count from. Excel
     /// for Mac wrote 1904-based workbooks for years and 123 of the corpus's
     /// 1,089 workbooks come from Mac Excel, so this is not a historical
@@ -111,11 +115,13 @@ pub fn walk(data: &[u8]) -> Result<WorkbookPackage> {
     };
     let shared_strings_xml = part_of_type(&RelationshipType::SharedStrings);
     let styles_xml = part_of_type(&RelationshipType::Styles);
+    let theme_xml = part_of_type(&RelationshipType::Theme);
 
     Ok(WorkbookPackage {
         sheets,
         shared_strings_xml,
         styles_xml,
+        theme_xml,
         date1904: parsed.date1904,
         package,
     })

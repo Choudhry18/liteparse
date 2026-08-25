@@ -56,7 +56,10 @@ pub use drawings::{CellAnchor, PicAnchor, SheetPic, SheetShape};
 pub use package::{SheetEntry, WorkbookPackage, walk};
 pub use refs::{CellRef, RangeRef, column_label, parse_cell, parse_column, parse_range};
 pub use sheet::{Cell, CellValue, ColInfo, Hyperlink, Row, Sheet, SheetStats};
-pub use styles::{Alignment, CellXf, Font, HorizontalAlign, Styles};
+pub use styles::{
+    Alignment, Border, BorderEdge, BorderStyle, CellXf, ColorKind, ColorRef, Fill, Font,
+    HorizontalAlign, INDEXED_PALETTE, PatternType, Styles,
+};
 pub use text::{RichText, RunProps, TextRun, VertAlign, parse_shared_strings};
 
 use crate::docx::error::Result;
@@ -74,6 +77,11 @@ pub struct Workbook {
     /// undo that.
     pub shared_strings: Vec<RichText>,
     pub styles: Styles,
+    /// `xl/theme/theme1.xml`'s colour scheme, the other half of colour
+    /// resolution — see [`Workbook::resolve_color`]. `None` when the workbook
+    /// ships no theme part (0.6% of the corpus), which makes every `theme=`
+    /// reference resolve to the consumer's default rather than to black.
+    pub theme: Option<crate::model::ThemeColorScheme>,
     /// Serial dates count from 1904-01-01 rather than 1899-12-30.
     pub date1904: bool,
     /// Sheets named in `<sheets>` that hold no cell grid — chartsheets and
@@ -215,16 +223,40 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
         });
     }
 
+    // The theme is DrawingML, identical to the part DOCX and PPTX read, so
+    // the vendored parser is reused rather than re-implemented. A broken
+    // theme costs the file its `theme=` colours, never its cells.
+    let theme =
+        pkg.theme_xml.as_deref().and_then(|xml| {
+            match crate::docx::parse::theme::parse_theme(xml) {
+                Ok(t) => Some(t.color_scheme),
+                Err(e) => {
+                    log::warn!("unreadable theme part: {e}");
+                    None
+                }
+            }
+        });
+
     Ok(Workbook {
         sheets,
         shared_strings,
         styles,
+        theme,
         date1904: pkg.date1904,
         non_worksheet_sheets,
     })
 }
 
 impl Workbook {
+    /// Resolve a colour reference against this workbook's palette and theme.
+    ///
+    /// `None` means *automatic* — see [`Styles::resolve_color`]; the caller
+    /// supplies the default, because it is black for text and white for a
+    /// background.
+    pub fn resolve_color(&self, color: styles::ColorRef) -> Option<[u8; 3]> {
+        self.styles.resolve_color(color, self.theme.as_ref())
+    }
+
     /// The text of a cell, resolving a shared-string index against the table.
     ///
     /// Returns `None` for a cell that holds no text — a number, a boolean, an
