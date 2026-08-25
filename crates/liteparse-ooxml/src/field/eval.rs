@@ -163,10 +163,10 @@ pub fn evaluate(instr: &FieldInstruction, ctx: &FieldContext) -> FieldValue {
             switches,
         } => {
             // SEQ evaluation is stateful. We use the snapshot from context.
-            if let Some(reset) = reset_to {
-                if let Ok(n) = reset.parse::<u32>() {
-                    return format_result(n.to_string(), switches);
-                }
+            if let Some(reset) = reset_to
+                && let Ok(n) = reset.parse::<u32>()
+            {
+                return format_result(n.to_string(), switches);
             }
             if *repeat {
                 let n = ctx.sequences.get(identifier.as_str()).copied().unwrap_or(0);
@@ -252,10 +252,10 @@ fn format_result(value: String, switches: &crate::field::ast::CommonSwitches) ->
     let mut text = value;
 
     // Apply numeric format
-    if let Some(ref num_fmt) = switches.numeric_format {
-        if let Ok(n) = text.parse::<f64>() {
-            text = format::format_number(n, num_fmt);
-        }
+    if let Some(ref num_fmt) = switches.numeric_format
+        && let Ok(n) = text.parse::<f64>()
+    {
+        text = format::format_number(n, num_fmt);
     }
 
     // Apply general format
