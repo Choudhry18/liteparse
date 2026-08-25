@@ -11,6 +11,8 @@
 //! whichever reader produced it, which is the whole point of both pipelines
 //! converging on `markdown_layout::Block`.
 
+use liteparse_ooxml::model::{RunProperties, StrikeStyle};
+
 use crate::markdown_layout::{apply_link, escape_inline};
 
 /// Effective character formatting after the style cascade is applied.
@@ -19,6 +21,16 @@ pub(crate) struct Fmt {
     pub(crate) bold: bool,
     pub(crate) italic: bool,
     pub(crate) strike: bool,
+}
+
+/// The [`Fmt`] a DrawingML run's (cascade-resolved or explicit) properties
+/// declare. Shared by the PPTX emitter and the XLSX text-shape path.
+pub(crate) fn fmt_of(p: &RunProperties) -> Fmt {
+    Fmt {
+        bold: p.bold.unwrap_or(false),
+        italic: p.italic.unwrap_or(false),
+        strike: matches!(p.strike, Some(StrikeStyle::Single | StrikeStyle::Double)),
+    }
 }
 
 impl Fmt {

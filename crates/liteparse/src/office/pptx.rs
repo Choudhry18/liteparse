@@ -12,7 +12,7 @@
 //! The design below follows that census throughout; where a rule looks
 //! arbitrary it is usually a corpus measurement, and the comment says which.
 
-use liteparse_ooxml::model::{ColorMap, Inline, RunElement, RunProperties, StrikeStyle};
+use liteparse_ooxml::model::{ColorMap, Inline, RunElement};
 use liteparse_ooxml::pptx::{
     self, AutoNumberScheme, Background, BackgroundSource, Bullet, DeckTextDefaults,
     GraphicFramePayload, ListStyle, MatchRule, Placeholder, PlaceholderGeometry, PlaceholderKind,
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use crate::error::LiteParseError;
 use crate::markdown_layout::{Block, Cell};
 use crate::office::figures::FigureSink;
-use crate::office::inline::{Chunk, Fmt, render_chunks};
+use crate::office::inline::{Chunk, fmt_of, render_chunks};
 use crate::types::{ExtractedImage, Rect};
 
 /// Two shapes whose tops differ by less than this sit on the same visual row
@@ -1455,14 +1455,6 @@ fn hyperlink_url(h: &liteparse_ooxml::model::Hyperlink, ctx: &SlideCtx<'_>) -> O
             .filter(|t| !t.is_empty()),
         // An internal jump targets a slide, which markdown has no anchor for.
         T::Internal { .. } => None,
-    }
-}
-
-fn fmt_of(p: &RunProperties) -> Fmt {
-    Fmt {
-        bold: p.bold.unwrap_or(false),
-        italic: p.italic.unwrap_or(false),
-        strike: matches!(p.strike, Some(StrikeStyle::Single | StrikeStyle::Double)),
     }
 }
 

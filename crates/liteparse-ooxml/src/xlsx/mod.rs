@@ -52,7 +52,7 @@ pub mod styles;
 pub mod text;
 mod xml;
 
-pub use drawings::{CellAnchor, PicAnchor, SheetPic};
+pub use drawings::{CellAnchor, PicAnchor, SheetPic, SheetShape};
 pub use package::{SheetEntry, WorkbookPackage, walk};
 pub use refs::{CellRef, RangeRef, column_label, parse_cell, parse_column, parse_range};
 pub use sheet::{Cell, CellValue, ColInfo, Hyperlink, Row, Sheet, SheetStats};
@@ -150,25 +150,29 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
                     let drawing_path = resolve_target(part_directory(&entry.path), &rel.target);
                     if let Some(dxml) = pkg.package.get_part(&drawing_path) {
                         match drawings::parse_drawing(dxml) {
-                            Ok(raws) if !raws.is_empty() => {
-                                let drels = package::load_rels(&pkg.package, &drawing_path);
-                                let ddir = part_directory(&drawing_path).to_string();
-                                for raw in raws {
-                                    let Some(r) = drels
-                                        .find_by_id(&raw.rel_id)
-                                        .filter(|r| r.target_mode != TargetMode::External)
-                                    else {
-                                        continue;
-                                    };
-                                    pending_pics.push((
-                                        sheets.len(),
-                                        raw.anchor,
-                                        raw.name,
-                                        resolve_target(&ddir, &r.target),
-                                    ));
+                            Ok(content) => {
+                                if !content.pics.is_empty() {
+                                    let drels = package::load_rels(&pkg.package, &drawing_path);
+                                    let ddir = part_directory(&drawing_path).to_string();
+                                    for raw in content.pics {
+                                        let Some(r) = drels
+                                            .find_by_id(&raw.rel_id)
+                                            .filter(|r| r.target_mode != TargetMode::External)
+                                        else {
+                                            continue;
+                                        };
+                                        pending_pics.push((
+                                            sheets.len(),
+                                            raw.anchor,
+                                            raw.name,
+                                            resolve_target(&ddir, &r.target),
+                                        ));
+                                    }
                                 }
+                                // Text shapes are complete as parsed — no
+                                // media, no rels — so they attach directly.
+                                s.shapes = content.shapes;
                             }
-                            Ok(_) => {}
                             Err(e) => {
                                 log::warn!("drawing part {drawing_path} failed to parse: {e}")
                             }

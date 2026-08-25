@@ -154,6 +154,10 @@ pub struct Sheet {
     /// the drawing part — empty until then, and empty for the 69% of corpus
     /// workbooks whose sheets draw nothing.
     pub pics: Vec<crate::xlsx::drawings::SheetPic>,
+    /// Visible text-bearing shapes floating over the grid, from the same
+    /// drawing part as `pics`. Titles, form labels, instructions — content
+    /// no cell holds.
+    pub shapes: Vec<crate::xlsx::drawings::SheetShape>,
     pub stats: SheetStats,
 }
 

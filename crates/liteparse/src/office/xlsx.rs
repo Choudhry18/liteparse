@@ -41,10 +41,15 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use liteparse_ooxml::xlsx::{self, Cell as GridCell, CellValue, Row, Sheet, SheetPic, Workbook};
+use liteparse_ooxml::model::{Inline, RunElement};
+use liteparse_ooxml::pptx::TextParagraph;
+use liteparse_ooxml::xlsx::{
+    self, Cell as GridCell, CellValue, Row, Sheet, SheetPic, SheetShape, Workbook,
+};
 
 use crate::error::LiteParseError;
 use crate::markdown_layout::{Block, Cell, apply_link, escape_inline};
+use crate::office::inline::{Chunk, fmt_of, render_chunks};
 
 /// Sheet names become `#` — the workbook's only structural rank, mirroring
 /// slide titles on the PPTX path.
@@ -120,6 +125,10 @@ pub fn emit_workbook(wb: &Workbook, opts: EmitOptions) -> NativeWorkbook {
             },
             si,
         ));
+        let (shapes_above, shapes_below) = shape_blocks(sheet);
+        for b in shapes_above {
+            blocks.push((b, si));
+        }
         if let Some(plan) = SheetPlan::build(wb, sheet, opts) {
             let n = plan.rows.len();
             for page in plan.page_blocks(wb, &[0..n]) {
@@ -127,6 +136,9 @@ pub fn emit_workbook(wb: &Workbook, opts: EmitOptions) -> NativeWorkbook {
                     blocks.push((b, si));
                 }
             }
+        }
+        for b in shapes_below {
+            blocks.push((b, si));
         }
         if opts.figures {
             for b in figure_blocks(sheet, si) {
@@ -177,6 +189,124 @@ pub(crate) fn figure_blocks(sheet: &Sheet, sheet_index: usize) -> Vec<Block> {
             format: ext.to_string(),
         });
     }
+    out
+}
+
+/// A sheet's text shapes in reading order — the same anchor sort as
+/// [`ordered_pics`], and for the same reason: the geometry pass walks the
+/// same list, so a shape's blocks and its placed items cannot disagree on
+/// order.
+pub(crate) fn ordered_shapes(sheet: &Sheet) -> Vec<&SheetShape> {
+    let mut shapes: Vec<&SheetShape> = sheet.shapes.iter().collect();
+    shapes.sort_by_key(|s| match s.anchor.from_cell() {
+        Some(c) => (c.row as i64, c.col as i64, c.row_off_emu, c.col_off_emu),
+        None => match s.anchor {
+            xlsx::PicAnchor::Absolute { pos_emu, .. } => (i64::MAX, pos_emu.1, pos_emu.0, 0),
+            _ => unreachable!("from_cell is None only for Absolute"),
+        },
+    });
+    shapes
+}
+
+/// The paragraph blocks for a sheet's floating text shapes, split at the
+/// grid: `(before the table, after the table)`.
+///
+/// The census (plan doc, floating text-shape entry) measured where shapes
+/// anchor: 33% sit *above* the sheet's first written row, and the eye check
+/// says those are titles and section navigation — emitting them after the
+/// table would bury every title under its own data. Everything else follows
+/// the figures precedent: shapes float *over* the grid, so interleaving with
+/// specific rows would be false precision, and they emit after the table,
+/// before the figure refs.
+///
+/// Census-scoped non-goals: bullets (7 shapes corpus-wide) emit as plain
+/// paragraphs; `a:hlinkClick` (7) keeps its text and drops the link, which
+/// would need the drawing part's rels threaded through the reader.
+pub(crate) fn shape_blocks(sheet: &Sheet) -> (Vec<Block>, Vec<Block>) {
+    let first_row = first_written_row(sheet);
+    let mut above = Vec::new();
+    let mut below = Vec::new();
+    for shape in ordered_shapes(sheet) {
+        let dst = if shape_is_above(shape, first_row) {
+            &mut above
+        } else {
+            &mut below
+        };
+        dst.extend(shape_paragraphs(shape));
+    }
+    (above, below)
+}
+
+/// The index of the sheet's first written row with cells — the boundary the
+/// above/below split keys on.
+pub(crate) fn first_written_row(sheet: &Sheet) -> Option<u32> {
+    sheet
+        .rows
+        .iter()
+        .find(|r| !r.cells.is_empty())
+        .map(|r| r.index)
+}
+
+/// Whether a shape anchors above the grid's first written row. A shape on a
+/// sheet with no written cells is the sheet's only content and lands in the
+/// "after" half, where an empty grid emits nothing before it.
+pub(crate) fn shape_is_above(shape: &SheetShape, first_row: Option<u32>) -> bool {
+    match (shape.anchor.from_cell(), first_row) {
+        (Some(c), Some(first)) => c.row < first,
+        _ => false,
+    }
+}
+
+/// One shape's paragraph blocks, in body order. Shared by the doc emitter
+/// and the geometry pass so a shape's blocks cannot differ between the two.
+pub(crate) fn shape_paragraphs(shape: &SheetShape) -> Vec<Block> {
+    let mut out = Vec::new();
+    for para in &shape.body.paragraphs {
+        let chunks = shape_chunks(para);
+        let (text, bold, italic) = render_chunks(&chunks, true);
+        if text.is_empty() {
+            continue;
+        }
+        out.push(Block::Paragraph { text, bold, italic });
+    }
+    out
+}
+
+/// A shape paragraph's formatting-tagged chunks. Unlike the PPTX path there
+/// is no cascade to resolve — a worksheet drawing has no master or layout —
+/// so a run's explicit properties are the whole truth.
+fn shape_chunks(para: &TextParagraph) -> Vec<Chunk> {
+    fn walk(inlines: &[Inline], out: &mut Vec<Chunk>) {
+        for inline in inlines {
+            match inline {
+                Inline::TextRun(run) => {
+                    let mut text = String::new();
+                    for el in &run.content {
+                        match el {
+                            RunElement::Text(t) => text.push_str(t),
+                            RunElement::Tab => text.push('\t'),
+                            // `a:br` inside one paragraph; `Block`'s
+                            // single-line text cannot hold it (the PPTX
+                            // path's rule, same reason).
+                            RunElement::LineBreak(_) => text.push(' '),
+                            _ => {}
+                        }
+                    }
+                    if !text.is_empty() {
+                        out.push(Chunk {
+                            fmt: fmt_of(&run.properties),
+                            link: None,
+                            text,
+                        });
+                    }
+                }
+                Inline::Hyperlink(h) => walk(&h.content, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&para.content, &mut out);
     out
 }
 
@@ -1056,6 +1186,122 @@ pub(crate) mod tests {
 
     /// Header rows mark only the slice containing the grid's first row —
     /// a continuation page's table has no header.
+    // ── floating text shapes ────────────────────────────────────────────────
+
+    /// Parts hanging one text shape off sheet1 via a drawing part. Shapes
+    /// resolve nothing, so no drawing rels and no media are needed.
+    fn shape_parts(anchor_xml: &str) -> Vec<(String, String)> {
+        let sheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>"#;
+        let drawing = format!(
+            r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{anchor_xml}</xdr:wsDr>"#
+        );
+        vec![
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels".to_string(),
+                sheet_rels.to_string(),
+            ),
+            ("xl/drawings/drawing1.xml".to_string(), drawing),
+        ]
+    }
+
+    fn shape_anchor(from_row: u32, paras: &str) -> String {
+        format!(
+            r#"<xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{from_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="914400" cy="457200"/>
+                 <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="TextBox 1"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>
+                   <xdr:spPr/><xdr:txBody><a:bodyPr/>{paras}</xdr:txBody></xdr:sp>
+               <xdr:clientData/></xdr:oneCellAnchor>"#
+        )
+    }
+
+    fn shape_blocks_of(sheet_xml: &str, anchor_xml: &str) -> Vec<Block> {
+        let parts = shape_parts(anchor_xml);
+        let extra: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let wb = workbook_from(sheet_xml, &extra);
+        emit_workbook(&wb, EmitOptions::default())
+            .blocks
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect()
+    }
+
+    const TWO_ROW_GRID: &str = r#"<worksheet><sheetData>
+        <row r="3"><c r="A3" t="inlineStr"><is><t>a</t></is></c><c r="B3"><v>1</v></c></row>
+        <row r="4"><c r="A4" t="inlineStr"><is><t>b</t></is></c><c r="B4"><v>2</v></c></row>
+    </sheetData><drawing r:id="rId7"/></worksheet>"#;
+
+    /// The census's placement rule: a shape anchored above the first written
+    /// row is a title and must not be buried under its own table.
+    #[test]
+    fn a_shape_above_the_grid_emits_before_the_table() {
+        let blocks = shape_blocks_of(
+            TWO_ROW_GRID,
+            &shape_anchor(0, r#"<a:p><a:r><a:t>Quarterly Summary</a:t></a:r></a:p>"#),
+        );
+        assert!(matches!(&blocks[0], Block::Heading { .. }));
+        assert!(
+            matches!(&blocks[1], Block::Paragraph { text, .. } if text == "Quarterly Summary"),
+            "title shape should precede the table, got {blocks:?}"
+        );
+        assert!(matches!(&blocks[2], Block::MergedTable { .. }));
+    }
+
+    /// Everything else follows the figures precedent: after the table.
+    #[test]
+    fn a_shape_over_the_grid_emits_after_the_table() {
+        let blocks = shape_blocks_of(
+            TWO_ROW_GRID,
+            &shape_anchor(3, r#"<a:p><a:r><a:t>see note</a:t></a:r></a:p>"#),
+        );
+        assert!(matches!(&blocks[1], Block::MergedTable { .. }));
+        assert!(
+            matches!(&blocks[2], Block::Paragraph { text, .. } if text == "see note"),
+            "annotation shape should follow the table, got {blocks:?}"
+        );
+    }
+
+    /// 54 corpus shapes sit on sheets with no written cells — today those
+    /// sheets emit nothing at all; the shape is the sheet's only content.
+    #[test]
+    fn a_shape_on_an_empty_sheet_is_its_only_content() {
+        let blocks = shape_blocks_of(
+            r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData/><drawing r:id="rId7"/></worksheet>"#,
+            &shape_anchor(2, r#"<a:p><a:r><a:t>orphan text</a:t></a:r></a:p>"#),
+        );
+        assert!(matches!(&blocks[0], Block::Heading { .. }));
+        assert!(
+            matches!(&blocks[1], Block::Paragraph { text, .. } if text == "orphan text"),
+            "got {blocks:?}"
+        );
+        assert_eq!(blocks.len(), 2);
+    }
+
+    /// Run emphasis reaches the block the same way the PPTX path's does, and
+    /// each paragraph is its own block.
+    #[test]
+    fn shape_paragraphs_carry_emphasis_and_split_per_paragraph() {
+        let blocks = shape_blocks_of(
+            TWO_ROW_GRID,
+            &shape_anchor(
+                3,
+                r#"<a:p><a:r><a:rPr b="1"/><a:t>NOTES:</a:t></a:r></a:p><a:p><a:r><a:t>fill in blue cells</a:t></a:r></a:p>"#,
+            ),
+        );
+        assert!(
+            matches!(&blocks[2], Block::Paragraph { text, bold: true, .. } if text == "NOTES:"),
+            "got {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[3], Block::Paragraph { text, bold: false, .. } if text == "fill in blue cells")
+        );
+    }
+
     #[test]
     fn header_rows_do_not_repeat_on_continuation_pages() {
         let wb = workbook_from(

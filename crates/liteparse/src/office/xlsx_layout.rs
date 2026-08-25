@@ -33,7 +33,7 @@
 
 use std::ops::Range;
 
-use liteparse_ooxml::xlsx::{CellAnchor, PicAnchor, Sheet, Workbook};
+use liteparse_ooxml::xlsx::{CellAnchor, PicAnchor, Sheet, SheetShape, Workbook};
 
 use super::figures::FigureSink;
 use super::xlsx::{EmitOptions, SHEET_HEADING_LEVEL, SheetPlan};
@@ -215,15 +215,19 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
                 ),
             };
 
-        // Doc-level: the unsplit emission (one full-range slice), then the
-        // sheet's figures — the same order `emit_workbook` writes, so the
-        // two doc emissions stay byte-identical.
+        // Doc-level: title-like shapes above the grid, the unsplit emission
+        // (one full-range slice), the remaining shapes, then the sheet's
+        // figures — the same order `emit_workbook` writes, so the two doc
+        // emissions stay byte-identical.
+        let (shapes_above, shapes_below) = super::xlsx::shape_blocks(sheet);
+        out.all_blocks.extend(shapes_above);
         if let Some(p) = &plan {
             let n = p.rows.len();
             for page in p.page_blocks(wb, &[0..n]) {
                 out.all_blocks.extend(page);
             }
         }
+        out.all_blocks.extend(shapes_below);
         if opts.figures {
             out.all_blocks.extend(super::xlsx::figure_blocks(sheet, si));
         }
@@ -234,14 +238,42 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
         };
         blocks_per_page[0].insert(0, heading);
 
+        // Text shapes: page assignment + rect through the same anchor
+        // placement as pictures, blocks mirroring the doc order per page —
+        // above-grid shapes right after the heading, the rest after the
+        // page's table slice (and before its figure refs, pushed below).
+        // Items follow the pass's own philosophy — unit conversion, not
+        // layout: one item per paragraph, stacked evenly in the shape's box.
+        let grid_w = *geo.x_off.last().unwrap() as f32;
+        let page_width = (grid_w + 2.0 * MARGIN).max(MIN_PAGE_WIDTH);
+        let canvas = CanvasGrid::build(sheet);
+        let first_row = super::xlsx::first_written_row(sheet);
+        let mut shape_items_per_page: Vec<Vec<TextItem>> = vec![Vec::new(); ranges.len()];
+        let mut above_blocks: Vec<Block> = Vec::new();
+        for shape in super::xlsx::ordered_shapes(sheet) {
+            let (page_local, rect) = geo.place_pic(
+                cols,
+                &row_indices,
+                &ranges,
+                page_width,
+                &canvas,
+                &shape.anchor,
+            );
+            shape_text_items(shape, &rect, &mut shape_items_per_page[page_local]);
+            let blocks = super::xlsx::shape_paragraphs(shape);
+            if super::xlsx::shape_is_above(shape, first_row) {
+                above_blocks.extend(blocks);
+            } else {
+                blocks_per_page[page_local].extend(blocks);
+            }
+        }
+        blocks_per_page[0].splice(1..1, above_blocks);
+
         // Pictures: page assignment + rect from the packed grid, figure
         // blocks on the page the anchor lands on, bytes into the sink. The
         // local ordinal mirrors `figure_blocks` (both skip media we do not
         // surface), and the sink's id must agree with it by construction.
-        let grid_w = *geo.x_off.last().unwrap() as f32;
-        let page_width = (grid_w + 2.0 * MARGIN).max(MIN_PAGE_WIDTH);
         let mut rects_per_page: Vec<Vec<Rect>> = vec![Vec::new(); ranges.len()];
-        let canvas = CanvasGrid::build(sheet);
         sink.reset_ordinal();
         let mut n_fig = 0u32;
         for pic in super::xlsx::ordered_pics(sheet) {
@@ -283,10 +315,11 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
         }
 
         for (i, blocks) in blocks_per_page.into_iter().enumerate() {
-            let page = match &plan {
+            let mut page = match &plan {
                 Some(p) => geo.build_page(wb, p, ranges[i].clone(), out.pages.len() + 1),
                 None => empty_page(out.pages.len() + 1),
             };
+            append_items(&mut page, std::mem::take(&mut shape_items_per_page[i]));
             out.pages.push(page);
             out.page_blocks.push(blocks);
             out.pic_rects.push(std::mem::take(&mut rects_per_page[i]));
@@ -294,6 +327,70 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
     }
     out.images = sink.images;
     out
+}
+
+/// One `TextItem` per non-empty shape paragraph, stacked evenly inside the
+/// shape's box — the same fidelity contract as a cell's item (the box is
+/// real, the intra-box line layout is not attempted). Font facts come from
+/// the paragraph's first run: 99.5% of corpus shape runs declare `sz`, and a
+/// theme-referenced face (no explicit name) stays `None` like an unstyled
+/// cell would.
+fn shape_text_items(shape: &SheetShape, rect: &Rect, out: &mut Vec<TextItem>) {
+    let paras: Vec<&liteparse_ooxml::pptx::TextParagraph> = shape
+        .body
+        .paragraphs
+        .iter()
+        .filter(|p| !p.text().trim().is_empty())
+        .collect();
+    if paras.is_empty() {
+        return;
+    }
+    let each_h = rect.height / paras.len() as f32;
+    for (i, para) in paras.iter().enumerate() {
+        fn first_run(
+            inlines: &[liteparse_ooxml::model::Inline],
+        ) -> Option<&liteparse_ooxml::model::TextRun> {
+            inlines.iter().find_map(|inl| match inl {
+                liteparse_ooxml::model::Inline::TextRun(r) => Some(&**r),
+                liteparse_ooxml::model::Inline::Hyperlink(h) => first_run(&h.content),
+                _ => None,
+            })
+        }
+        let props = first_run(&para.content).map(|r| &r.properties);
+        out.push(TextItem {
+            text: para.text().trim().replace('\n', " "),
+            x: rect.x,
+            y: rect.y + i as f32 * each_h,
+            width: rect.width,
+            height: each_h,
+            font_name: props.and_then(|p| p.fonts.ascii.explicit.clone()),
+            font_size: props
+                .and_then(|p| p.font_size)
+                .map(|s| s.raw() as f32 / 2.0),
+            font_weight: props.and_then(|p| p.bold).unwrap_or(false).then_some(700),
+            ..Default::default()
+        });
+    }
+}
+
+/// Extend a built page with extra items, keeping `content_bounds` the union
+/// it was defined as.
+fn append_items(page: &mut Page, items: Vec<TextItem>) {
+    if items.is_empty() {
+        return;
+    }
+    page.text_items.extend(items);
+    page.content_bounds = page
+        .text_items
+        .iter()
+        .map(|t| (t.x, t.y, t.x + t.width, t.y + t.height))
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+        .map(|(x0, y0, x1, y1)| Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        });
 }
 
 fn empty_page(page_number: usize) -> Page {
@@ -995,5 +1092,141 @@ mod tests {
             format!("{:?}", nx.all_blocks),
             "geometry-pass doc blocks diverge from the emitter's"
         );
+    }
+
+    // ── floating text shapes ────────────────────────────────────────────────
+
+    fn shape_drawing_parts(anchor_xml: &str) -> Vec<(String, String)> {
+        let sheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>"#;
+        let drawing = format!(
+            r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{anchor_xml}</xdr:wsDr>"#
+        );
+        vec![
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels".to_string(),
+                sheet_rels.to_string(),
+            ),
+            ("xl/drawings/drawing1.xml".to_string(), drawing),
+        ]
+    }
+
+    /// A two-paragraph shape yields one item per paragraph, stacked in the
+    /// shape's box, carrying the run's declared face and size — and the doc
+    /// blocks stay byte-equal to the emitter's, title-before-table split
+    /// included.
+    #[test]
+    fn shape_items_stack_in_the_box_and_doc_blocks_match_the_emitter() {
+        let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>
+            <row r="4"><c r="A4" t="inlineStr"><is><t>a</t></is></c><c r="B4"><v>1</v></c></row>
+            <row r="5"><c r="A5"><v>2</v></c><c r="B5"><v>3</v></c></row>
+        </sheetData><drawing r:id="rId7"/></worksheet>"#;
+        // Anchored at row 0 — above the first written row (r=4, index 3).
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="TextBox 1"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>
+               <xdr:spPr/><xdr:txBody><a:bodyPr/>
+                 <a:p><a:r><a:rPr sz="1400" b="1"><a:latin typeface="Arial"/></a:rPr><a:t>Title</a:t></a:r></a:p>
+                 <a:p><a:r><a:rPr sz="1100"/><a:t>subtitle</a:t></a:r></a:p>
+               </xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let parts = shape_drawing_parts(anchor);
+        let extra: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let wb = workbook_from(sheet, &extra);
+        let opts = EmitOptions::default();
+
+        let emitted: Vec<Block> = crate::office::xlsx::emit_workbook(&wb, opts)
+            .blocks
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect();
+        let nx = workbook_to_pages(&wb, opts);
+        assert_eq!(
+            format!("{emitted:?}"),
+            format!("{:?}", nx.all_blocks),
+            "geometry-pass doc blocks diverge from the emitter's"
+        );
+
+        // Page blocks mirror the doc split: title right after the heading.
+        assert!(matches!(&nx.page_blocks[0][0], Block::Heading { .. }));
+        assert!(
+            matches!(&nx.page_blocks[0][1], Block::Paragraph { text, .. } if text == "Title"),
+            "got {:?}",
+            nx.page_blocks[0]
+        );
+
+        // Two items, stacked halves of the 914400×457200 EMU box (72×36 pt),
+        // anchored at the grid origin (row 0 collapses to the packed top).
+        let items: Vec<&TextItem> = nx.pages[0]
+            .text_items
+            .iter()
+            .filter(|t| t.text == "Title" || t.text == "subtitle")
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].font_name.as_deref(), Some("Arial"));
+        assert_eq!(items[0].font_size, Some(14.0));
+        assert_eq!(items[0].font_weight, Some(700));
+        assert_eq!(items[1].font_size, Some(11.0));
+        assert!(
+            (items[0].width - 72.0).abs() < 0.5,
+            "box width is the anchor ext"
+        );
+        assert!((items[0].height - 18.0).abs() < 0.5, "half the box each");
+        assert!((items[1].y - items[0].y - 18.0).abs() < 0.5, "stacked");
+    }
+
+    /// A shape anchored on later pages' rows lands its blocks and items on
+    /// that page, like a picture.
+    #[test]
+    fn a_shape_lands_on_its_anchor_row_page() {
+        let mut rows = String::new();
+        for r in 1..=60 {
+            rows.push_str(&format!(
+                r#"<row r="{r}" ht="20"><c r="A{r}"><v>{r}</v></c></row>"#
+            ));
+        }
+        let sheet = format!(
+            r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>{rows}</sheetData><drawing r:id="rId7"/></worksheet>"#
+        );
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>50</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="T"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr/><a:p><a:r><a:t>deep note</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let parts = shape_drawing_parts(anchor);
+        let extra: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let wb = workbook_from(&sheet, &extra);
+        let nx = workbook_to_pages(&wb, EmitOptions::default());
+        assert!(nx.pages.len() > 1, "60 rows at 20pt must paginate");
+        let with_item: Vec<usize> = nx
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.text_items.iter().any(|t| t.text == "deep note"))
+            .map(|(i, _)| i)
+            .collect();
+        let with_block: Vec<usize> = nx
+            .page_blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, blocks)| {
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, Block::Paragraph { text, .. } if text == "deep note"))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(with_item, with_block, "item page and block page agree");
+        assert_eq!(with_item.len(), 1);
+        assert!(with_item[0] > 0, "row 50 is not on page 1");
     }
 }

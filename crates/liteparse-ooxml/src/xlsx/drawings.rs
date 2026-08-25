@@ -1,14 +1,30 @@
-//! SpreadsheetML DrawingML: the pictures floating over a sheet's grid.
+//! SpreadsheetML DrawingML: the pictures and text shapes floating over a
+//! sheet's grid.
 //!
 //! A worksheet references at most one drawing part (`<drawing r:id>`); the
 //! part holds a list of *anchors* (ECMA-376 §20.5), each placing one object —
 //! a picture, a shape, a chart frame, or a group — against the grid. This
-//! module reads **pictures only**: the corpus census (1,248 workbooks) found
-//! 2,276 `xdr:pic` against 386 chart frames and 28,745 shapes, and a chart
-//! has no image bytes to extract while a shape's text is a separate content
-//! gap, recorded in the plan doc rather than half-solved here.
+//! module reads **pictures** and **text-bearing shapes**: the corpus census
+//! (1,248 workbooks) found 2,276 `xdr:pic`, 386 chart frames, and — among
+//! ~29k `xdr:sp` — 1,637 visible shapes carrying real text (137k chars of
+//! titles, form labels, and instructions invisible to the grid). Charts have
+//! no image bytes to extract and stay out of scope.
 //!
-//! Census-driven decisions:
+//! Census-driven decisions (`xlsx_shapetext_census`, see plan doc):
+//!
+//! * **`hidden="1"` shapes are skipped.** 1,004 of the corpus's 2,641
+//!   text-bearing shapes are legacy form controls (`name="Check Box N"`,
+//!   zero-extent, stacked option labels like `YES`/`NO`/`UNKNOWN`) that
+//!   Excel itself never renders.
+//! * **`mc:Fallback` subtrees are skipped** — the PPTX shape walk's
+//!   prefer-Choice rule, third format it applies to. Neither branch is a
+//!   superset (Choice-only reads +119 shapes, −0.8% chars vs Fallback-only),
+//!   and reading *both* — what this parser did before it knew about MCE —
+//!   double-places every picture that appears in each branch.
+//! * **`cxnSp` text is not read**: zero corpus occurrences. Likewise
+//!   `a:hlinkClick`/`a:fld` resolution (7 and 4 shapes corpus-wide).
+//!
+//! Census-driven decisions for pictures:
 //!
 //! * **All three anchor kinds are read.** `oneCellAnchor` is the majority
 //!   (19,228 against 9,157 `twoCellAnchor`), so treating the two-cell form as
@@ -94,14 +110,108 @@ pub(crate) struct RawPic {
     pub(crate) rel_id: String,
 }
 
-/// Parse one `xl/drawings/drawingN.xml` part into its placed pictures.
+/// One visible text-bearing shape placed on a sheet. Unlike a picture there
+/// is nothing to resolve — the text is complete in the drawing part — so
+/// this is the final form, not a `Raw*` intermediate.
+#[derive(Clone, Debug)]
+pub struct SheetShape {
+    pub anchor: PicAnchor,
+    /// `xdr:cNvPr@name`, when the producer wrote one.
+    pub name: Option<String>,
+    /// The shape's `xdr:txBody`, lowered through the shared DrawingML text
+    /// model — the same `CT_TextBody` a PPTX shape carries.
+    pub body: crate::pptx::text::TextBody,
+}
+
+/// Everything one drawing part yields.
+#[derive(Default)]
+pub(crate) struct DrawingContent {
+    pub(crate) pics: Vec<RawPic>,
+    pub(crate) shapes: Vec<SheetShape>,
+}
+
+/// An `xdr:sp` currently open in the walk, before its anchor is known.
+#[derive(Default)]
+struct OpenShape {
+    name: Option<String>,
+    hidden: bool,
+    body: Option<crate::pptx::text::TextBody>,
+    seen_cnvpr: bool,
+}
+
+/// Flat text rescue for OMML equation bodies.
+///
+/// 56 corpus shapes (6 workbooks, engineering calculators) hold their text
+/// in `a14:m` math — `m:oMath` trees whose glyphs sit in `m:t` runs the
+/// structured text model does not know, so the body lowers to empty. This
+/// collects every `t`-element's text in document order into one run per
+/// `a:p` (`m:t` and `a:t` both strip to `t` under `local_name`, which is
+/// exactly the reading the shape-text census counted). Math *structure* —
+/// fractions, sub/superscripts — flattens to its glyph sequence; recorded,
+/// not hidden. Returns `None` when no text is found at all.
+fn flat_math_body(txbody: &[u8]) -> Option<crate::pptx::text::TextBody> {
+    use crate::model::{Inline, RunElement, TextRun};
+    use crate::pptx::text::{TextBody, TextParagraph};
+
+    let mut reader = Reader::from_reader(txbody);
+    let mut buf = Vec::new();
+    let mut paras: Vec<String> = Vec::new();
+    let mut in_t = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Err(_) => return None,
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(ref e)) => match local_name(e.name().as_ref()) {
+                b"p" => paras.push(String::new()),
+                b"t" => in_t = true,
+                _ => {}
+            },
+            Ok(Event::Text(ref t)) if in_t => {
+                if let (Some(last), Ok(txt)) = (paras.last_mut(), t.decode()) {
+                    last.push_str(&txt);
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                if local_name(e.name().as_ref()) == b"t" {
+                    in_t = false;
+                }
+            }
+            Ok(_) => {}
+        }
+        buf.clear();
+    }
+    if paras.iter().all(|p| p.trim().is_empty()) {
+        return None;
+    }
+    Some(TextBody {
+        body_pr: None,
+        list_style: Default::default(),
+        paragraphs: paras
+            .into_iter()
+            .map(|text| TextParagraph {
+                properties: Default::default(),
+                content: vec![Inline::TextRun(Box::new(TextRun {
+                    style_id: None,
+                    properties: Default::default(),
+                    content: vec![RunElement::Text(text)],
+                    rsids: Default::default(),
+                }))],
+                end_run_properties: None,
+            })
+            .collect(),
+    })
+}
+
+/// Parse one `xl/drawings/drawingN.xml` part into its placed pictures and
+/// text shapes.
 ///
 /// Fail-open like the rest of the reader: a malformed drawing part costs its
-/// pictures, never the workbook.
-pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
+/// pictures and shapes, never the workbook.
+pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
     let mut reader = Reader::from_reader(data);
     let mut buf = Vec::new();
-    let mut out = Vec::new();
+    let mut skip_buf = Vec::new();
+    let mut out = DrawingContent::default();
 
     // State for the anchor currently open. `object_depth` counts how far
     // inside a placed object (pic/sp/grpSp/graphicFrame/cxnSp) the cursor is:
@@ -118,12 +228,23 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
     let mut pic_depth: u32 = 0;
     let mut pending: Vec<(Option<String>, Option<String>)> = Vec::new(); // (name, rel_id)
 
+    // The sp currently open, if any. `xdr:sp` cannot nest (only groups
+    // nest), so one slot suffices; like `pending`, its result waits for the
+    // anchor's End event, where the placement is finally known.
+    let mut cur_sp: Option<OpenShape> = None;
+    let mut pending_shapes: Vec<(Option<String>, crate::pptx::text::TextBody)> = Vec::new();
+
     // Corner currently being filled and the element text being accumulated.
     let mut corner: Option<bool> = None; // true = from, false = to
     let mut text_target: Option<&'static str> = None;
     let mut text = String::new();
 
     loop {
+        // Byte offset where the next event's own bytes begin — whitespace
+        // between tags is its own Text event, so after any event this is
+        // exactly the start of the following tag. Used to slice a txBody
+        // element out of the part verbatim.
+        let tag_start = reader.buffer_position() as usize;
         let event = reader
             .read_event_into(&mut buf)
             .map_err(quick_xml::DeError::from)?;
@@ -134,6 +255,16 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
                 let name = local_name(qname.as_ref());
                 let empty = matches!(event, Event::Empty(_));
                 match name {
+                    // MCE: keep the Choice branch, skip the Fallback — the
+                    // PPTX shape walk's rule. Reading both (what this parser
+                    // did before it knew about MCE) double-places any object
+                    // that appears in each branch.
+                    b"Fallback" if !empty => {
+                        let end = e.to_end().into_owned();
+                        reader
+                            .read_to_end_into(end.name(), &mut skip_buf)
+                            .map_err(quick_xml::DeError::from)?;
+                    }
                     b"oneCellAnchor" | b"twoCellAnchor" | b"absoluteAnchor" if !empty => {
                         anchor_kind = Some(match name {
                             b"oneCellAnchor" => "one",
@@ -148,6 +279,8 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
                         object_depth = 0;
                         pic_depth = 0;
                         pending.clear();
+                        pending_shapes.clear();
+                        cur_sp = None;
                     }
                     b"pic" | b"sp" | b"grpSp" | b"graphicFrame" | b"cxnSp"
                         if anchor_kind.is_some() =>
@@ -157,6 +290,9 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
                             if !empty {
                                 pic_depth += 1;
                             }
+                        }
+                        if name == b"sp" && !empty {
+                            cur_sp = Some(OpenShape::default());
                         }
                         if !empty {
                             object_depth += 1;
@@ -189,12 +325,49 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
                         pos = Some((x, y));
                     }
                     // `cNvPr` also names shapes and groups; only a picture's
-                    // own (the first at its depth) is its display name.
+                    // or shape's own (the first at its depth) is its display
+                    // name. Order matters: an sp closes before a sibling pic
+                    // opens, so at most one of the two branches is live.
                     b"cNvPr" if pic_depth > 0 => {
                         if let Some(last) = pending.last_mut()
                             && last.0.is_none()
                         {
                             last.0 = attr(e, b"name").filter(|n| !n.is_empty());
+                        }
+                    }
+                    b"cNvPr" => {
+                        if let Some(sh) = cur_sp.as_mut()
+                            && !sh.seen_cnvpr
+                        {
+                            sh.seen_cnvpr = true;
+                            sh.name = attr(e, b"name").filter(|n| !n.is_empty());
+                            sh.hidden = attr(e, b"hidden").as_deref() == Some("1");
+                        }
+                    }
+                    // The shape's text body, sliced out verbatim and lowered
+                    // through the shared DrawingML text model. quick-xml's
+                    // serde layer matches local names with prefixes stripped,
+                    // so the `xdr:txBody` slice parses without namespace
+                    // re-declaration. A body that fails to parse costs its
+                    // shape's text, nothing else.
+                    b"txBody" if cur_sp.is_some() && pic_depth == 0 && !empty => {
+                        let end = e.to_end().into_owned();
+                        reader
+                            .read_to_end_into(end.name(), &mut skip_buf)
+                            .map_err(quick_xml::DeError::from)?;
+                        let tag_end = reader.buffer_position() as usize;
+                        let slice = &data[tag_start..tag_end];
+                        if let Some(sh) = cur_sp.as_mut()
+                            && let Ok(body) = crate::pptx::text::parse_text_body(slice)
+                        {
+                            // An OMML equation body (`a14:m` → `m:t` runs) is
+                            // invisible to the structured text model and
+                            // lowers to empty; rescue its glyphs flat.
+                            sh.body = if body.plain_text().trim().is_empty() {
+                                flat_math_body(slice).or(Some(body))
+                            } else {
+                                Some(body)
+                            };
                         }
                     }
                     // The blip inside `xdr:blipFill`. A shape's background
@@ -239,12 +412,15 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
                         };
                         for (name, rel_id) in pending.drain(..) {
                             if let Some(rel_id) = rel_id {
-                                out.push(RawPic {
+                                out.pics.push(RawPic {
                                     anchor,
                                     name: name.clone(),
                                     rel_id,
                                 });
                             }
+                        }
+                        for (name, body) in pending_shapes.drain(..) {
+                            out.shapes.push(SheetShape { anchor, name, body });
                         }
                     }
                 }
@@ -252,7 +428,21 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<Vec<RawPic>> {
                     pic_depth -= 1;
                     object_depth = object_depth.saturating_sub(1);
                 }
-                b"sp" | b"grpSp" | b"graphicFrame" | b"cxnSp" => {
+                b"sp" => {
+                    object_depth = object_depth.saturating_sub(1);
+                    if let Some(sh) = cur_sp.take() {
+                        // Hidden shapes are legacy form controls Excel never
+                        // renders; whitespace-only bodies carry no content.
+                        // Both censused, both dropped here.
+                        if !sh.hidden
+                            && let Some(body) = sh.body
+                            && !body.plain_text().trim().is_empty()
+                        {
+                            pending_shapes.push((sh.name, body));
+                        }
+                    }
+                }
+                b"grpSp" | b"graphicFrame" | b"cxnSp" => {
                     object_depth = object_depth.saturating_sub(1);
                 }
                 b"from" | b"to" => corner = None,
@@ -301,7 +491,7 @@ mod tests {
                <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#,
             pic("rId1", "Logo")
         );
-        let pics = parse_drawing(xml.as_bytes()).unwrap();
+        let pics = parse_drawing(xml.as_bytes()).unwrap().pics;
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].rel_id, "rId1");
         assert_eq!(pics[0].name.as_deref(), Some("Logo"));
@@ -337,7 +527,7 @@ mod tests {
                <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#,
             pic("rId2", "P")
         );
-        let pics = parse_drawing(xml.as_bytes()).unwrap();
+        let pics = parse_drawing(xml.as_bytes()).unwrap().pics;
         assert_eq!(
             pics[0].anchor,
             PicAnchor::OneCell {
@@ -363,7 +553,7 @@ mod tests {
             pic("rId3", "A"),
             pic("rId4", "B")
         );
-        let pics = parse_drawing(xml.as_bytes()).unwrap();
+        let pics = parse_drawing(xml.as_bytes()).unwrap().pics;
         assert_eq!(pics.len(), 2);
         assert_eq!(pics[0].rel_id, "rId3");
         assert_eq!(pics[0].name.as_deref(), Some("A"));
@@ -394,7 +584,9 @@ mod tests {
                  <xdr:sp><xdr:spPr><a:blipFill><a:blip r:embed="rId9"/></a:blipFill></xdr:spPr></xdr:sp>
                <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
         );
-        assert!(parse_drawing(xml.as_bytes()).unwrap().is_empty());
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert!(content.pics.is_empty());
+        assert!(content.shapes.is_empty());
     }
 
     #[test]
@@ -406,7 +598,7 @@ mod tests {
                <xdr:clientData/></xdr:absoluteAnchor></xdr:wsDr>"#,
             pic("rId5", "Abs")
         );
-        let pics = parse_drawing(xml.as_bytes()).unwrap();
+        let pics = parse_drawing(xml.as_bytes()).unwrap().pics;
         assert_eq!(
             pics[0].anchor,
             PicAnchor::Absolute {
@@ -427,6 +619,162 @@ mod tests {
                  <xdr:graphicFrame><a:graphic><a:graphicData uri="chart"/></a:graphic></xdr:graphicFrame>
                <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#
         );
-        assert!(parse_drawing(xml.as_bytes()).unwrap().is_empty());
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert!(content.pics.is_empty());
+        assert!(content.shapes.is_empty());
+    }
+
+    fn text_sp(body: &str) -> String {
+        format!(
+            r#"<xdr:sp><xdr:nvSpPr><xdr:cNvPr id="7" name="TextBox 1"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>
+               <xdr:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="999" cy="888"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+               <xdr:txBody><a:bodyPr/><a:lstStyle/>{body}</xdr:txBody></xdr:sp>"#
+        )
+    }
+
+    /// A text shape parses into a lowered body carrying the anchor that was
+    /// only known after the shape closed.
+    #[test]
+    fn a_text_shape_takes_its_anchor_and_lowers_its_body() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor>
+                 <xdr:from><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>6</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+                 {}
+               <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#,
+            text_sp(
+                r#"<a:p><a:r><a:rPr lang="en-US" sz="1100"/><a:t>Section title</a:t></a:r></a:p><a:p><a:r><a:t>second line</a:t></a:r></a:p>"#
+            )
+        );
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert!(content.pics.is_empty());
+        assert_eq!(content.shapes.len(), 1);
+        let sh = &content.shapes[0];
+        assert_eq!(sh.name.as_deref(), Some("TextBox 1"));
+        assert_eq!(
+            sh.body.plain_text(),
+            "Section title
+second line"
+        );
+        assert_eq!(
+            sh.anchor.from_cell(),
+            Some(CellAnchor {
+                col: 2,
+                row: 3,
+                ..Default::default()
+            })
+        );
+    }
+
+    /// `hidden="1"` marks a legacy form control (checkbox option labels and
+    /// friends) that Excel never renders — 1,004 of them in the corpus.
+    #[test]
+    fn a_hidden_shape_is_a_form_control_and_is_skipped() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="1" cy="1"/>
+                 <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="9" name="Check Box 15" hidden="1"/></xdr:nvSpPr>
+                   <xdr:txBody><a:bodyPr/><a:p><a:r><a:t>UNKNOWN</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+               <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        assert!(parse_drawing(xml.as_bytes()).unwrap().shapes.is_empty());
+    }
+
+    /// A whitespace-only body carries no content; the census counted 4,454.
+    #[test]
+    fn a_whitespace_only_body_is_skipped() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="1" cy="1"/>
+                 {}
+               <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#,
+            text_sp(r#"<a:p><a:r><a:t>  </a:t></a:r></a:p>"#)
+        );
+        assert!(parse_drawing(xml.as_bytes()).unwrap().shapes.is_empty());
+    }
+
+    /// A grouped text shape inherits the group's anchor, like a grouped
+    /// picture — and its cNvPr is its own, not the group's.
+    #[test]
+    fn a_grouped_text_shape_takes_the_group_anchor_and_its_own_name() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor>
+                 <xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>9</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+                 <xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="1" name="Group 1"/></xdr:nvGrpSpPr>
+                   {}
+                 </xdr:grpSp>
+               <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#,
+            text_sp(r#"<a:p><a:r><a:t>label</a:t></a:r></a:p>"#)
+        );
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert_eq!(content.shapes.len(), 1);
+        assert_eq!(content.shapes[0].name.as_deref(), Some("TextBox 1"));
+        assert_eq!(
+            content.shapes[0].anchor.from_cell(),
+            Some(CellAnchor {
+                col: 3,
+                row: 4,
+                ..Default::default()
+            })
+        );
+    }
+
+    /// MCE: the Choice branch wins, the Fallback is skipped — an object in
+    /// both branches yields ONE placement, not two. This was a live bug for
+    /// pictures (~12 phantom placements corpus-wide) before shapes arrived.
+    #[test]
+    fn mce_prefers_choice_and_never_reads_both_branches() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS} xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><xdr:twoCellAnchor>
+                 <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="a14">{}{}</mc:Choice>
+                   <mc:Fallback>{}{}</mc:Fallback>
+                 </mc:AlternateContent>
+               <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#,
+            text_sp(r#"<a:p><a:r><a:t>choice text</a:t></a:r></a:p>"#),
+            pic("rId1", "P"),
+            text_sp(r#"<a:p><a:r><a:t>fallback text</a:t></a:r></a:p>"#),
+            pic("rId1", "P")
+        );
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert_eq!(content.pics.len(), 1);
+        assert_eq!(content.shapes.len(), 1);
+        assert_eq!(content.shapes[0].body.plain_text(), "choice text");
+    }
+
+    /// An OMML equation shape keeps its glyphs: the structured model sees an
+    /// empty paragraph, and the flat rescue reads the `m:t` runs instead.
+    #[test]
+    fn an_omml_equation_body_flattens_to_its_glyphs() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS} xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"><xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="1" cy="1"/>
+                 <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="4" name="Eq"/></xdr:nvSpPr><xdr:spPr/>
+                   <xdr:txBody><a:bodyPr/><a:p><a:pPr/><a14:m><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>𝑛=</m:t></m:r><m:r><m:t>𝑑1/6</m:t></m:r></m:oMath></a14:m></a:p></xdr:txBody></xdr:sp>
+               <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert_eq!(content.shapes.len(), 1);
+        assert_eq!(content.shapes[0].body.plain_text(), "𝑛=𝑑1/6");
+    }
+
+    /// The census's zero: a connector's text (schema-legal, corpus-absent)
+    /// is not read, and its presence does not disturb a sibling text shape.
+    #[test]
+    fn a_connector_yields_no_text_shape() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="1" cy="1"/>
+                 <xdr:cxnSp><xdr:nvCxnSpPr><xdr:cNvPr id="3" name="Line 1"/></xdr:nvCxnSpPr><xdr:spPr/></xdr:cxnSp>
+               <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        assert!(parse_drawing(xml.as_bytes()).unwrap().shapes.is_empty());
     }
 }
