@@ -1436,10 +1436,14 @@ impl LiteParse {
     ///
     /// `unit` names the page population in the out-of-range message so a deck
     /// says "slides" where a document says "pages"; it is the only thing that
-    /// differs between the DOCX and PPTX callers, because by this point both
-    /// are just a `[LayoutedPage]`.
+    /// differs between the DOCX, PPTX and XLSX callers, because by this point
+    /// all three are just a `[LayoutedPage]`.
     #[cfg(all(
-        any(feature = "docx-native", feature = "pptx-native"),
+        any(
+            feature = "docx-native",
+            feature = "pptx-native",
+            feature = "xlsx-native"
+        ),
         not(target_arch = "wasm32")
     ))]
     fn rasterize_native_pages(
@@ -1451,6 +1455,18 @@ impl LiteParse {
     ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
         let (container, noun) = unit;
         let page_count = layouted.len() as u32;
+        // A zero-page layout is an engine failure, not an empty document:
+        // every reader here gives a sheet, a slide or a section at least one
+        // page, so nothing to draw means nothing was read. Degrading is the
+        // only useful answer — one corpus workbook has 12 KB of junk ahead of
+        // its local headers, which this reader walks to zero sheets and
+        // LibreOffice recovers. Returning "page 1 out of range (0 pages)"
+        // instead would hand the caller a range error it cannot act on.
+        if page_count == 0 {
+            return Err(LiteParseError::Conversion(format!(
+                "native layout produced no {noun}"
+            )));
+        }
         let pages: Vec<u32> = match page_numbers {
             Some(nums) => nums.to_vec(),
             None => (1..=page_count).collect(),
@@ -1530,6 +1546,57 @@ impl LiteParse {
             .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
         let geo = crate::office::pptx_layout::slides_to_pages(data, &registry)?;
         self.rasterize_native_pages(&geo.layouts, &registry, page_numbers, ("deck", "slides"))
+    }
+
+    /// Native XLSX screenshot: the DOCX/PPTX contract over the grid painter's
+    /// own commands. `Conversion` means the engine failed and the caller
+    /// should fall back to LibreOffice; anything else is the caller's error.
+    #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+    fn try_screenshot_xlsx_native(
+        &self,
+        data: &[u8],
+        page_numbers: Option<&[u32]>,
+    ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.screenshot_xlsx_native_inner(data, page_numbers)
+        }))
+        .unwrap_or_else(|_| {
+            Err(LiteParseError::Conversion(
+                "native xlsx layout panicked".to_string(),
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+    fn screenshot_xlsx_native_inner(
+        &self,
+        data: &[u8],
+        page_numbers: Option<&[u32]>,
+    ) -> Result<Vec<ScreenshotResult>, LiteParseError> {
+        use crate::office::{xlsx, xlsx_layout};
+
+        let wb = liteparse_ooxml::xlsx::read(data)
+            .map_err(|e| LiteParseError::Conversion(format!("xlsx parse failed: {e}")))?;
+        // A workbook embeds no fonts, so the registry is the host's — same
+        // construction as the PPTX path, including its no-faces check.
+        let registry = liteparse_ooxml::render::fonts::FontRegistry::build(&[], &[])
+            .map_err(|e| LiteParseError::Conversion(format!("font registry: {e}")))?;
+        // The one call that differs from the parse side: `paint: true` plus a
+        // registry, which is what turns the pass's grid and cell values into
+        // draw commands. Figures and image bytes stay off — the floating
+        // layer does not paint yet, so asking for it would only copy bytes
+        // nothing draws.
+        let nx = xlsx_layout::workbook_to_pages(
+            &wb,
+            xlsx::EmitOptions {
+                links: false,
+                figures: false,
+                images: false,
+                paint: true,
+            },
+            Some(&registry),
+        );
+        self.rasterize_native_pages(&nx.layouts, &registry, page_numbers, ("workbook", "pages"))
     }
 
     /// `parse_from_pages`'s native sibling: no projection — the block model
@@ -1689,6 +1756,23 @@ impl LiteParse {
                 Ok(results) => return Ok(results),
                 Err(LiteParseError::Conversion(e)) => log(&format!(
                     "[liteparse] native pptx screenshot failed ({e}); falling back to conversion"
+                )),
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Native XLSX raster, same contract again: the grid painter draws the
+        // page the geometry pass already numbered, so a screenshot and the
+        // native `TextItem`s share one coordinate space. LibreOffice paginates
+        // a sheet by its own print rules, so the converted PDF never did.
+        #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
+        if self.config.office_native
+            && let Some(bytes) = crate::office::xlsx_bytes(&input)
+        {
+            match self.try_screenshot_xlsx_native(&bytes, page_numbers.as_deref()) {
+                Ok(results) => return Ok(results),
+                Err(LiteParseError::Conversion(e)) => log(&format!(
+                    "[liteparse] native xlsx screenshot failed ({e}); falling back to conversion"
                 )),
                 Err(e) => return Err(e),
             }

@@ -76,9 +76,7 @@ tesseract = ["dep:tesseract-rs"]
 office-native = []
 docx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
 pptx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
-# Emitter only so far — `parser.rs` routes `.xlsx` through LibreOffice until
-# the XLSX geometry pass lands (`office/mod.rs` says why). No raster needed.
-xlsx-native = ["dep:liteparse-ooxml", "office-native"]
+xlsx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
 
 [dependencies]
 blake3 = "1"

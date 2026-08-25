@@ -851,3 +851,77 @@ async fn test_pptx_native_extracts_images() {
     }
     assert!(refs > 0, "figure refs reach the markdown");
 }
+
+/// Native XLSX screenshots: the sheet is rastered from the grid painter's own
+/// draw commands, over the pages the geometry pass already numbered.
+///
+/// The coordinate-space parity assertion is the load-bearing one, and it means
+/// more here than it did for the deck: LibreOffice paginates a sheet by its own
+/// print rules, so the converted PDF's page 2 was never this pass's page 2. A
+/// native raster and a native `TextItem` now share one page *and* one box.
+#[cfg(feature = "xlsx-native")]
+#[tokio::test]
+#[serial]
+async fn test_screenshot_xlsx_native_integration() {
+    let path = "../../bench/xlsx_corpus/nfs/IC-Accounting-Business-General-Ledger-11334.xlsx";
+    let lit = LiteParse::new(LiteParseConfig {
+        quiet: true,
+        ..Default::default()
+    });
+
+    let shots = lit.screenshot(path, None).await.expect("native raster");
+    let parsed = lit.parse(path).await.expect("native parse succeeds");
+    assert_eq!(
+        shots.len(),
+        parsed.pages.len(),
+        "the raster paginates exactly like the parse"
+    );
+    assert!(
+        shots.iter().all(|s| !s.image_bytes.is_empty()),
+        "every page encodes to PNG"
+    );
+    assert!(
+        shots.iter().any(|s| !s.is_solid_fill),
+        "a painted ledger is not a blank page"
+    );
+
+    // Same coordinate space as the parse: the raster is the page box scaled by
+    // dpi/72, modulo the 32 MP clamp a wide sheet can hit.
+    for (shot, page) in shots.iter().zip(&parsed.pages) {
+        let scale = liteparse_ooxml::render::raster::effective_scale(
+            page.page_width,
+            page.page_height,
+            lit.config().dpi / 72.0,
+        );
+        let expect_w = (page.page_width * scale).round() as u32;
+        let expect_h = (page.page_height * scale).round() as u32;
+        assert!(
+            shot.width.abs_diff(expect_w) <= 1 && shot.height.abs_diff(expect_h) <= 1,
+            "page {}: raster {}x{} vs page {}x{} at {scale}x",
+            shot.page_num,
+            shot.width,
+            shot.height,
+            expect_w,
+            expect_h
+        );
+    }
+
+    let picked = lit
+        .screenshot(path, Some(vec![2, 3]))
+        .await
+        .expect("native raster");
+    assert_eq!(
+        picked.iter().map(|s| s.page_num).collect::<Vec<_>>(),
+        vec![2, 3],
+        "a sheet page number is a page number"
+    );
+
+    let err = lit
+        .screenshot(path, Some(vec![999]))
+        .await
+        .expect_err("out-of-range page is the caller's error, not a fallback");
+    assert!(
+        err.to_string().contains("out of range"),
+        "engine reports the range rather than degrading to LibreOffice: {err}"
+    );
+}
