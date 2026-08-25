@@ -55,7 +55,7 @@ mod xml;
 pub use drawings::{CellAnchor, PicAnchor, SheetPic, SheetShape};
 pub use package::{SheetEntry, WorkbookPackage, walk};
 pub use refs::{CellRef, RangeRef, column_label, parse_cell, parse_column, parse_range};
-pub use sheet::{Cell, CellValue, ColInfo, Hyperlink, Row, Sheet, SheetStats};
+pub use sheet::{Cell, CellValue, ColInfo, Hyperlink, Row, Sheet, SheetStats, StyledBlank};
 pub use styles::{
     Alignment, Border, BorderEdge, BorderStyle, CellXf, ColorKind, ColorRef, Fill, Font,
     HorizontalAlign, INDEXED_PALETTE, PatternType, Styles,

@@ -79,6 +79,12 @@ pub struct EmitOptions {
     /// (`xlsx_layout`), which is where pages — and so image ids' page
     /// numbers — exist; the block emitter ignores it.
     pub images: bool,
+    /// Paint the grid: fill `NativeXlsx::layouts` with the gridlines, cell
+    /// fills and cell borders behind the text. Off by default and read only
+    /// by `xlsx_layout` — a parse wants `TextItem`s, and painting one corpus
+    /// sheet can be a quarter-million rects nobody would look at. The
+    /// screenshot path turns it on.
+    pub paint: bool,
 }
 
 /// What one native-parsed workbook yields: the block stream, tagged with the

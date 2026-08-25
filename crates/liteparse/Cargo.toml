@@ -50,6 +50,14 @@ required-features = ["xlsx-native"]
 name = "xlsx_layout_check"
 required-features = ["xlsx-native"]
 
+[[example]]
+name = "xlsx_raster_dump"
+required-features = ["xlsx-native"]
+
+[[example]]
+name = "xlsx_paint_recall"
+required-features = ["xlsx-native"]
+
 [features]
 default = ["tesseract", "docx-native", "pptx-native", "xlsx-native"]
 oar-ocr = ["dep:oar-ocr"]

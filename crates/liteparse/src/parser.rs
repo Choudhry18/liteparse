@@ -961,6 +961,9 @@ impl LiteParse {
                 links: self.config.extract_links,
                 figures: self.config.image_mode != crate::config::ImageMode::Off,
                 images: self.config.effective_extract_images(),
+                // A parse wants items, not ink: the grid painter runs for the
+                // screenshot path only.
+                paint: false,
             },
         );
 

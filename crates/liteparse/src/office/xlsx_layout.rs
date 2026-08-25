@@ -33,7 +33,13 @@
 
 use std::ops::Range;
 
-use liteparse_ooxml::xlsx::{CellAnchor, PicAnchor, Sheet, SheetShape, Workbook};
+use liteparse_ooxml::render::dimension::Pt;
+use liteparse_ooxml::render::geometry::{PtRect, PtSize};
+use liteparse_ooxml::render::layout::draw_command::{DrawCommand, LayoutedPage};
+use liteparse_ooxml::render::resolve::color::RgbColor;
+use liteparse_ooxml::xlsx::{
+    Border, BorderEdge, CellAnchor, PatternType, PicAnchor, Row, Sheet, SheetShape, Workbook,
+};
 
 use super::figures::FigureSink;
 use super::xlsx::{EmitOptions, SHEET_HEADING_LEVEL, SheetPlan};
@@ -62,6 +68,16 @@ const MIN_PAGE_WIDTH: f32 = 612.0;
 /// pixel formula already contains, in points.
 const TEXT_INSET: f32 = (PAD_PX / 2.0 * PX_TO_PT) as f32;
 
+/// Excel's gridline grey, and one device pixel of it at 96 DPI. Gridlines are
+/// not decoration: 12.1% of corpus sheets declare neither a fill nor a border
+/// anywhere, so this is the only ink holding their numbers in a grid.
+const GRIDLINE_COLOR: RgbColor = RgbColor {
+    r: 0xD0,
+    g: 0xD7,
+    b: 0xE5,
+};
+const GRIDLINE_W: f64 = 0.75;
+
 /// Everything the native XLSX pipeline hands `parser.rs`.
 pub struct NativeXlsx {
     /// One or more pages per sheet (every sheet gets at least one, so a page
@@ -86,6 +102,11 @@ pub struct NativeXlsx {
     /// input to page complexity, computed whether or not images were asked
     /// for (a rectangle costs no byte copies).
     pub pic_rects: Vec<Vec<Rect>>,
+    /// The paint of each page, aligned with `pages`: gridlines, cell fills
+    /// and cell borders as [`DrawCommand::Rect`]s, ready for
+    /// `render::raster::rasterize_page`. Cell *text* is not here yet — this
+    /// is the grid, not the sheet.
+    pub layouts: Vec<LayoutedPage>,
 }
 
 /// EMU → points: 914,400 EMU to the inch, 72 points to the inch.
@@ -171,6 +192,7 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
         outline: Vec::new(),
         images: Vec::new(),
         pic_rects: Vec::new(),
+        layouts: Vec::new(),
     };
     // One sink across the workbook: a logo placed on every sheet dedups to
     // one canonical entry, the same cross-page rule the PPTX path applies
@@ -314,12 +336,24 @@ pub fn workbook_to_pages(wb: &Workbook, opts: EmitOptions) -> NativeXlsx {
             }
         }
 
+        // The `<col style>` of each retained column, resolved once per sheet:
+        // the painter asks for it on every row of every page.
+        let col_styles: Vec<Option<u32>> = cols.iter().map(|&c| sheet.col_style(c)).collect();
+
         for (i, blocks) in blocks_per_page.into_iter().enumerate() {
             let mut page = match &plan {
                 Some(p) => geo.build_page(wb, p, ranges[i].clone(), out.pages.len() + 1),
                 None => empty_page(out.pages.len() + 1),
             };
             append_items(&mut page, std::mem::take(&mut shape_items_per_page[i]));
+            let mut layout = LayoutedPage::new(PtSize::new(
+                Pt::new(page.page_width),
+                Pt::new(page.page_height),
+            ));
+            if let (true, Some(p)) = (opts.paint, &plan) {
+                layout.commands = geo.paint_page(wb, sheet, p, &col_styles, ranges[i].clone());
+            }
+            out.layouts.push(layout);
             out.pages.push(page);
             out.page_blocks.push(blocks);
             out.pic_rects.push(std::mem::take(&mut rects_per_page[i]));
@@ -407,6 +441,127 @@ fn empty_page(page_number: usize) -> Page {
         annotations: None,
         form_fields: None,
         structure_tree: None,
+    }
+}
+
+/// A page-space rectangle command. Coordinates arrive grid-relative and leave
+/// page-absolute, which is the one place [`MARGIN`] is added to paint.
+fn rect_cmd(x: f64, y: f64, w: f64, h: f64, color: RgbColor) -> DrawCommand {
+    DrawCommand::Rect {
+        rect: PtRect::from_xywh(
+            Pt::new(MARGIN + x as f32),
+            Pt::new(MARGIN + y as f32),
+            Pt::new(w as f32),
+            Pt::new(h as f32),
+        ),
+        color,
+    }
+}
+
+fn rgb_of([r, g, b]: [u8; 3]) -> RgbColor {
+    RgbColor { r, g, b }
+}
+
+/// The effective style of every retained column of one row, written into
+/// `out` (reused across rows: a wide sheet would otherwise allocate one vector
+/// per row per page).
+///
+/// The cascade is Excel's: the cell's own `s=` wins, then the row's
+/// `customFormat` style, then the `<col style>` of the span it falls in. A
+/// cell that states no `s=` inherits rather than resolving to style 0 — that
+/// is the whole reason the row and column carriers exist.
+///
+/// Value-less styled cells come from the paint side-channel and are treated
+/// exactly like a cell's own `s=`; the ones on columns the packed grid
+/// compacted out are dropped here (class C's column half).
+fn row_paint_styles(
+    row: &Row,
+    cells: &[&liteparse_ooxml::xlsx::Cell],
+    cols: &[u32],
+    col_styles: &[Option<u32>],
+    out: &mut Vec<Option<u32>>,
+) {
+    out.clear();
+    if row.style.is_some() {
+        out.resize(cols.len(), row.style);
+    } else {
+        out.extend_from_slice(col_styles);
+    }
+    let mut set = |col: u32, style: u32| {
+        if let Ok(ci) = cols.binary_search(&col) {
+            out[ci] = Some(style);
+        }
+    };
+    for cell in cells {
+        if let Some(s) = cell.style {
+            set(cell.at.col, s);
+        }
+    }
+    for blank in &row.styled_blanks {
+        set(blank.col, blank.style);
+    }
+}
+
+/// One cell's four edges as thin rects, inside the cell box. Vertical edges
+/// are inset by the horizontal ones so a corner is painted once, the same
+/// rule the DOCX table painter uses.
+///
+/// An edge that names no colour is black: SpreadsheetML's automatic border
+/// colour is the window text colour, unlike an automatic *fill*, which is the
+/// background and must not be painted at all.
+fn push_border(
+    out: &mut Vec<DrawCommand>,
+    wb: &Workbook,
+    border: &Border,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) {
+    let color = |e: &BorderEdge| {
+        e.color
+            .and_then(|c| wb.resolve_color(c))
+            .map_or(RgbColor::BLACK, rgb_of)
+    };
+    let width = |e: &BorderEdge| {
+        f64::from(e.style.width_pt())
+            .min(h.max(0.0))
+            .min(w.max(0.0))
+    };
+    let (top_w, bot_w) = (width(&border.top), width(&border.bottom));
+    if border.top.style.paints() {
+        out.push(rect_cmd(x, y, w, top_w, color(&border.top)));
+    }
+    if border.bottom.style.paints() {
+        out.push(rect_cmd(x, y + h - bot_w, w, bot_w, color(&border.bottom)));
+    }
+    let top_inset = if border.top.style.paints() {
+        top_w
+    } else {
+        0.0
+    };
+    let bot_inset = if border.bottom.style.paints() {
+        bot_w
+    } else {
+        0.0
+    };
+    let v_h = h - top_inset - bot_inset;
+    if v_h <= 0.0 {
+        return;
+    }
+    if border.left.style.paints() {
+        let lw = width(&border.left);
+        out.push(rect_cmd(x, y + top_inset, lw, v_h, color(&border.left)));
+    }
+    if border.right.style.paints() {
+        let rw = width(&border.right);
+        out.push(rect_cmd(
+            x + w - rw,
+            y + top_inset,
+            rw,
+            v_h,
+            color(&border.right),
+        ));
     }
 }
 
@@ -561,6 +716,99 @@ impl SheetGeometry {
         }
         ranges.push(start..n);
         ranges
+    }
+
+    /// One page's paint: gridlines under fills under borders, every one of
+    /// them a [`DrawCommand::Rect`] so the raster's Shading pass keeps them in
+    /// emission order (its pass order is fixed — `Path` < `Rect` < `Image` <
+    /// `Line`/`Text` — so three variants would be three *layers*, in the wrong
+    /// sequence).
+    ///
+    /// The population is the census's classes A + B + D + E: valued cells,
+    /// the value-less styled cells the reader keeps in [`Row::styled_blanks`],
+    /// `<row customFormat>` and `<col style>`. That is 15.9% of all declared
+    /// paint on top of the 42.4% a valued-cells-only painter sees, and every
+    /// unit of it lands on a cell box the geometry pass has already placed —
+    /// no page changes size, no `TextItem` moves. Class C (paint on cells
+    /// outside the packed grid, 41.7%) is dropped by design: honouring it
+    /// means inventing the rows and columns to hang it on, which is the canvas
+    /// explosion this pass exists to prevent, and Excel does not print it
+    /// either.
+    ///
+    /// Three approximations, each with its number:
+    ///
+    /// * **Only `solid` fills paint.** 100.0% of filled corpus cells are
+    ///   solid; the hatch branch is skipped rather than approximated because
+    ///   slot 1 of every styles part is `gray125` — Excel's "no fill"
+    ///   placeholder, usually with a black `fg` — and painting it solid would
+    ///   black out sheets that asked for nothing.
+    /// * **Dashed edges paint solid** (0.2% of edges), the same trade
+    ///   [`BorderStyle`](liteparse_ooxml::xlsx::BorderStyle) already made by
+    ///   keeping the full enum rather than mapping the tail to `None`.
+    /// * **Diagonals are not drawn**: a `Rect` cannot express one, and the
+    ///   variant that could (`Line`) paints in the Ink pass, over everything.
+    ///
+    /// Merged regions paint per cell rather than as one box. Excel writes the
+    /// covered cells with the merge's own style, so the fill is right; the
+    /// cost is the interior edges of a merge whose covered cells declare
+    /// borders, which Excel suppresses.
+    fn paint_page(
+        &self,
+        wb: &Workbook,
+        sheet: &Sheet,
+        plan: &SheetPlan<'_>,
+        col_styles: &[Option<u32>],
+        range: Range<usize>,
+    ) -> Vec<DrawCommand> {
+        let y_base = self.y_off[range.start];
+        let grid_w = *self.x_off.last().unwrap();
+        let grid_h = self.y_off[range.end] - y_base;
+        let mut cmds = Vec::new();
+
+        // 1. Gridlines: one line per emitted-row and retained-column boundary,
+        // under everything. They follow the *packed* grid, so a compacted-out
+        // empty column leaves no line — the grid the reader sees is the grid
+        // the text is in.
+        if sheet.gridlines_visible() && grid_h > 0.0 {
+            for x in &self.x_off {
+                cmds.push(rect_cmd(*x, 0.0, GRIDLINE_W, grid_h, GRIDLINE_COLOR));
+            }
+            for i in range.start..=range.end {
+                let y = self.y_off[i] - y_base;
+                cmds.push(rect_cmd(0.0, y, grid_w, GRIDLINE_W, GRIDLINE_COLOR));
+            }
+        }
+
+        // 2 & 3. Fills, then borders — collected in one walk and concatenated
+        // so every fill is under every border, including its neighbour's.
+        let mut borders = Vec::new();
+        let mut styles: Vec<Option<u32>> = Vec::new();
+        for i in range.clone() {
+            let (row, cells) = &plan.rows[i];
+            let y = self.y_off[i] - y_base;
+            let h = self.row_height(i);
+            row_paint_styles(row, cells, &plan.cols, col_styles, &mut styles);
+            for (ci, style) in styles.iter().enumerate() {
+                let Some(style) = *style else { continue };
+                let (x, w) = (self.x_off[ci], self.x_off[ci + 1] - self.x_off[ci]);
+                let fill = wb.styles.fill(Some(style));
+                if fill.pattern == PatternType::Solid {
+                    // An automatic `fg` is not white — it is "the consumer's
+                    // default background", which is the page this is painted
+                    // on. Painting it would cover the gridlines with the
+                    // colour they are already on.
+                    if let Some(rgb) = fill.fg.and_then(|c| wb.resolve_color(c)) {
+                        cmds.push(rect_cmd(x, y, w, h, rgb_of(rgb)));
+                    }
+                }
+                let border = wb.styles.border(Some(style));
+                if border.paints() {
+                    push_border(&mut borders, wb, &border, x, y, w, h);
+                }
+            }
+        }
+        cmds.append(&mut borders);
+        cmds
     }
 
     /// One page: the rows of `range`, each non-empty cell an item at its
@@ -854,6 +1102,202 @@ mod tests {
         let site = &nx.pages[0].text_items[0];
         assert_eq!(site.text, "site");
         assert_eq!(site.link.as_deref(), Some("https://example.com"));
+    }
+
+    // ── the grid painter ────────────────────────────────────────────────────
+
+    /// A styles part with the fills, borders and cell formats the paint tests
+    /// name by index. Slots 0 and 1 are Excel's own (`none`, `gray125`), which
+    /// is what makes the gray125 test below meaningful.
+    const PAINT_STYLES: &str = r#"<styleSheet>
+      <fonts count="1"><font/></fonts>
+      <fills count="4">
+        <fill><patternFill patternType="none"/></fill>
+        <fill><patternFill patternType="gray125"><fgColor rgb="FF000000"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FF3366CC"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FFFFDD00"/></patternFill></fill>
+      </fills>
+      <borders count="2">
+        <border><left/><right/><top/><bottom/></border>
+        <border><left style="thin"><color rgb="FFFF0000"/></left><right/><top/><bottom style="medium"/></border>
+      </borders>
+      <cellXfs count="6">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="2" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="3" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="1"/>
+        <xf numFmtId="0" fontId="0" fillId="1" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="2" borderId="1"/>
+      </cellXfs>
+    </styleSheet>"#;
+
+    fn painted(sheet_xml: &str) -> NativeXlsx {
+        let wb = workbook_from(sheet_xml, &[("xl/styles.xml", PAINT_STYLES)]);
+        workbook_to_pages(
+            &wb,
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn rects(page: &LayoutedPage) -> Vec<(f32, f32, f32, f32, RgbColor)> {
+        page.commands
+            .iter()
+            .map(|c| match c {
+                DrawCommand::Rect { rect, color } => (
+                    rect.origin.x.raw(),
+                    rect.origin.y.raw(),
+                    rect.size.width.raw(),
+                    rect.size.height.raw(),
+                    *color,
+                ),
+                other => panic!("the grid painter emits Rects only, got {other:?}"),
+            })
+            .collect()
+    }
+
+    const BLUE: RgbColor = RgbColor {
+        r: 0x33,
+        g: 0x66,
+        b: 0xCC,
+    };
+    const YELLOW: RgbColor = RgbColor {
+        r: 0xFF,
+        g: 0xDD,
+        b: 0x00,
+    };
+
+    /// Gridlines are one line per boundary of the *packed* grid, under
+    /// everything, and they obey the sheet's own switch.
+    #[test]
+    fn gridlines_frame_the_packed_grid_and_can_be_turned_off() {
+        let body = r#"<sheetData>
+            <row r="1" ht="20"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row>
+            <row r="2" ht="20"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row>
+        </sheetData>"#;
+        let on = painted(&format!("<worksheet>{body}</worksheet>"));
+        let lines = rects(&on.layouts[0]);
+        // 2 columns → 3 verticals, 2 rows → 3 horizontals, nothing else.
+        assert_eq!(lines.len(), 6);
+        assert!(lines.iter().all(|l| l.4 == GRIDLINE_COLOR));
+        // Verticals span the page's rows; horizontals span the grid width.
+        assert!((lines[0].3 - 40.0).abs() < 1e-4, "{:?}", lines[0]);
+        assert_eq!(lines[0].0, MARGIN);
+        assert_eq!(lines[3].1, MARGIN);
+        assert!((lines[5].1 - (MARGIN + 40.0)).abs() < 1e-4);
+
+        let off = painted(&format!(
+            r#"<worksheet><sheetViews><sheetView showGridLines="0"/></sheetViews>{body}</worksheet>"#
+        ));
+        assert!(off.layouts[0].commands.is_empty());
+    }
+
+    /// Fills under borders, both over the gridlines — the emission order the
+    /// raster's single Shading pass turns into z-order.
+    #[test]
+    fn fills_paint_under_borders_and_over_the_gridlines() {
+        let nx = painted(
+            r#"<worksheet><sheetViews><sheetView showGridLines="0"/></sheetViews><sheetData>
+                <row r="1" ht="20"><c r="A1" s="5"><v>1</v></c><c r="B1" s="1"><v>2</v></c></row>
+                <row r="2" ht="20"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row>
+            </sheetData></worksheet>"#,
+        );
+        let r = rects(&nx.layouts[0]);
+        // Two solid fills, then A1's two edges: left thin red, bottom medium.
+        assert_eq!(r.len(), 4, "{r:?}");
+        assert_eq!(r[0].4, BLUE);
+        assert_eq!(r[1].4, BLUE);
+        let (left, bottom) = (r[3], r[2]);
+        assert_eq!(bottom.4, RgbColor::BLACK, "an uncoloured edge is black");
+        assert_eq!(
+            left.4,
+            RgbColor {
+                r: 0xFF,
+                g: 0,
+                b: 0
+            }
+        );
+        // Bottom edge: full cell width, medium (1.5 pt), at the row's foot.
+        assert!((bottom.3 - 1.5).abs() < 1e-4);
+        assert!((bottom.1 - (MARGIN + 20.0 - 1.5)).abs() < 1e-4);
+        // Left edge: thin (0.75 pt), inset below the bottom edge it meets.
+        assert!((left.2 - 0.75).abs() < 1e-4);
+        assert!((left.3 - (20.0 - 1.5)).abs() < 1e-4);
+    }
+
+    /// `gray125` is slot 1 of every styles part and means "no fill". Painting
+    /// its `fg` solid would black out sheets that asked for nothing.
+    #[test]
+    fn the_gray125_placeholder_paints_nothing() {
+        let nx = painted(
+            r#"<worksheet><sheetViews><sheetView showGridLines="0"/></sheetViews><sheetData>
+                <row r="1"><c r="A1" s="4"><v>1</v></c><c r="B1"><v>2</v></c></row>
+                <row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row>
+            </sheetData></worksheet>"#,
+        );
+        assert!(nx.layouts[0].commands.is_empty());
+    }
+
+    /// The census's classes B, D and E — the 15.9% of declared paint that a
+    /// valued-cells-only painter cannot see. A styled blank paints its own
+    /// cell, `<row customFormat>` paints the row's retained columns, and
+    /// `<col style>` paints its span; the cascade is cell > row > column.
+    #[test]
+    fn blanks_and_row_and_column_formats_all_paint() {
+        let nx = painted(
+            r#"<worksheet><sheetViews><sheetView showGridLines="0"/></sheetViews>
+            <cols><col min="1" max="2" width="10" customWidth="1" style="1"/></cols>
+            <sheetData>
+                <row r="1" ht="20"><c r="A1"><v>1</v></c><c r="B1" s="4"/></row>
+                <row r="2" ht="20" s="2" customFormat="1"><c r="A2"><v>3</v></c><c r="B2" s="1"><v>4</v></c></row>
+            </sheetData></worksheet>"#,
+        );
+        let r = rects(&nx.layouts[0]);
+        // Row 1: A1 takes the column's blue (class E), B1's own style wins and
+        // is the no-paint placeholder (class B). Row 2: the row's yellow on
+        // both columns (class D), with B2's own blue overriding it.
+        assert_eq!(r.len(), 3, "{r:?}");
+        assert_eq!((r[0].1, r[0].4), (MARGIN, BLUE));
+        assert!((r[0].2 - 56.25).abs() < 1e-4, "the column's own width");
+        assert_eq!((r[1].1, r[1].4), (MARGIN + 20.0, YELLOW));
+        assert_eq!((r[2].1, r[2].4), (MARGIN + 20.0, BLUE));
+        assert!((r[2].0 - (MARGIN + 56.25)).abs() < 1e-4, "column B");
+    }
+
+    /// Paint follows the page split: a page holds its own rows' ink and the
+    /// page-relative origin, like every item on it.
+    #[test]
+    fn paint_paginates_with_the_rows() {
+        let rows_xml: String = (1..=15)
+            .map(|r| {
+                format!(
+                    r#"<row r="{r}" ht="100"><c r="A{r}" s="1"><v>{r}</v></c><c r="B{r}"><v>{r}</v></c></row>"#
+                )
+            })
+            .collect();
+        let nx = painted(&format!(
+            r#"<worksheet><sheetViews><sheetView showGridLines="0"/></sheetViews><sheetData>{rows_xml}</sheetData></worksheet>"#
+        ));
+        assert_eq!(nx.layouts.len(), 3);
+        assert_eq!(rects(&nx.layouts[0]).len(), 7, "one fill per row on page 1");
+        assert_eq!(rects(&nx.layouts[2]).len(), 1);
+        assert_eq!(rects(&nx.layouts[2])[0].1, MARGIN, "page-relative");
+        // The layout's page box is the item pages' box.
+        for (layout, page) in nx.layouts.iter().zip(&nx.pages) {
+            assert_eq!(layout.page_size.width.raw(), page.page_width);
+            assert_eq!(layout.page_size.height.raw(), page.page_height);
+        }
+    }
+
+    /// An empty sheet has a page and no paint — the painter must not invent a
+    /// grid for a sheet the plan refused.
+    #[test]
+    fn an_empty_sheet_paints_nothing() {
+        let nx = painted("<worksheet><sheetData/></worksheet>");
+        assert_eq!(nx.layouts.len(), 1);
+        assert!(nx.layouts[0].commands.is_empty());
     }
 
     pub(crate) fn col_label(mut col: u32) -> String {

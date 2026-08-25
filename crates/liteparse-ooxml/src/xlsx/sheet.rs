@@ -11,11 +11,29 @@
 //!   shared-string table. The table exists precisely so a string used 40,000
 //!   times is stored once; resolving eagerly would undo that. See
 //!   [`crate::xlsx::Workbook::cell_text`].
-//! * **Value-less cells are dropped.** `<c r="A1" s="7"/>` carries a style and
-//!   no content — usually a bordered-but-blank region, and in some producers
-//!   an entire pre-formatted sheet. They are counted in [`SheetStats`] rather
-//!   than stored, because a workbook can hold millions of them and none of
-//!   them carries text.
+//! * **Value-less cells are dropped from [`Row::cells`].** `<c r="A1" s="7"/>`
+//!   carries a style and no content — usually a bordered-but-blank region, and
+//!   in some producers an entire pre-formatted sheet. They are counted in
+//!   [`SheetStats`] and, when they carry a style at all, kept in the
+//!   *paint-only* side-channel [`Row::styled_blanks`] — never in `cells`,
+//!   where they would change what the emitter, the block slicer and the
+//!   geometry pass all read as "a row / column that exists".
+//!
+//! # The paint side-channel
+//!
+//! `xlsx_unvalued_paint_census` over the 1,248-workbook corpus: **57.6% of all
+//! declared paint reaches the file and not a reader built on valued cells
+//! alone**, in three carriers — value-less styled cells, `<row customFormat>`
+//! and `<col style>`. [`Row::styled_blanks`], [`Row::style`] and
+//! [`ColInfo::style`] are those three, and they exist for the raster; nothing
+//! that reads text sees them.
+//!
+//! `styled_blanks` is pruned at `</row>`: a row with no valued cell is not a
+//! row any consumer of this reader emits, so its blanks are unreachable ink
+//! and are dropped rather than stored. That prune is also the memory bound —
+//! it is what keeps the pre-formatted-region sheets (thousands of blank rows
+//! past the data, class C of the census, 41.7% of all paint) from being held
+//! at all.
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -62,6 +80,16 @@ pub struct Cell {
     pub has_formula: bool,
 }
 
+/// A value-less `<c s=…>`: the style it carries and the column it carries it
+/// on. Paint only — see the module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StyledBlank {
+    pub col: u32,
+    /// The `s=` index. A blank with no `s=` is not recorded: it declares
+    /// nothing to paint.
+    pub style: u32,
+}
+
 /// A row that exists in the file, with its own metrics.
 #[derive(Clone, Debug, Default)]
 pub struct Row {
@@ -70,9 +98,20 @@ pub struct Row {
     /// `ht=` in points, when the row states its own height.
     pub height: Option<f64>,
     pub hidden: bool,
+    /// `<row s=… customFormat="1">`: a format for every cell of the row that
+    /// states none of its own. Recorded **only** under `customFormat`, which
+    /// is the attribute that says the `s=` is meant rather than inherited
+    /// (§18.3.1.73); 33,562 rows in the corpus declare one, carrying 482,334
+    /// cells of paint.
+    pub style: Option<u32>,
     /// Cells in written order, which is ascending column order in every
     /// producer seen. Sparse: absent columns are absent.
     pub cells: Vec<Cell>,
+    /// Value-less styled cells of this row, in written order. A paint-only
+    /// side-channel: it is deliberately *not* part of `cells`, because every
+    /// consumer derives "this row has content" and "this column is used" from
+    /// that field. Empty for a row with no valued cell (see the module docs).
+    pub styled_blanks: Vec<StyledBlank>,
 }
 
 /// A `<col>` span's metrics. One entry covers columns `min..=max`, both
@@ -87,6 +126,11 @@ pub struct ColInfo {
     pub width: Option<f64>,
     pub hidden: bool,
     pub custom_width: bool,
+    /// `<col style=…>`: a format for every cell of the span that states none
+    /// of its own, and none through its row. Paint only, like
+    /// [`Row::styled_blanks`]: 8,372 corpus spans declare one, carrying
+    /// 163,350 cells of ink.
+    pub style: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +234,15 @@ impl Sheet {
         self.show_gridlines.unwrap_or(true)
     }
 
+    /// The format a `<col>` span declares for the columns it covers, if any.
+    /// Paint only — the emitter never asks.
+    pub fn col_style(&self, col: u32) -> Option<u32> {
+        self.cols
+            .iter()
+            .find(|c| col >= c.min && col <= c.max)
+            .and_then(|c| c.style)
+    }
+
     /// The declared width of a column, walking the `<col>` spans.
     pub fn col_width(&self, col: u32) -> Option<f64> {
         self.cols
@@ -271,6 +324,7 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
                             width: attr_parse(e, b"width"),
                             hidden: attr_bool(e, b"hidden", false),
                             custom_width: attr_bool(e, b"customWidth", false),
+                            style: attr_parse(e, b"style"),
                         });
                     }
                     b"row" => {
@@ -284,7 +338,14 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
                             index,
                             height: attr_parse(e, b"ht"),
                             hidden: attr_bool(e, b"hidden", false),
+                            // `s=` without `customFormat="1"` is the row's
+                            // *inherited* format written out; taking it would
+                            // paint every default row with style 0's fill.
+                            style: attr_bool(e, b"customFormat", false)
+                                .then(|| attr_parse(e, b"s"))
+                                .flatten(),
                             cells: Vec::new(),
+                            styled_blanks: Vec::new(),
                         };
                         // An empty `<row/>` still carries height and hidden
                         // state, which the geometry pass needs.
@@ -316,6 +377,7 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
                         if empty {
                             // No children means no value: styled-but-blank.
                             sheet.stats.empty_styled_cells += 1;
+                            record_styled_blank(pending.at.col, pending.style, &mut row);
                         } else {
                             cell = Some(pending);
                         }
@@ -376,7 +438,7 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
                 }
                 b"row" => {
                     if let Some(r) = row.take() {
-                        sheet.rows.push(r);
+                        sheet.rows.push(prune_blanks(r));
                     }
                 }
                 _ => {}
@@ -391,9 +453,29 @@ pub fn parse(name: &str, visible: bool, data: &[u8]) -> Result<Sheet> {
         finish_cell(pending, &value, &mut row, &mut sheet);
     }
     if let Some(r) = row.take() {
-        sheet.rows.push(r);
+        sheet.rows.push(prune_blanks(r));
     }
     Ok(sheet)
+}
+
+/// Drop a row's paint side-channel when the row carries no value: no consumer
+/// emits such a row, so the ink has nowhere to land. This is what bounds the
+/// reader's memory on a pre-formatted sheet — see the module docs.
+fn prune_blanks(mut row: Row) -> Row {
+    if row.cells.is_empty() && !row.styled_blanks.is_empty() {
+        row.styled_blanks = Vec::new();
+    }
+    row
+}
+
+/// Send a value-less `<c s=…>` to the paint side-channel. A blank outside any
+/// `<row>` is dropped: the row `finish_cell` would invent for it has no valued
+/// cell, so the prune at `</row>` would discard it anyway.
+fn record_styled_blank(col: u32, style: Option<u32>, row: &mut Option<Row>) {
+    let (Some(style), Some(r)) = (style, row.as_mut()) else {
+        return;
+    };
+    r.styled_blanks.push(StyledBlank { col, style });
 }
 
 struct PendingCell {
@@ -405,6 +487,9 @@ struct PendingCell {
 }
 
 fn finish_cell(pending: PendingCell, raw: &str, row: &mut Option<Row>, sheet: &mut Sheet) {
+    // Read before the match moves `pending.text`; the blank path below needs
+    // only these two.
+    let blank = (pending.at.col, pending.style);
     let value = match pending.kind.as_str() {
         "inlineStr" => pending.text.map(CellValue::Text),
         // An empty body is a styled-but-blank cell that the producer happened
@@ -441,6 +526,7 @@ fn finish_cell(pending: PendingCell, raw: &str, row: &mut Option<Row>, sheet: &m
 
     let Some(value) = value else {
         sheet.stats.empty_styled_cells += 1;
+        record_styled_blank(blank.0, blank.1, row);
         return;
     };
     let cell = Cell {
@@ -557,6 +643,69 @@ mod tests {
         let s = sheet();
         assert_eq!(s.rows[0].cells.len(), 1, "B1 has a style and no value");
         assert_eq!(s.stats.empty_styled_cells, 1);
+    }
+
+    /// The paint side-channel: the blank keeps its style, `cells` does not
+    /// grow, and the stats keep counting it.
+    #[test]
+    fn styled_blanks_reach_the_paint_side_channel_only() {
+        let s = sheet();
+        assert_eq!(s.rows[0].cells.len(), 1, "B1 is still not a cell");
+        assert_eq!(
+            s.rows[0].styled_blanks,
+            vec![StyledBlank { col: 1, style: 2 }]
+        );
+        assert_eq!(s.stats.empty_styled_cells, 1);
+    }
+
+    /// A blank with no `s=` declares nothing to paint and is not recorded.
+    #[test]
+    fn an_unstyled_blank_is_not_recorded() {
+        let xml = r#"<worksheet><sheetData><row r="1">
+            <c r="A1"/><c r="B1"><v>1</v></c>
+        </row></sheetData></worksheet>"#;
+        let s = parse("s", true, xml.as_bytes()).unwrap();
+        assert!(s.rows[0].styled_blanks.is_empty());
+        assert_eq!(s.stats.empty_styled_cells, 1);
+    }
+
+    /// The memory bound and the class-C rule in one: a row with no value is
+    /// emitted by nobody, so its blanks are dropped rather than stored — for
+    /// the row written `<c/>`-style and for the one written `<c></c>`.
+    #[test]
+    fn a_valueless_row_keeps_its_metrics_and_drops_its_blanks() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1" ht="30"><c r="A1" s="4"/><c r="B1" s="4"></c></row>
+            <row r="2"><c r="A2" s="5"/><c r="B2"><v>1</v></c></row>
+        </sheetData></worksheet>"#;
+        let s = parse("s", true, xml.as_bytes()).unwrap();
+        assert_eq!(s.rows[0].height, Some(30.0), "the row itself survives");
+        assert!(s.rows[0].styled_blanks.is_empty());
+        assert_eq!(
+            s.rows[1].styled_blanks,
+            vec![StyledBlank { col: 0, style: 5 }],
+            "a row with a value keeps its blanks"
+        );
+        assert_eq!(s.stats.empty_styled_cells, 3);
+    }
+
+    /// `<row s=>` counts only under `customFormat="1"`; `<col style=>` always
+    /// does.
+    #[test]
+    fn row_and_column_formats_are_read_for_paint() {
+        let xml = r#"<worksheet>
+            <cols><col min="1" max="2" width="9" style="6"/><col min="3" max="3" width="9"/></cols>
+            <sheetData>
+              <row r="1" s="8" customFormat="1"><c r="A1"><v>1</v></c></row>
+              <row r="2" s="9"><c r="A2"><v>2</v></c></row>
+            </sheetData></worksheet>"#;
+        let s = parse("s", true, xml.as_bytes()).unwrap();
+        assert_eq!(s.rows[0].style, Some(8));
+        assert_eq!(s.rows[1].style, None, "no customFormat, no claim");
+        assert_eq!(s.col_style(0), Some(6));
+        assert_eq!(s.col_style(1), Some(6));
+        assert_eq!(s.col_style(2), None);
+        assert_eq!(s.col_style(9), None, "outside every span");
     }
 
     #[test]
