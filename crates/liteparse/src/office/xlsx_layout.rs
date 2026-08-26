@@ -41,10 +41,13 @@
 use std::ops::Range;
 use std::rc::Rc;
 
+use liteparse_ooxml::model::dimension::Dimension;
 use liteparse_ooxml::render::dimension::Pt;
 use liteparse_ooxml::render::fonts::FontRegistry;
 use liteparse_ooxml::render::geometry::{PtLineSegment, PtOffset, PtRect, PtSize};
-use liteparse_ooxml::render::layout::draw_command::{DrawCommand, LayoutedPage};
+use liteparse_ooxml::render::layout::draw_command::{
+    DrawCommand, LayoutedPage, ShapeTransform, TransformMark,
+};
 use liteparse_ooxml::render::layout::fragment::FontProps;
 use liteparse_ooxml::render::layout::measurer::TextMeasurer;
 use liteparse_ooxml::render::resolve::color::{RgbColor, rgb_from_u32};
@@ -1443,6 +1446,18 @@ pub struct TextPaintStats {
     /// Cells painted in two pieces because their format asked for a `*` fill
     /// between them — Excel's Accounting shape.
     pub filled: u64,
+    /// Cells whose text was laid out along an angle and placed by a
+    /// [`TransformMark`] bracket — §18.8.1's `1..=180` spellings.
+    pub rotated: u64,
+    /// Cells painted one glyph under the next, `@textRotation="255"`. Not a
+    /// rotation: the glyphs stay upright, so these carry no bracket.
+    pub stacked: u64,
+    /// Cells cut across the direction their lines stack rather than along
+    /// them: a stacked cell with more glyphs than its row is tall, or a
+    /// rotated one whose wrapped lines ran past the cell's cross extent. The
+    /// cross-axis twin of `clipped`, kept apart from it so the horizontal
+    /// rule's gated rate stays a statement about the horizontal rule.
+    pub cross_clipped: u64,
 }
 
 impl TextPaintStats {
@@ -1456,6 +1471,9 @@ impl TextPaintStats {
         self.clipped += o.clipped;
         self.hashed += o.hashed;
         self.filled += o.filled;
+        self.rotated += o.rotated;
+        self.stacked += o.stacked;
+        self.cross_clipped += o.cross_clipped;
     }
 }
 
@@ -1757,6 +1775,314 @@ fn paint_cell_text(
     stats
 }
 
+/// §18.8.1 `@textRotation`, as the three cases a painter has to tell apart.
+///
+/// One attribute with three meanings: `1..=90` is degrees **counter-clockwise**,
+/// `91..=180` is `value - 90` degrees **clockwise**, and `255` is not a
+/// rotation at all — it is Excel's *stacked* text, upright glyphs one under the
+/// next. Paint census, 1,247 workbooks / 1,902 rotated cells, and the corpus
+/// declares only five values: 951 at `90`, 40 at `180`, 184 at `60`, 48 at
+/// `45`, 679 stacked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CellRotation {
+    /// No rotation, and 99.994% of text cells.
+    None,
+    /// Degrees counter-clockwise from the cell's own baseline; negative for
+    /// the `91..=180` clockwise spellings.
+    Angled(f64),
+    /// One glyph per line, unrotated.
+    Stacked,
+}
+
+fn cell_rotation(align: &Alignment) -> CellRotation {
+    match align.text_rotation {
+        Some(255) => CellRotation::Stacked,
+        // `0` never reaches here — the reader filters it — but a rotation of
+        // zero degrees is the unrotated case either way.
+        Some(r @ 1..=90) => CellRotation::Angled(f64::from(r)),
+        Some(r @ 91..=180) => CellRotation::Angled(-f64::from(r - 90)),
+        // Out of §18.8.1's range: paint it flat rather than guess.
+        _ => CellRotation::None,
+    }
+}
+
+/// The longest run of text the cell can hold at angle θ, in the text's own
+/// frame.
+///
+/// A `W × H` box laid along θ covers `W·|cos θ| + H·|sin θ|` of the cell's
+/// width and `W·|sin θ| + H·|cos θ|` of its height, so a quarter turn may run
+/// the cell's whole *height* and an oblique angle gets whichever of the two
+/// constraints binds first. `H` is one line, which is what the corpus's angled
+/// cells are: a rotated header is a single string, and wrapping and *then*
+/// rotating would need the line count before the length that decides it.
+fn rotated_run_length(theta_deg: f64, b: &CellBox, line_h: f64) -> f64 {
+    let (s, c) = theta_deg.to_radians().sin_cos();
+    let (s, c) = (s.abs(), c.abs());
+    if c < 1e-9 {
+        return b.h;
+    }
+    let h = line_h.min(b.h);
+    ((b.w - h * s) / c)
+        .min((b.h - h * c) / s)
+        .max(0.0)
+        .min(b.w + b.h)
+}
+
+/// The block a run of laid-out commands occupies, in their own space:
+/// `(x, y, w, h)`, with the vertical edges taken from the font rather than
+/// from the baselines the commands carry.
+fn block_bounds(
+    m: &TextMeasurer,
+    cmds: &[DrawCommand],
+    fp: &FontProps,
+    ascent: f64,
+    descent: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
+    for cmd in cmds {
+        let DrawCommand::Text { position, text, .. } = cmd else {
+            continue;
+        };
+        let (x, base) = (f64::from(position.x.raw()), f64::from(position.y.raw()));
+        x0 = x0.min(x);
+        x1 = x1.max(x + width_of(m, fp, text));
+        y0 = y0.min(base - ascent);
+        y1 = y1.max(base + descent);
+    }
+    (x0.is_finite()).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// One rotated cell's text: laid out flush along its own baseline, then placed
+/// in the cell **by the page-axis alignment Excel keeps for it** and turned by
+/// a [`TransformMark`] bracket.
+///
+/// A bracket rather than a second painter, for two reasons that are really one:
+/// [`paint_cell_text`]'s rules (wrap, clip, `#######`) are stated in a box and
+/// do not care which way the box points, and the bracket is the only place a
+/// page coordinate is introduced — so the local commands come back out of the
+/// shared painter with [`MARGIN`] already in them and are shifted off it, which
+/// is cheaper than teaching every `text_cmd` call site a second origin.
+///
+/// **Alignment does not rotate with the text, and that is measured rather than
+/// assumed.** The obvious model — the alignment frame turns with the glyphs, so
+/// a 90° cell's `horizontal` runs up the column — is wrong: rendering a probe
+/// workbook of every rotation × `vertical` × `horizontal` combination through
+/// LibreOffice puts `horizontal` on the page's x axis and `vertical` on its y
+/// axis at every angle, quarter turn included. So the text is laid out flush,
+/// its finished block is measured, and *the block's upright bounding box* is
+/// what the two alignments place inside the cell's inset rect. Centre-on-centre
+/// then does the rest: `place_transform` turns the local box about its own
+/// centre before translating, so putting the local centre on the bounding box's
+/// centre lands the rotated block exactly where the alignment put it, at any
+/// angle and with no case split per quadrant.
+///
+/// **A rotated cell does not spill**: Excel keeps angled text inside its own
+/// cell, so the room the flat path would grow into is passed as zero and the
+/// run clips against the length the cell can hold instead.
+#[allow(clippy::too_many_arguments)]
+fn paint_rotated_cell_text(
+    out: &mut Vec<DrawCommand>,
+    m: &TextMeasurer,
+    theta_deg: f64,
+    text: &str,
+    numeric: bool,
+    font: &liteparse_ooxml::xlsx::Font,
+    align: &Alignment,
+    color: RgbColor,
+    b: &CellBox,
+    y: f64,
+) -> TextPaintStats {
+    let fp = font_props(font);
+    let (_, metrics) = m.measure("", &fp);
+    let (ascent, descent) = (
+        f64::from(f32::from(metrics.ascent)),
+        f64::from(f32::from(metrics.descent)),
+    );
+    let line_h = ascent + descent + f64::from(f32::from(metrics.leading));
+    let inset = f64::from(TEXT_INSET);
+
+    // Flush along the baseline and at the top of the cross axis: the finished
+    // block is what carries the cell's alignment, so applying it twice would
+    // double it.
+    let flush = Alignment {
+        horizontal: HorizontalAlign::Left,
+        vertical: VerticalAlign::Top,
+        ..align.clone()
+    };
+    let local_box = CellBox {
+        x: 0.0,
+        w: rotated_run_length(theta_deg, b, line_h) + 2.0 * inset,
+        h: b.w + b.h,
+        cols: b.cols.clone(),
+    };
+    let mut local = Vec::new();
+    let mut stats = paint_cell_text(
+        &mut local,
+        m,
+        text,
+        numeric,
+        font,
+        &flush,
+        color,
+        &local_box,
+        0.0,
+        (0.0, 0.0),
+        false,
+        None,
+    );
+    let Some((bx, by, bw, bh)) = block_bounds(m, &local, &fp, ascent, descent) else {
+        return stats;
+    };
+
+    // The cross extent the cell can hold once the block's own length is
+    // spoken for — the same two constraints `rotated_run_length` solves, read
+    // the other way round. A wrapped cell is the only one that can exceed it,
+    // and a quarter-turned one that did would run its lines out across the
+    // whole sheet rather than down its own column: 3 corpus cells wrap on an
+    // 8 pt column. Lines past it are cut, which is the cross-axis twin of the
+    // clip the flat path applies along the baseline.
+    let (s, c) = theta_deg.to_radians().sin_cos();
+    let (s, c) = (s.abs(), c.abs());
+    let cross_max = if c < 1e-9 {
+        b.w - 2.0 * inset
+    } else {
+        ((b.w - bw * c) / s).min((b.h - bw * s) / c)
+    }
+    .max(line_h);
+    let (bw, bh) = if bh > cross_max {
+        local.retain(|cmd| match cmd {
+            DrawCommand::Text { position, .. } => {
+                f64::from(position.y.raw()) + descent - by <= cross_max
+            }
+            _ => true,
+        });
+        stats.cross_clipped += 1;
+        match block_bounds(m, &local, &fp, ascent, descent) {
+            Some((_, _, w, h)) => (w, h),
+            None => return stats,
+        }
+    } else {
+        (bw, bh)
+    };
+
+    // The block's upright bounding box once turned, and where the two
+    // alignments put it inside the cell's inset rect. A block too big for the
+    // cell hangs out of the near edge rather than being centred on the
+    // overflow, which is Excel's behaviour and the flat path's.
+    let (rw, rh) = (bw * c + bh * s, bw * s + bh * c);
+    let slack_x = (b.w - 2.0 * inset - rw).max(0.0);
+    let slack_y = (b.h - 2.0 * inset - rh).max(0.0);
+    let dx = match align.horizontal {
+        HorizontalAlign::Center | HorizontalAlign::CenterContinuous => slack_x / 2.0,
+        HorizontalAlign::Right => slack_x,
+        HorizontalAlign::General if numeric => slack_x,
+        _ => 0.0,
+    };
+    let dy = match align.vertical {
+        VerticalAlign::Top => 0.0,
+        VerticalAlign::Center => slack_y / 2.0,
+        _ => slack_y,
+    };
+    // Centre of the turned block on the page, and the local box's own centre
+    // put on top of it.
+    let (cx, cy) = (b.x + inset + dx + rw / 2.0, y + inset + dy + rh / 2.0);
+
+    // The block's own offset comes off, leaving commands whose top-left is the
+    // local origin. `bx`/`by` are measured on the emitted commands, so the
+    // page `MARGIN` the shared painter bakes into every one of them is already
+    // inside them and comes off with the rest.
+    for cmd in &mut local {
+        cmd.shift(Pt::new(-(bx as f32)), Pt::new(-(by as f32)));
+    }
+    out.push(DrawCommand::Transform(TransformMark::Begin(
+        ShapeTransform {
+            origin: PtOffset::new(
+                Pt::new(MARGIN + (cx - bw / 2.0) as f32),
+                Pt::new(MARGIN + (cy - bh / 2.0) as f32),
+            ),
+            // The bracket's angle is clockwise-positive (§20.1.10.3, and what
+            // the rasterizer's `from_rotate_at` takes); `theta_deg` is
+            // counter-clockwise, which is §18.8.1's.
+            rotation: Dimension::new((-theta_deg * 60_000.0).round() as i64),
+            flip_h: false,
+            flip_v: false,
+            extent: PtSize::new(Pt::new(bw as f32), Pt::new(bh as f32)),
+        },
+    )));
+    out.append(&mut local);
+    out.push(DrawCommand::Transform(TransformMark::End));
+    stats.rotated += 1;
+    stats
+}
+
+/// One stacked cell's text (`@textRotation="255"`): the same glyphs, upright,
+/// one under the next.
+///
+/// Not a rotation and so not a bracket — it is a *line breaking* rule, and it
+/// is expressed as one: the string becomes one character per line and the flat
+/// painter lays it out, which is what keeps the alignment, the font and the
+/// vertical placement the cell's own. Excel breaks between characters, not
+/// grapheme clusters, and every stacked cell in the corpus is ASCII.
+///
+/// The lines are cut to what the row is tall enough to hold, the vertical twin
+/// of the horizontal clip: 40 stacked glyphs in a 15 pt row would otherwise
+/// paint down over every row beneath it, and the command stream has no clip.
+#[allow(clippy::too_many_arguments)]
+fn paint_stacked_cell_text(
+    out: &mut Vec<DrawCommand>,
+    m: &TextMeasurer,
+    text: &str,
+    numeric: bool,
+    font: &liteparse_ooxml::xlsx::Font,
+    align: &Alignment,
+    color: RgbColor,
+    b: &CellBox,
+    y: f64,
+) -> TextPaintStats {
+    let fp = font_props(font);
+    let (_, metrics) = m.measure("", &fp);
+    let line_h = f64::from(f32::from(metrics.ascent))
+        + f64::from(f32::from(metrics.descent))
+        + f64::from(f32::from(metrics.leading));
+    let room = (b.h - 2.0 * f64::from(TEXT_INSET)).max(0.0);
+    let fits = if line_h > 0.0 {
+        (room / line_h).floor() as usize
+    } else {
+        0
+    }
+    .max(1);
+
+    let glyphs: Vec<char> = text.chars().filter(|c| *c != '\n').collect();
+    let clipped = glyphs.len() > fits;
+    let stacked: String = glyphs
+        .iter()
+        .take(fits)
+        .map(char::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut stats = paint_cell_text(
+        out,
+        m,
+        &stacked,
+        numeric,
+        font,
+        align,
+        color,
+        b,
+        y,
+        (0.0, 0.0),
+        false,
+        None,
+    );
+    stats.stacked += 1;
+    if clipped {
+        stats.cross_clipped += 1;
+    }
+    stats
+}
+
 /// One cell's box on a page, grid-relative: the rectangle plus the retained
 /// columns it covers, which is what the spill rule needs to find the
 /// neighbours it may run into.
@@ -2047,27 +2373,38 @@ impl SheetGeometry {
                         .color
                         .and_then(|c| wb.resolve_color(c))
                         .map_or(RgbColor::BLACK, rgb_of);
-                    stats.add(paint_cell_text(
-                        &mut cmds,
-                        m,
-                        text,
-                        matches!(cell.value, CellValue::Number(_)),
-                        &wb.styles.font(style),
-                        &wb.styles.alignment(style),
-                        color,
-                        &b,
-                        y,
-                        self.spill_room(&occupied, &b.cols),
-                        !cells.iter().any(|n| {
-                            n.at.col == cell.at.col + 1
-                                && wb.display_text(n).is_some_and(|t| !t.trim().is_empty())
-                        }),
-                        // Against the trimmed string the painter draws, not
-                        // the padded one the format produced: `display_text`
-                        // keeps `_(`'s spaces and `trim` takes them off both
-                        // ends, which moves the split.
-                        fill_split_of(wb, cell, &text),
-                    ));
+                    let numeric = matches!(cell.value, CellValue::Number(_));
+                    let font = wb.styles.font(style);
+                    let align = wb.styles.alignment(style);
+                    stats.add(match cell_rotation(&align) {
+                        CellRotation::Angled(deg) => paint_rotated_cell_text(
+                            &mut cmds, m, deg, text, numeric, &font, &align, color, &b, y,
+                        ),
+                        CellRotation::Stacked => paint_stacked_cell_text(
+                            &mut cmds, m, text, numeric, &font, &align, color, &b, y,
+                        ),
+                        CellRotation::None => paint_cell_text(
+                            &mut cmds,
+                            m,
+                            text,
+                            numeric,
+                            &font,
+                            &align,
+                            color,
+                            &b,
+                            y,
+                            self.spill_room(&occupied, &b.cols),
+                            !cells.iter().any(|n| {
+                                n.at.col == cell.at.col + 1
+                                    && wb.display_text(n).is_some_and(|t| !t.trim().is_empty())
+                            }),
+                            // Against the trimmed string the painter draws,
+                            // not the padded one the format produced:
+                            // `display_text` keeps `_(`'s spaces and `trim`
+                            // takes them off both ends, which moves the split.
+                            fill_split_of(wb, cell, &text),
+                        ),
+                    });
                 }
             }
         }
@@ -3749,13 +4086,18 @@ mod tests {
       </fonts>
       <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
       <borders count="1"><border/></borders>
-      <cellXfs count="6">
+      <cellXfs count="11">
         <xf numFmtId="0" fontId="0"/>
         <xf numFmtId="0" fontId="0"><alignment horizontal="right"/></xf>
         <xf numFmtId="0" fontId="0"><alignment horizontal="center"/></xf>
         <xf numFmtId="0" fontId="0"><alignment wrapText="1"/></xf>
         <xf numFmtId="0" fontId="1"/>
         <xf numFmtId="0" fontId="0"><alignment vertical="top"/></xf>
+        <xf numFmtId="0" fontId="0"><alignment textRotation="90"/></xf>
+        <xf numFmtId="0" fontId="0"><alignment textRotation="180"/></xf>
+        <xf numFmtId="0" fontId="0"><alignment textRotation="255"/></xf>
+        <xf numFmtId="0" fontId="0"><alignment textRotation="90" vertical="top"/></xf>
+        <xf numFmtId="0" fontId="0"><alignment textRotation="45"/></xf>
       </cellXfs>
     </styleSheet>"#;
 
@@ -4012,5 +4354,200 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].3, red, "row customFormat font");
         assert_eq!(t[1].3, red, "col style font");
+    }
+
+    // ── §18.8.1 rotation ────────────────────────────────────────────────────
+
+    /// Every bracket on a page as `(rotation in 60,000ths, origin, extent,
+    /// the turned bounding box its commands occupy)` — the last computed the
+    /// way `raster.rs::place_transform` does, so a test asserts about where
+    /// the *rasterizer* will put the glyphs rather than about local
+    /// coordinates only the producer can see.
+    struct Bracket {
+        rotation: i64,
+        /// The box the sampled points occupy on the page.
+        bbox: (f32, f32, f32, f32),
+        /// The first run's baseline start and the point one em above it, both
+        /// turned onto the page — the glyphs' own two axes, which is what says
+        /// which way the text reads.
+        baseline: (f32, f32),
+        ascender: (f32, f32),
+    }
+
+    fn brackets(page: &LayoutedPage) -> Vec<Bracket> {
+        let mut out: Vec<Bracket> = Vec::new();
+        let mut open: Option<ShapeTransform> = None;
+        let mut runs = 0usize;
+        for cmd in &page.commands {
+            match cmd {
+                DrawCommand::Transform(TransformMark::Begin(t)) => {
+                    open = Some(t.clone());
+                    runs = 0;
+                    out.push(Bracket {
+                        rotation: t.rotation.raw(),
+                        bbox: (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
+                        baseline: (0.0, 0.0),
+                        ascender: (0.0, 0.0),
+                    });
+                }
+                DrawCommand::Transform(TransformMark::End) => {
+                    open.take().expect("End without Begin");
+                }
+                DrawCommand::Text {
+                    position,
+                    font_size,
+                    ..
+                } => {
+                    let Some(t) = open.as_ref() else { continue };
+                    let b = out.last_mut().expect("a run inside no bracket");
+                    let (cx, cy) = (t.extent.width.raw() / 2.0, t.extent.height.raw() / 2.0);
+                    let (sin, cos) = (t.rotation.raw() as f32 / 60_000.0).to_radians().sin_cos();
+                    let place = |px: f32, py: f32| {
+                        let (dx, dy) = (px - cx, py - cy);
+                        (
+                            t.origin.x.raw() + cx + dx * cos - dy * sin,
+                            t.origin.y.raw() + cy + dx * sin + dy * cos,
+                        )
+                    };
+                    let baseline = place(position.x.raw(), position.y.raw());
+                    let ascender = place(position.x.raw(), position.y.raw() - font_size.raw());
+                    for (gx, gy) in [baseline, ascender] {
+                        b.bbox = (
+                            b.bbox.0.min(gx),
+                            b.bbox.1.min(gy),
+                            b.bbox.2.max(gx),
+                            b.bbox.3.max(gy),
+                        );
+                    }
+                    if runs == 0 {
+                        b.baseline = baseline;
+                        b.ascender = ascender;
+                    }
+                    runs += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_none(), "a bracket was left open");
+        out
+    }
+
+    /// §18.8.1's two quarter turns are opposite rotations of the same size,
+    /// and the bracket's angle is the *clockwise* one §20.1.10.3 asks for:
+    /// `textRotation="90"` reads up the page, `"180"` (90° clockwise) reads
+    /// down it.
+    #[test]
+    fn a_quarter_turn_brackets_its_text_at_ninety_degrees_either_way() {
+        let nx = texted(
+            r#"<worksheet><cols><col min="1" max="2" width="9" customWidth="1"/></cols><sheetData>
+            <row r="1" ht="60"><c r="A1" s="6" t="inlineStr"><is><t>up</t></is></c><c r="B1" s="7" t="inlineStr"><is><t>down</t></is></c></row>
+        </sheetData></worksheet>"#,
+        );
+        let b = brackets(&nx.layouts[0]);
+        assert_eq!(b.len(), 2, "one bracket per rotated cell");
+        assert_eq!(
+            b[0].rotation, -5_400_000,
+            "textRotation=90 turns counter-clockwise"
+        );
+        assert_eq!(b[1].rotation, 5_400_000, "textRotation=180 turns clockwise");
+        assert_eq!(nx.text_stats.rotated, 2);
+        assert_eq!(nx.text_stats.stacked, 0);
+
+        // The glyphs' up direction stands upright in the local space, so a
+        // quarter turn must lay it flat on the page — to the left of the
+        // baseline for the turn that reads up the page, to the right for the
+        // one that reads down it.
+        for k in &b {
+            assert!(
+                (k.ascender.1 - k.baseline.1).abs() < 0.01,
+                "the em lies flat at {}: {:?} {:?}",
+                k.rotation,
+                k.baseline,
+                k.ascender
+            );
+        }
+        assert!(b[0].ascender.0 < b[0].baseline.0 - 5.0, "90° reads up");
+        assert!(b[1].ascender.0 > b[1].baseline.0 + 5.0, "180° reads down");
+    }
+
+    /// The alignment does **not** turn with the glyphs: `vertical` moves the
+    /// block up and down the page and `horizontal` moves it left and right, at
+    /// every angle. Measured against LibreOffice on a probe workbook of every
+    /// rotation × alignment pair, and the opposite of what a rotated frame
+    /// would do.
+    #[test]
+    fn rotation_leaves_the_alignment_on_the_pages_own_axes() {
+        let nx = texted(
+            r#"<worksheet><cols><col min="1" max="2" width="9" customWidth="1"/></cols><sheetData>
+            <row r="1" ht="80"><c r="A1" s="6" t="inlineStr"><is><t>ab</t></is></c><c r="B1" s="9" t="inlineStr"><is><t>ab</t></is></c></row>
+        </sheetData></worksheet>"#,
+        );
+        let b = brackets(&nx.layouts[0]);
+        let (bottom, top) = (b[0].bbox, b[1].bbox);
+        // Same angle, same string, same box — only `vertical` differs, and it
+        // moves the block down the page rather than along its baseline.
+        assert_eq!(b[0].rotation, b[1].rotation);
+        assert!(
+            top.1 < bottom.1 && top.3 < bottom.3,
+            "vertical=top sits above the default bottom: top {top:?} bottom {bottom:?}"
+        );
+        // Both stay inside the row: 80 pt tall, one page, margin at the top.
+        assert!(top.1 >= MARGIN - 1.0 && bottom.3 <= MARGIN + 80.0 + 1.0);
+    }
+
+    /// Stacked is not a rotation: no bracket, one command per glyph, and the
+    /// stack is cut to the rows the cell is tall — Excel clips vertically,
+    /// and a stack that overflowed would paint over every row beneath it.
+    #[test]
+    fn stacked_text_is_one_upright_glyph_per_line_cut_to_the_row() {
+        let nx = texted(
+            r#"<worksheet><cols><col min="1" max="1" width="9" customWidth="1"/></cols><sheetData>
+            <row r="1" ht="60"><c r="A1" s="8" t="inlineStr"><is><t>abc</t></is></c></row>
+            <row r="2" ht="12"><c r="A2" s="8" t="inlineStr"><is><t>abcdefghij</t></is></c></row>
+        </sheetData></worksheet>"#,
+        );
+        assert!(
+            brackets(&nx.layouts[0]).is_empty(),
+            "stacked carries no bracket"
+        );
+        assert_eq!(nx.text_stats.stacked, 2);
+        assert_eq!(nx.text_stats.rotated, 0);
+        assert_eq!(nx.text_stats.cross_clipped, 1, "only the short row cuts");
+
+        let t = texts(&nx.layouts[0]);
+        let tall: Vec<&(String, f32, f32, RgbColor)> =
+            t.iter().filter(|c| c.2 < MARGIN + 60.0).collect();
+        assert_eq!(
+            tall.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"],
+            "one glyph per line, in reading order"
+        );
+        // Each glyph is a line below the one before it, and they share a column.
+        assert!(tall[1].2 > tall[0].2 && tall[2].2 > tall[1].2);
+        assert_eq!(tall[0].1, tall[1].1);
+        // The 12 pt row holds one line of an 11 pt font, so nine glyphs go.
+        assert_eq!(t.len() - tall.len(), 1);
+    }
+
+    /// The parse is not a rendering: a rotated cell's `TextItem` is the same
+    /// cell box, with the same text, that an unrotated one would have. The
+    /// rotation lives in the paint alone.
+    #[test]
+    fn rotation_never_reaches_the_items() {
+        let sheet = |s: &str| {
+            format!(
+                r#"<worksheet><cols><col min="1" max="1" width="9" customWidth="1"/></cols><sheetData>
+                <row r="1" ht="60"><c r="A1"{s} t="inlineStr"><is><t>header</t></is></c></row>
+            </sheetData></worksheet>"#
+            )
+        };
+        let flat = texted(&sheet(""));
+        for style in [r#" s="6""#, r#" s="7""#, r#" s="8""#, r#" s="10""#] {
+            assert_eq!(
+                format!("{:?}", texted(&sheet(style)).pages[0].text_items),
+                format!("{:?}", flat.pages[0].text_items),
+                "{style} moved an item"
+            );
+        }
     }
 }
