@@ -209,6 +209,12 @@ pub struct Sheet {
     /// drawing part as `pics`. Titles, form labels, instructions — content
     /// no cell holds.
     pub shapes: Vec<crate::xlsx::drawings::SheetShape>,
+    /// The drawing part's *paint* channel: every top-level `sp`/`grpSp`/
+    /// `cxnSp` as the shared DrawingML shape tree, fills and outlines and
+    /// group child spaces intact. Parallel to `shapes` — a text-bearing
+    /// shape appears in both, one carrying its words, the other its box's
+    /// ink — and never feeds items or markdown.
+    pub ink: Vec<crate::xlsx::drawings::SheetInk>,
     pub stats: SheetStats,
 }
 

@@ -100,6 +100,27 @@ pub enum TransformMark {
     End,
 }
 
+/// Brackets a span of commands that belongs to the page's *floating drawing
+/// layer* — Excel's shapes and their text, which draw above the grid and the
+/// cell values. Draws nothing.
+///
+/// The rasterizer paints a bracketed span in its `Float` pass, in stream
+/// order, instead of each command's native pass — the span-shaped version of
+/// [`DrawCommand::Image`]'s `float` flag. A bracket rather than a flag for
+/// the reason [`TransformMark`] is one: `Text` is constructed at ~100 sites,
+/// and only the XLSX shape layer ever floats a span. Emitted by the XLSX
+/// path alone; DOCX and PPTX pages contain none and are unaffected.
+///
+/// Nesting is flat: each floated span opens and closes its own bracket and
+/// none contains another.
+#[derive(Debug, Clone)]
+pub enum FloatMark {
+    /// Opens a floating span.
+    Begin,
+    /// Closes it, restoring native pass routing.
+    End,
+}
+
 /// A positioned drawing command — absolute page coordinates.
 #[derive(Debug, Clone)]
 pub enum DrawCommand {
@@ -198,6 +219,9 @@ pub enum DrawCommand {
     /// §20.1.7.6: brackets one shape's commands with the placement that maps
     /// them onto the page. Draws nothing. PPTX only — see [`TransformMark`].
     Transform(TransformMark),
+    /// Brackets a span that paints in the rasterizer's `Float` pass. Draws
+    /// nothing. XLSX only — see [`FloatMark`].
+    Float(FloatMark),
     /// §20.1.8 shape draw command — a resolved geometry with fill, stroke,
     /// and optional effects. `paths` are in shape-local Pt; the painter
     /// applies the placement transform (origin/rotation/flip).
@@ -400,6 +424,8 @@ impl DrawCommand {
                 t.origin.y += dy;
             }
             DrawCommand::Transform(TransformMark::End) => {}
+            // Pass routing, not geometry — nothing to shift.
+            DrawCommand::Float(_) => {}
         }
     }
 
@@ -444,6 +470,7 @@ impl DrawCommand {
             // theirs shape-locally. The one caller (`@vertOverflow="clip"`)
             // works inside a single shape's body, where no bracket exists yet.
             DrawCommand::Transform(_) => None,
+            DrawCommand::Float(_) => None,
         }
     }
 
@@ -601,6 +628,8 @@ mod tests {
             // but its `End` half has none, so the pair is tested on its own in
             // `shift_moves_only_a_brackets_origin`.
             DrawCommand::Transform(_) => unreachable!("brackets are tested separately"),
+            // Pass routing: no coordinates at all, nothing for `shift` to move.
+            DrawCommand::Float(_) => unreachable!("markers are tested separately"),
         }
     }
 

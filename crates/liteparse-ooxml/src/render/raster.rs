@@ -44,7 +44,7 @@ use crate::render::dimension::Pt;
 use crate::render::fonts::{FontRegistry, FontStyle, TypefaceEntry, wght_location};
 use crate::render::geometry::{PtOffset, PtRect};
 use crate::render::layout::draw_command::{
-    DrawCommand, LayoutedPage, ResolvedDashPattern, ResolvedFill, ResolvedLineCap,
+    DrawCommand, FloatMark, LayoutedPage, ResolvedDashPattern, ResolvedFill, ResolvedLineCap,
     ResolvedLineJoin, ResolvedStroke, TransformMark,
 };
 use crate::render::resolve::color::RgbColor;
@@ -199,6 +199,11 @@ pub fn rasterize_page(
         // walks the whole command list, so a bracket skipped as "not my pass"
         // would leave the pass that does paint inside it in the wrong space.
         let mut local = Transform::identity();
+        // Whether the cursor is inside a `Float` bracket — also updated
+        // before the pass filter, for the same reason the transform is: the
+        // bracket reroutes commands *between* passes, so every pass must see
+        // it to agree on who paints what.
+        let mut floating = false;
         for cmd in &page.commands {
             if let DrawCommand::Transform(mark) = cmd {
                 local = match mark {
@@ -209,7 +214,18 @@ pub fn rasterize_page(
                 };
                 continue;
             }
-            if raster_pass(cmd) != Some(pass) {
+            if let DrawCommand::Float(mark) = cmd {
+                floating = matches!(mark, FloatMark::Begin);
+                continue;
+            }
+            // A floated span paints in the `Float` pass in stream order,
+            // whatever its commands' native passes say; a metadata command
+            // (`raster_pass` = None) stays a non-painter inside one too.
+            let effective = match raster_pass(cmd) {
+                Some(_) if floating => Some(RasterPass::Float),
+                p => p,
+            };
+            if effective != Some(pass) {
                 continue;
             }
             let device = device.pre_concat(local);
@@ -316,7 +332,8 @@ pub fn rasterize_page(
                 | DrawCommand::InternalLink { .. }
                 | DrawCommand::NamedDestination { .. }
                 | DrawCommand::Outline(_)
-                | DrawCommand::Transform(_) => {}
+                | DrawCommand::Transform(_)
+                | DrawCommand::Float(_) => {}
             }
         }
     }
@@ -367,8 +384,10 @@ fn raster_pass(cmd: &DrawCommand) -> Option<RasterPass> {
         | DrawCommand::NamedDestination { .. }
         | DrawCommand::Outline(_)
         // Handled before this filter runs — a bracket belongs to no single
-        // pass, it changes the space every pass paints the run in.
-        | DrawCommand::Transform(_) => None,
+        // pass, it changes the space (or, for `Float`, the layer) every pass
+        // paints the run in.
+        | DrawCommand::Transform(_)
+        | DrawCommand::Float(_) => None,
     }
 }
 

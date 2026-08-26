@@ -71,6 +71,8 @@ fn estimate_cursor_y(
             // §20.1.7.6: a placement marker, and one this function never sees
             // — it runs over DOCX section pages, which carry no brackets.
             DrawCommand::Transform(_) => continue,
+            // Pass routing, XLSX only — same story: no DOCX page carries one.
+            DrawCommand::Float(_) => continue,
             // Annotations mark content that is already accounted for by the
             // command underneath them, and a named destination is a point.
             // Neither adds extent of its own.

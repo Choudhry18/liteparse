@@ -51,6 +51,10 @@ name = "xlsx_layout_check"
 required-features = ["xlsx-native"]
 
 [[example]]
+name = "xlsx_ink_recall"
+required-features = ["xlsx-native"]
+
+[[example]]
 name = "xlsx_raster_dump"
 required-features = ["xlsx-native"]
 

@@ -123,11 +123,44 @@ pub struct SheetShape {
     pub body: crate::pptx::text::TextBody,
 }
 
+/// One top-level drawing object on the *paint* channel of a drawing part —
+/// parallel to `shapes` (text) and `pics` (images) and feeding neither.
+///
+/// Holds the object's verbatim XML rather than a parsed tree: a plain parse
+/// never paints, and parsing 25,948 corpus shape trees it will never look at
+/// measured at +67% on the most shape-heavy workbook. [`SheetInk::shape`]
+/// parses on demand — the painter is the only caller.
+#[derive(Clone, Debug)]
+pub struct SheetInk {
+    pub anchor: PicAnchor,
+    /// The `sp`/`grpSp`/`cxnSp` element, sliced verbatim out of the part.
+    xml: Vec<u8>,
+}
+
+impl SheetInk {
+    /// The object as the shared DrawingML shape tree — groups, child spaces,
+    /// MCE and all. `None` for an object the shared model cannot parse
+    /// (fail-open: it costs its ink, nothing else).
+    ///
+    /// A *tree* rather than a flattened list because the placement of a
+    /// grouped child only exists relative to its group's child space
+    /// (`chOff`/`chExt`), and composing that is the geometry pass's job
+    /// ([`crate::pptx::apply_slide_geometry`]), not the reader's. Transforms
+    /// are as declared, in the drawing's EMU space; the anchor is what
+    /// places the tree's outer box on the page.
+    pub fn shape(&self) -> Option<crate::pptx::shapes::Shape> {
+        crate::pptx::shapes::parse_single_object(&self.xml)
+            .ok()
+            .flatten()
+    }
+}
+
 /// Everything one drawing part yields.
 #[derive(Default)]
 pub(crate) struct DrawingContent {
     pub(crate) pics: Vec<RawPic>,
     pub(crate) shapes: Vec<SheetShape>,
+    pub(crate) ink: Vec<SheetInk>,
 }
 
 /// An `xdr:sp` currently open in the walk, before its anchor is known.
@@ -226,6 +259,9 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
     let mut pos: Option<(i64, i64)> = None;
     let mut object_depth: u32 = 0;
     let mut pic_depth: u32 = 0;
+    // Every anchor's resolved placement, in document order — the join key the
+    // ink pass uses to place its object slices.
+    let mut anchors: Vec<PicAnchor> = Vec::new();
     let mut pending: Vec<(Option<String>, Option<String>)> = Vec::new(); // (name, rel_id)
 
     // The sp currently open, if any. `xdr:sp` cannot nest (only groups
@@ -422,6 +458,7 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
                         for (name, body) in pending_shapes.drain(..) {
                             out.shapes.push(SheetShape { anchor, name, body });
                         }
+                        anchors.push(anchor);
                     }
                 }
                 b"pic" if pic_depth > 0 => {
@@ -464,7 +501,73 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
         }
         buf.clear();
     }
+    out.ink = extract_ink(data, &anchors);
     Ok(out)
+}
+
+/// The paint channel: slice every top-level `sp`/`grpSp`/`cxnSp` out of the
+/// part verbatim and parse each through the shared DrawingML shape tree.
+///
+/// A second pass over the same bytes rather than a branch of the main walk,
+/// because the main walk *descends* into an `sp` for its text while this pass
+/// consumes the whole subtree in one slice — one cursor cannot do both. The
+/// two stay aligned on anchors by construction: both count the same
+/// non-empty anchor Start/End events and both skip `mc:Fallback` (the
+/// prefer-Choice rule), so anchor *i* here is `anchors[i]` there.
+///
+/// Fail-open at every level: an object that fails to parse costs its ink,
+/// never its sibling's, and never the part's text or pictures.
+fn extract_ink(data: &[u8], anchors: &[PicAnchor]) -> Vec<SheetInk> {
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut skip_buf = Vec::new();
+    let mut out = Vec::new();
+    let mut anchor_idx = 0usize;
+    loop {
+        let tag_start = reader.buffer_position() as usize;
+        let event = match reader.read_event_into(&mut buf) {
+            Ok(ev) => ev,
+            Err(_) => return out,
+        };
+        match event {
+            Event::Eof => break,
+            Event::Start(ref e) => match local_name(e.name().as_ref()) {
+                b"Fallback" => {
+                    let end = e.to_end().into_owned();
+                    if reader.read_to_end_into(end.name(), &mut skip_buf).is_err() {
+                        return out;
+                    }
+                }
+                // Any of these seen here is top-level by construction:
+                // nested ones are inside a subtree this arm already consumed.
+                b"sp" | b"grpSp" | b"cxnSp" => {
+                    let end = e.to_end().into_owned();
+                    if reader.read_to_end_into(end.name(), &mut skip_buf).is_err() {
+                        return out;
+                    }
+                    let tag_end = reader.buffer_position() as usize;
+                    if let Some(anchor) = anchors.get(anchor_idx) {
+                        out.push(SheetInk {
+                            anchor: *anchor,
+                            xml: data[tag_start..tag_end].to_vec(),
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Event::End(ref e) => {
+                if matches!(
+                    local_name(e.name().as_ref()),
+                    b"oneCellAnchor" | b"twoCellAnchor" | b"absoluteAnchor"
+                ) {
+                    anchor_idx += 1;
+                }
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -776,5 +879,120 @@ second line"
                <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
         );
         assert!(parse_drawing(xml.as_bytes()).unwrap().shapes.is_empty());
+    }
+
+    // ── the ink channel ──────────────────────────────────────────────────
+
+    use crate::pptx::shapes::ShapeKind;
+
+    /// A textless filled rectangle — the population the text channel
+    /// rightly drops (6,359 on the corpus) — survives on the ink channel,
+    /// fill and geometry intact, under the anchor it was placed by.
+    #[test]
+    fn a_textless_filled_shape_reaches_ink_but_not_shapes() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="914400" cy="457200"/>
+                 <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="Box"/></xdr:nvSpPr>
+                   <xdr:spPr><a:prstGeom prst="rect"/><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></xdr:spPr></xdr:sp>
+               <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert!(content.shapes.is_empty());
+        assert_eq!(content.ink.len(), 1);
+        assert_eq!(content.ink[0].anchor.from_cell().unwrap().col, 2);
+        let shape = content.ink[0].shape().unwrap();
+        let ShapeKind::AutoShape(auto) = &shape.kind else {
+            panic!("expected an AutoShape");
+        };
+        let props = auto.properties.as_ref().unwrap();
+        assert!(props.fill.is_some());
+        assert!(props.geometry.is_some());
+    }
+
+    /// A group keeps its child space and its members — the placement facts
+    /// `apply_slide_geometry` composes with — and a connector reaches ink
+    /// as a Connector.
+    #[test]
+    fn a_group_keeps_its_child_space_and_a_connector_reaches_ink() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+                 <xdr:grpSp>
+                   <xdr:nvGrpSpPr><xdr:cNvPr id="1" name="G"/></xdr:nvGrpSpPr>
+                   <xdr:grpSpPr><a:xfrm><a:off x="100" y="200"/><a:ext cx="1000" cy="2000"/>
+                     <a:chOff x="10" y="20"/><a:chExt cx="100" cy="200"/></a:xfrm></xdr:grpSpPr>
+                   <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="2" name="A"/></xdr:nvSpPr>
+                     <xdr:spPr><a:xfrm><a:off x="10" y="20"/><a:ext cx="50" cy="100"/></a:xfrm>
+                       <a:prstGeom prst="ellipse"/><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></xdr:spPr></xdr:sp>
+                   <xdr:cxnSp><xdr:nvCxnSpPr><xdr:cNvPr id="3" name="L"/></xdr:nvCxnSpPr>
+                     <xdr:spPr><a:prstGeom prst="line"/><a:ln w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></xdr:spPr></xdr:cxnSp>
+                 </xdr:grpSp>
+               <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#
+        );
+        let content = parse_drawing(xml.as_bytes()).unwrap();
+        assert_eq!(content.ink.len(), 1);
+        let shape = content.ink[0].shape().unwrap();
+        let ShapeKind::Group(group) = &shape.kind else {
+            panic!("expected a Group");
+        };
+        assert_eq!(group.child_offset.unwrap().x.raw(), 10);
+        assert_eq!(group.child_extent.unwrap().width.raw(), 100);
+        assert_eq!(group.children.len(), 2);
+        assert!(matches!(group.children[0].kind, ShapeKind::AutoShape(_)));
+        assert!(matches!(group.children[1].kind, ShapeKind::Connector(_)));
+    }
+
+    /// Two anchors, two objects: each ink entry carries its own anchor —
+    /// the alignment the two-pass design must not lose.
+    #[test]
+    fn ink_objects_keep_their_own_anchors() {
+        let sp = |id: u32| {
+            format!(
+                r#"<xdr:sp><xdr:nvSpPr><xdr:cNvPr id="{id}" name="S{id}"/></xdr:nvSpPr>
+                   <xdr:spPr><a:prstGeom prst="rect"/><a:noFill/></xdr:spPr></xdr:sp>"#
+            )
+        };
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+               <xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="1" cy="1"/>{}<xdr:clientData/></xdr:oneCellAnchor>
+               <xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>7</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>9</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="1" cy="1"/>{}<xdr:clientData/></xdr:oneCellAnchor>
+               </xdr:wsDr>"#,
+            sp(1),
+            sp(2)
+        );
+        let ink = parse_drawing(xml.as_bytes()).unwrap().ink;
+        assert_eq!(ink.len(), 2);
+        assert_eq!(ink[0].anchor.from_cell().unwrap().col, 1);
+        assert_eq!(ink[1].anchor.from_cell().unwrap().col, 7);
+        assert_eq!(ink[1].shape().unwrap().non_visual.name, "S2");
+    }
+
+    /// MCE on the ink channel follows the reader's prefer-Choice rule: a
+    /// `Fallback` object never paints, so nothing is placed twice.
+    #[test]
+    fn ink_skips_mce_fallback_objects() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS} xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+               <xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="1" cy="1"/>
+                 <mc:AlternateContent>
+                   <mc:Choice Requires="x"><xdr:sp><xdr:nvSpPr><xdr:cNvPr id="1" name="Live"/></xdr:nvSpPr>
+                     <xdr:spPr><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></xdr:spPr></xdr:sp></mc:Choice>
+                   <mc:Fallback><xdr:sp><xdr:nvSpPr><xdr:cNvPr id="2" name="Dead"/></xdr:nvSpPr>
+                     <xdr:spPr><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></xdr:spPr></xdr:sp></mc:Fallback>
+                 </mc:AlternateContent>
+               <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        let ink = parse_drawing(xml.as_bytes()).unwrap().ink;
+        assert_eq!(ink.len(), 1);
+        assert_eq!(ink[0].shape().unwrap().non_visual.name, "Live");
     }
 }

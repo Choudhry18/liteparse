@@ -52,7 +52,7 @@ pub mod styles;
 pub mod text;
 mod xml;
 
-pub use drawings::{CellAnchor, PicAnchor, SheetPic, SheetShape};
+pub use drawings::{CellAnchor, PicAnchor, SheetInk, SheetPic, SheetShape};
 pub use package::{SheetEntry, WorkbookPackage, walk};
 pub use refs::{CellRef, RangeRef, column_label, parse_cell, parse_column, parse_range};
 pub use sheet::{Cell, CellValue, ColInfo, Hyperlink, Row, Sheet, SheetStats, StyledBlank};
@@ -77,11 +77,16 @@ pub struct Workbook {
     /// undo that.
     pub shared_strings: Vec<RichText>,
     pub styles: Styles,
-    /// `xl/theme/theme1.xml`'s colour scheme, the other half of colour
-    /// resolution — see [`Workbook::resolve_color`]. `None` when the workbook
-    /// ships no theme part (0.6% of the corpus), which makes every `theme=`
-    /// reference resolve to the consumer's default rather than to black.
-    pub theme: Option<crate::model::ThemeColorScheme>,
+    /// `xl/theme/theme1.xml`, whole — the other half of colour resolution
+    /// (see [`Workbook::resolve_color`]). `styles.rs` reads only its colour
+    /// scheme (through the SpreadsheetML index swap); the drawing paint
+    /// layer also needs `fill_styles`/`line_styles` (for `a:fillRef`/
+    /// `a:lnRef` on floating shapes) and the font scheme, which is why the
+    /// full part is kept rather than the scheme alone. `None` when the
+    /// workbook ships no theme part (0.6% of the corpus), which makes every
+    /// `theme=` reference resolve to the consumer's default rather than to
+    /// black.
+    pub theme: Option<crate::model::Theme>,
     /// Serial dates count from 1904-01-01 rather than 1899-12-30.
     pub date1904: bool,
     /// Sheets named in `<sheets>` that hold no cell grid — chartsheets and
@@ -178,8 +183,10 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
                                     }
                                 }
                                 // Text shapes are complete as parsed — no
-                                // media, no rels — so they attach directly.
+                                // media, no rels — so they attach directly,
+                                // and the paint channel with them.
                                 s.shapes = content.shapes;
+                                s.ink = content.ink;
                             }
                             Err(e) => {
                                 log::warn!("drawing part {drawing_path} failed to parse: {e}")
@@ -229,7 +236,7 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
     let theme =
         pkg.theme_xml.as_deref().and_then(|xml| {
             match crate::docx::parse::theme::parse_theme(xml) {
-                Ok(t) => Some(t.color_scheme),
+                Ok(t) => Some(t),
                 Err(e) => {
                     log::warn!("unreadable theme part: {e}");
                     None
@@ -254,7 +261,8 @@ impl Workbook {
     /// supplies the default, because it is black for text and white for a
     /// background.
     pub fn resolve_color(&self, color: styles::ColorRef) -> Option<[u8; 3]> {
-        self.styles.resolve_color(color, self.theme.as_ref())
+        self.styles
+            .resolve_color(color, self.theme.as_ref().map(|t| &t.color_scheme))
     }
 
     /// The text of a cell, resolving a shared-string index against the table.

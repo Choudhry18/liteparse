@@ -558,6 +558,43 @@ pub fn parse_shape_tree(data: &[u8]) -> Result<Vec<Shape>> {
     Ok(parse_slide_part(data)?.shapes)
 }
 
+/// Parse one drawing object — an `sp`, `grpSp`, or `cxnSp` element sliced
+/// verbatim out of a part — into the lowered [`Shape`] model.
+///
+/// Exists for the SpreadsheetML drawing reader: an `xdr:sp` carries the same
+/// CT_Shape content model as a `p:sp` (quick-xml's serde layer matches local
+/// names with prefixes stripped, the same reading `parse_text_body` relies
+/// on), so the XLSX paint layer reuses this module's tree — `spPr`, `style`,
+/// group child spaces, MCE — instead of growing a second parser for it.
+///
+/// Any other root element yields `None` rather than an error, so a caller
+/// slicing by local name does not have to pre-filter exactly.
+pub fn parse_single_object(data: &[u8]) -> Result<Option<Shape>> {
+    let mut reader = quick_xml::Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let root = loop {
+        match reader
+            .read_event_into(&mut buf)
+            .map_err(quick_xml::DeError::from)?
+        {
+            quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) => {
+                let name = e.name();
+                let name = name.as_ref();
+                let cut = name.iter().position(|&b| b == b':').map_or(0, |i| i + 1);
+                break name[cut..].to_vec();
+            }
+            quick_xml::events::Event::Eof => return Ok(None),
+            _ => {}
+        }
+    };
+    Ok(match root.as_slice() {
+        b"sp" => Some(lower_sp(serde_xml::from_xml::<SpXml>(data)?)),
+        b"grpSp" => Some(lower_grp(serde_xml::from_xml::<GrpSpXml>(data)?)),
+        b"cxnSp" => Some(lower_cxn(serde_xml::from_xml::<CxnSpXml>(data)?)),
+        _ => None,
+    })
+}
+
 /// §19.2.1.32 `@showMasterSp` alone, read from the root element without
 /// deserializing the part.
 ///

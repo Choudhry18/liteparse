@@ -406,6 +406,8 @@ fn command_primary_y(cmd: &DrawCommand) -> Pt {
         // of the cell keeps a bracket with the half its shape starts in, the
         // same rule the outline marker follows.
         DrawCommand::Transform(_) => Pt::ZERO,
+        // Pass routing, XLSX only — a DOCX cell never carries one either.
+        DrawCommand::Float(_) => Pt::ZERO,
     }
 }
 

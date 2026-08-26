@@ -47,7 +47,9 @@ use liteparse_ooxml::render::geometry::{PtOffset, PtRect, PtSize};
 use liteparse_ooxml::render::layout::draw_command::{DrawCommand, LayoutedPage};
 use liteparse_ooxml::render::layout::fragment::FontProps;
 use liteparse_ooxml::render::layout::measurer::TextMeasurer;
-use liteparse_ooxml::render::resolve::color::RgbColor;
+use liteparse_ooxml::render::resolve::color::{RgbColor, rgb_from_u32};
+use liteparse_ooxml::render::resolve::drawing_color::{DrawingColorContext, resolve_drawing_color};
+use liteparse_ooxml::render::resolve::fonts::resolve_font_set_themes;
 use liteparse_ooxml::render::resolve::images::MediaEntry;
 use liteparse_ooxml::xlsx::{
     Alignment, Border, BorderEdge, CellAnchor, CellValue, HorizontalAlign, PatternType, PicAnchor,
@@ -90,9 +92,10 @@ const GRIDLINE_COLOR: RgbColor = RgbColor {
     b: 0xE5,
 };
 const GRIDLINE_W: f64 = 0.75;
-/// §21.1.2.3 default run colour, and — until a shape's `a:solidFill` can be
-/// resolved against a font/colour scheme the workbook does not carry — the
-/// only colour shape text paints in.
+/// §21.1.2.3 default run colour — what a shape run paints in when it
+/// declares no `a:solidFill` of its own (a spec default, not a guess).
+/// Declared colours resolve through the workbook's theme in
+/// [`shape_run_color`].
 const SHAPE_TEXT_COLOR: RgbColor = RgbColor { r: 0, g: 0, b: 0 };
 
 /// Everything the native XLSX pipeline hands `parser.rs`.
@@ -333,6 +336,30 @@ pub fn workbook_to_pages(
         // of them.
         let mut shape_rects: Vec<(usize, Rect)> = Vec::new();
         let mut shape_cmds_per_page: Vec<Vec<DrawCommand>> = vec![Vec::new(); ranges.len()];
+        // The paint channel: every anchored drawing object's fills and
+        // outlines, placed by the same anchor math as everything else.
+        // Emitted before the text loop below so a page's fills precede its
+        // shape text in the stream — the float pass paints in stream order,
+        // and that order is what keeps a callout's words on top of its box.
+        let mut ink_cmds_per_page: Vec<Vec<DrawCommand>> = vec![Vec::new(); ranges.len()];
+        if opts.paint {
+            for ink in &sheet.ink {
+                let (page_local, rect) = geo.place_pic(
+                    cols,
+                    &row_indices,
+                    &ranges,
+                    page_width,
+                    &canvas,
+                    &ink.anchor,
+                );
+                ink_commands(
+                    ink,
+                    &rect,
+                    wb.theme.as_ref(),
+                    &mut ink_cmds_per_page[page_local],
+                );
+            }
+        }
         for shape in super::xlsx::ordered_shapes(sheet) {
             let (page_local, rect) = geo.place_pic(
                 cols,
@@ -347,7 +374,12 @@ pub fn workbook_to_pages(
             // Painted from a real sub-layout, not from the items above — see
             // `shape_commands` for why the two are allowed to disagree.
             if let (true, Some(m)) = (opts.paint, measurer.as_ref()) {
-                shape_cmds_per_page[page_local].extend(shape_commands(shape, &rect, m));
+                shape_cmds_per_page[page_local].extend(shape_commands(
+                    shape,
+                    &rect,
+                    wb.theme.as_ref(),
+                    m,
+                ));
             }
             let blocks = super::xlsx::shape_paragraphs(shape);
             if super::xlsx::shape_is_above(shape, first_row) {
@@ -471,16 +503,28 @@ pub fn workbook_to_pages(
                     out.text_stats.add(stats);
                 }
                 // Outside the `plan` arm on purpose: a sheet whose only
-                // content is a picture — or a text shape — has no grid to
-                // paint and still has something to draw.
+                // content is a picture — or a shape — has no grid to paint
+                // and still has something to draw.
                 //
-                // Shape text lands in the painter's `Ink` pass, so it draws
-                // over the grid and over cell values, and *under* a floating
-                // picture. That last relation is the same approximation the
-                // float-z census accepted for cell text and did not measure
-                // for shapes: undoing it needs a float flag on
-                // `DrawCommand::Text`, which is its own step.
-                layout.commands.append(&mut shape_cmds_per_page[i]);
+                // The floating drawing layer, in Excel's z-order: shape
+                // fills and outlines, then shape text, both bracketed into
+                // the rasterizer's `Float` pass so they draw over the grid
+                // *and* the cell values (the same relation pictures already
+                // claim via their flag), then the pictures on top. Within
+                // the layer the approximation is the PPTX painter's: all
+                // fills before all text, so an overlapping shape's box never
+                // covers a neighbour's words.
+                use liteparse_ooxml::render::layout::draw_command::FloatMark;
+                if !ink_cmds_per_page[i].is_empty() {
+                    layout.commands.push(DrawCommand::Float(FloatMark::Begin));
+                    layout.commands.append(&mut ink_cmds_per_page[i]);
+                    layout.commands.push(DrawCommand::Float(FloatMark::End));
+                }
+                if !shape_cmds_per_page[i].is_empty() {
+                    layout.commands.push(DrawCommand::Float(FloatMark::Begin));
+                    layout.commands.append(&mut shape_cmds_per_page[i]);
+                    layout.commands.push(DrawCommand::Float(FloatMark::End));
+                }
                 layout.commands.append(&mut pic_cmds_per_page[i]);
             }
             out.layouts.push(layout);
@@ -559,17 +603,16 @@ fn shape_text_items(shape: &SheetShape, rect: &Rect, out: &mut Vec<TextItem>) {
 /// cannot express, and the first line moves by more than 24pt on 19.2% of
 /// shapes.
 ///
-/// Two simplifications, both measured rather than assumed:
-///
-/// * **Run colour is black.** `a:solidFill` on a run needs a `Theme` to
-///   resolve `schemeClr`, and a workbook carries only a
-///   [`ThemeColorScheme`](liteparse_ooxml::model::ThemeColorScheme). Nothing
-///   paints a shape's *fill* yet either, so this is black on the page's white
-///   rather than black on black.
-/// * **No theme face.** Same reason: there is no font scheme to read `+mn-lt`
-///   from, so a run naming no family gets Excel's `Calibri`. 96.9% of corpus
-///   shape runs state a size and most state a face.
-fn shape_commands(shape: &SheetShape, rect: &Rect, m: &TextMeasurer) -> Vec<DrawCommand> {
+/// Run colour and theme faces resolve against the workbook's full `Theme` —
+/// the shape-visuals census measured 5,041 of 5,902 runs declaring a colour,
+/// 52% of them `schemeClr`, which is what made keeping the whole theme (not
+/// just its colour scheme) worth it.
+fn shape_commands(
+    shape: &SheetShape,
+    rect: &Rect,
+    theme: Option<&liteparse_ooxml::model::Theme>,
+    m: &TextMeasurer,
+) -> Vec<DrawCommand> {
     use liteparse_ooxml::model::BodyProperties;
     use liteparse_ooxml::model::dimension::Dimension;
     use liteparse_ooxml::pptx::textcascade::TextCascade;
@@ -595,7 +638,7 @@ fn shape_commands(shape: &SheetShape, rect: &Rect, m: &TextMeasurer) -> Vec<Draw
     for (i, para) in shape.body.paragraphs.iter().enumerate() {
         let resolved = cascade.resolve(&para.properties, None);
         let mut fragments = Vec::new();
-        shape_fragments(&para.content, &resolved, auto_fit, m, &mut fragments);
+        shape_fragments(&para.content, &resolved, auto_fit, theme, m, &mut fragments);
         if i == 0 {
             // The fallback height for content that states none — an empty
             // paragraph between two filled ones still occupies a line.
@@ -659,6 +702,282 @@ fn shape_commands(shape: &SheetShape, rect: &Rect, m: &TextMeasurer) -> Vec<Draw
     commands
 }
 
+/// Maps a box in the drawing's declared EMU space onto the anchor's page
+/// rect: the top-level object's own declared box stands for the whole
+/// anchor, and every descendant scales through it. Fraction-based rather
+/// than EMU→pt conversion because the two spaces genuinely disagree — the
+/// anchor is computed from cells and column widths, the `a:xfrm` is whatever
+/// the producer wrote — and the anchor is the authority on where the object
+/// sits on the page.
+struct AnchorMap {
+    base_x: f64,
+    base_y: f64,
+    /// Scale from declared EMU to page pt, per axis. Non-uniform when the
+    /// anchor's aspect differs from the declared box's — under which a
+    /// rotated child's angle is carried unscaled, the closest similarity.
+    sx: f64,
+    sy: f64,
+    to_x: f64,
+    to_y: f64,
+}
+
+impl AnchorMap {
+    fn new(
+        base: liteparse_ooxml::model::geometry::Rect<liteparse_ooxml::model::dimension::Emu>,
+        target: &Rect,
+    ) -> Option<Self> {
+        let (bw, bh) = (base.size.width.raw() as f64, base.size.height.raw() as f64);
+        // A box that is zero in *both* axes is a point — 540 corpus shapes,
+        // one workbook, all legacy `Line NNN` leftovers — and a point has no
+        // ink. A box that is zero in *one* axis is a flat line (every
+        // horizontal connector declares `cy="0"`), and Excel draws those:
+        // the degenerate axis collapses (scale 0) instead of vetoing the
+        // whole tree.
+        if bw <= 0.0 && bh <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            base_x: base.origin.x.raw() as f64,
+            base_y: base.origin.y.raw() as f64,
+            sx: if bw > 0.0 {
+                target.width as f64 / bw
+            } else {
+                0.0
+            },
+            sy: if bh > 0.0 {
+                target.height as f64 / bh
+            } else {
+                0.0
+            },
+            to_x: target.x as f64,
+            to_y: target.y as f64,
+        })
+    }
+
+    fn map(
+        &self,
+        r: liteparse_ooxml::model::geometry::Rect<liteparse_ooxml::model::dimension::Emu>,
+    ) -> (f64, f64, f64, f64) {
+        (
+            self.to_x + (r.origin.x.raw() as f64 - self.base_x) * self.sx,
+            self.to_y + (r.origin.y.raw() as f64 - self.base_y) * self.sy,
+            r.size.width.raw() as f64 * self.sx,
+            r.size.height.raw() as f64 * self.sy,
+        )
+    }
+}
+
+/// One anchored drawing object's fills and outlines as self-placing
+/// [`DrawCommand::Path`]s — the XLSX twin of the PPTX paint walk, over the
+/// same shape tree, the same `resolve_shape_visuals`, and the same vendored
+/// preset geometry.
+///
+/// What it deliberately shares with the PPTX painter's approximations: all
+/// of one page's fills paint before any of its shape text, so an overlapping
+/// shape's fill does not cover a neighbour's words; a picture *inside a
+/// group* is not painted here (it already paints at the anchor box via the
+/// float pass, which is the landed approximation for grouped pics); an
+/// unbuildable preset is skipped, never approximated by its bounding box.
+fn ink_commands(
+    ink: &liteparse_ooxml::xlsx::SheetInk,
+    rect: &Rect,
+    theme: Option<&liteparse_ooxml::model::Theme>,
+    out: &mut Vec<DrawCommand>,
+) {
+    use liteparse_ooxml::pptx::apply_slide_geometry;
+
+    let Some(mut root) = ink.shape() else { return };
+    apply_slide_geometry(std::slice::from_mut(&mut root));
+    let ctx = DrawingColorContext::new(theme);
+    match root.slide_rect {
+        Some(sr) => {
+            // The anchor covers the object as *seen* — its rotated bounding
+            // box, not its unrotated rect. 88 corpus shapes are vertical
+            // lines rotated a quarter turn into horizontal ones, whose
+            // unrotated rect is zero-width; scaling through it collapses
+            // them, scaling through the bounding box does not.
+            let Some(map) = AnchorMap::new(sr.bounding_box(), rect) else {
+                return;
+            };
+            walk_ink(&root, &map, &ctx, None, out);
+        }
+        // No transform on the top-level object: its declared box *is* the
+        // anchor's, unrotated. Only a leaf can be placed this way — a
+        // group with no box gives its children nothing to map through.
+        None => {
+            let placed = PlacedBox {
+                x: rect.x as f64,
+                y: rect.y as f64,
+                w: rect.width as f64,
+                h: rect.height as f64,
+                rotation: liteparse_ooxml::model::dimension::Dimension::new(0),
+                flip_h: false,
+                flip_v: false,
+            };
+            paint_ink_shape(&root, placed, &ctx, None, out);
+        }
+    }
+}
+
+/// A shape's box after anchor mapping, in page points.
+struct PlacedBox {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    rotation: liteparse_ooxml::model::dimension::Dimension<
+        liteparse_ooxml::model::dimension::SixtieThousandthDeg,
+    >,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+fn walk_ink(
+    shape: &liteparse_ooxml::pptx::Shape,
+    map: &AnchorMap,
+    ctx: &DrawingColorContext<'_>,
+    group_fill: Option<&liteparse_ooxml::render::layout::draw_command::ResolvedFill>,
+    out: &mut Vec<DrawCommand>,
+) {
+    use liteparse_ooxml::model::DrawingFill;
+    use liteparse_ooxml::pptx::ShapeKind;
+    use liteparse_ooxml::render::resolve::shape_visuals::resolve_fill;
+
+    // Hidden is the legacy-form-control filter the text channel already
+    // applies; the paint channel honours the same bit.
+    if shape.non_visual.hidden == Some(true) {
+        return;
+    }
+    match &shape.kind {
+        ShapeKind::Group(group) => {
+            // §20.1.8.35: a child's `a:grpFill` inherits the nearest
+            // enclosing group's fill, resolved once in the group's own
+            // context. A group that itself declares `grpFill` (or nothing)
+            // passes its parent's answer through.
+            let resolved: Option<liteparse_ooxml::render::layout::draw_command::ResolvedFill> =
+                match &group.fill {
+                    Some(DrawingFill::Group) | None => None,
+                    Some(f) => Some(resolve_fill(f, ctx, None, group_fill)),
+                };
+            let next = resolved.as_ref().or(group_fill);
+            for child in &group.children {
+                walk_ink(child, map, ctx, next, out);
+            }
+        }
+        // A grouped picture already paints as a float image at the anchor
+        // box; painting its frame here would draw it twice. Frames (charts)
+        // carry no ink this pass can build.
+        ShapeKind::Picture(_) | ShapeKind::GraphicFrame(_) => {}
+        ShapeKind::AutoShape(_) | ShapeKind::Connector(_) => {
+            // A shape the geometry pass could not place has no box to paint
+            // into; skipped rather than guessed.
+            let Some(sr) = shape.slide_rect else { return };
+            // The *bounding* box maps — it is the on-page footprint the
+            // anchor's axis-aligned scale meaningfully applies to. The
+            // painter then needs the pre-rotation extent back, because
+            // `DrawCommand::Path` rotates its box about the centre: for a
+            // quarter turn that is the bounding box swapped in place; for
+            // an oblique angle the bounding box itself is the closest
+            // axis-aligned stand-in (the PPTX painter's approximation).
+            let (bx, by, bw, bh) = map.map(sr.bounding_box());
+            let rot = sr.rotation.raw().rem_euclid(21_600_000);
+            let quarter = rot == 5_400_000 || rot == 16_200_000;
+            let placed = if quarter {
+                let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
+                PlacedBox {
+                    x: cx - bh / 2.0,
+                    y: cy - bw / 2.0,
+                    w: bh,
+                    h: bw,
+                    rotation: sr.rotation,
+                    flip_h: sr.flip_h,
+                    flip_v: sr.flip_v,
+                }
+            } else {
+                PlacedBox {
+                    x: bx,
+                    y: by,
+                    w: bw,
+                    h: bh,
+                    rotation: sr.rotation,
+                    flip_h: sr.flip_h,
+                    flip_v: sr.flip_v,
+                }
+            };
+            paint_ink_shape(shape, placed, ctx, group_fill, out);
+        }
+    }
+}
+
+/// One shape's fill and outline as a [`DrawCommand::Path`], if it puts ink
+/// on the page — the paint gate, the style-ref fallback and the
+/// no-approximation rule all mirror the PPTX `paint_shape`.
+fn paint_ink_shape(
+    shape: &liteparse_ooxml::pptx::Shape,
+    placed: PlacedBox,
+    ctx: &DrawingColorContext<'_>,
+    group_fill: Option<&liteparse_ooxml::render::layout::draw_command::ResolvedFill>,
+    out: &mut Vec<DrawCommand>,
+) {
+    use liteparse_ooxml::pptx::ShapeKind;
+    use liteparse_ooxml::render::layout::draw_command::ResolvedFill;
+    use liteparse_ooxml::render::resolve::shape_geometry::build_geometry;
+    use liteparse_ooxml::render::resolve::shape_visuals::resolve_shape_visuals;
+
+    // Checked here as well as in the walk: the no-`xfrm` fallback reaches
+    // this function without passing through `walk_ink`'s filter.
+    if shape.non_visual.hidden == Some(true) {
+        return;
+    }
+    let props = match &shape.kind {
+        ShapeKind::AutoShape(a) => a.properties.as_ref(),
+        ShapeKind::Connector(c) => c.properties.as_ref(),
+        _ => return,
+    };
+    let Some(props) = props else { return };
+    let style = shape.style.as_ref();
+    let visuals = resolve_shape_visuals(
+        Some(props),
+        style.and_then(|s| s.line_ref.as_ref()),
+        style.and_then(|s| s.effect_ref.as_ref()),
+        style.and_then(|s| s.fill_ref.as_ref()),
+        ctx,
+        // No `PartMedia`: a blip fill on an XLSX shape (4 on the corpus)
+        // resolves to nothing and the shape paints its outline alone.
+        None,
+        group_fill,
+    );
+    if matches!(visuals.fill, ResolvedFill::None) && visuals.stroke.is_none() {
+        return;
+    }
+    // A point paints nothing — the both-axes-degenerate case `AnchorMap`
+    // already rejects at the root, restated here for grouped children.
+    if placed.w <= 0.0 && placed.h <= 0.0 {
+        return;
+    }
+    let extent = PtSize::new(Pt::new(placed.w as f32), Pt::new(placed.h as f32));
+    let Some(geometry) = props.geometry.as_ref() else {
+        return;
+    };
+    // An unimplemented preset is skipped, never approximated by its bounding
+    // box: a `rect` drawn where a `cloud` was asked for is a wrong page, not
+    // a coarse one.
+    let Some(path) = build_geometry(geometry, extent) else {
+        return;
+    };
+    out.push(DrawCommand::Path {
+        origin: PtOffset::new(Pt::new(placed.x as f32), Pt::new(placed.y as f32)),
+        rotation: placed.rotation,
+        flip_h: placed.flip_h,
+        flip_v: placed.flip_v,
+        extent,
+        paths: path.paths,
+        fill: visuals.fill,
+        stroke: visuals.stroke,
+        effects: visuals.effects,
+    });
+}
+
 /// A shape paragraph's runs as measured [`Fragment`]s.
 ///
 /// The XLSX-local twin of the PPTX `collect_run_fragments`: same shared
@@ -668,6 +987,7 @@ fn shape_fragments(
     inlines: &[liteparse_ooxml::model::Inline],
     resolved: &liteparse_ooxml::pptx::textcascade::ResolvedTextStyle,
     auto_fit: liteparse_ooxml::render::layout::ShapeAutoFit,
+    theme: Option<&liteparse_ooxml::model::Theme>,
     m: &TextMeasurer,
     out: &mut Vec<liteparse_ooxml::render::layout::fragment::Fragment>,
 ) {
@@ -681,21 +1001,27 @@ fn shape_fragments(
             Inline::TextRun(run) => {
                 let mut props = run.properties.clone();
                 resolved.apply_to_run(&mut props);
+                // A run naming `+mn-lt` carries a `ThemeFontRef` the measurer
+                // cannot use; resolve it now the workbook's theme is in hand.
+                if let Some(theme) = theme {
+                    resolve_font_set_themes(&mut props.fonts, theme);
+                }
                 let font = font_props_from_run(
                     &props,
                     DEFAULT_FONT_FAMILY,
                     Pt::new(DEFAULT_FONT_SIZE),
                     auto_fit,
                 );
+                let color = shape_run_color(&props, theme);
                 for element in &run.content {
                     match element {
                         RunElement::Text(text) => {
-                            emit_run_fragments(text, &font, SHAPE_TEXT_COLOR, None, m, out)
+                            emit_run_fragments(text, &font, color, None, m, out)
                         }
                         RunElement::Tab => out.push(Fragment::Tab {
                             line_height: font.size,
                             font: Rc::new(font.clone()),
-                            color: SHAPE_TEXT_COLOR,
+                            color,
                             fitting_width: None,
                         }),
                         RunElement::LineBreak(_) => out.push(Fragment::LineBreak {
@@ -706,10 +1032,31 @@ fn shape_fragments(
                 }
             }
             Inline::Hyperlink(link) => {
-                shape_fragments(&link.content, resolved, auto_fit, m, out);
+                shape_fragments(&link.content, resolved, auto_fit, theme, m, out);
             }
             _ => {}
         }
+    }
+}
+
+/// A shape run's declared colour, resolved against the workbook's theme —
+/// the XLSX twin of the PPTX path's `run_color`, minus the `p:clrMap` (a
+/// workbook has no master to remap `bg1`/`tx1` through) and minus the
+/// counters (the corpus census already sized both branches: 5,041 of 5,902
+/// runs declare, 52% of them `schemeClr`).
+///
+/// Alpha is dropped, as it is on the PPTX side: `DrawCommand::Text` carries
+/// an opaque colour, and solid is a smaller error than the black it
+/// replaces. No declaration is the §21.1.2.3 black default, not a guess.
+fn shape_run_color(
+    props: &liteparse_ooxml::model::RunProperties,
+    theme: Option<&liteparse_ooxml::model::Theme>,
+) -> RgbColor {
+    match props.drawing_color.as_ref() {
+        Some(declared) => rgb_from_u32(
+            resolve_drawing_color(declared, &DrawingColorContext::new(theme)).to_rgb24(),
+        ),
+        None => SHAPE_TEXT_COLOR,
     }
 }
 
@@ -2560,7 +2907,236 @@ mod tests {
         );
     }
 
-    // ── shape text paint ────────────────────────────────────────────────────
+    // ── shape ink (fills and outlines) ──────────────────────────────────────
+
+    use liteparse_ooxml::render::layout::draw_command::{FloatMark, ResolvedFill};
+
+    /// Every painted `Path` command's (x, y, w, h, fill, has_stroke).
+    fn shape_paths(page: &LayoutedPage) -> Vec<(f32, f32, f32, f32, ResolvedFill, bool)> {
+        page.commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Path {
+                    origin,
+                    extent,
+                    fill,
+                    stroke,
+                    ..
+                } => Some((
+                    origin.x.raw(),
+                    origin.y.raw(),
+                    extent.width.raw(),
+                    extent.height.raw(),
+                    fill.clone(),
+                    stroke.is_some(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The carrier gap closed: a textless filled rectangle — dropped by the
+    /// text channel, invisible before this step — paints as a `Path` in a
+    /// `Float` bracket, and the item stream never hears about it.
+    #[test]
+    fn a_textless_filled_shape_paints_a_path_and_adds_no_item() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="Box"/></xdr:nvSpPr>
+               <xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                 <a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></xdr:spPr></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        let paths = shape_paths(&nx.layouts[0]);
+        assert_eq!(paths.len(), 1, "one Path: {paths:?}");
+        let (_, _, w, h, fill, _) = &paths[0];
+        assert!(
+            (w - 72.0).abs() < 0.5 && (h - 36.0).abs() < 0.5,
+            "{paths:?}"
+        );
+        match fill {
+            ResolvedFill::Solid(c) => {
+                assert!(c.r > 0.99 && c.g < 0.01 && c.b < 0.01, "red: {c:?}")
+            }
+            other => panic!("expected a solid fill, got {other:?}"),
+        }
+        // Inside a Float bracket, so it draws over the grid and cell values.
+        let cmds = &nx.layouts[0].commands;
+        let path_at = cmds
+            .iter()
+            .position(|c| matches!(c, DrawCommand::Path { .. }))
+            .unwrap();
+        assert!(
+            matches!(cmds[path_at - 1], DrawCommand::Float(FloatMark::Begin))
+                && matches!(cmds[path_at + 1], DrawCommand::Float(FloatMark::End)),
+            "the Path floats"
+        );
+        // The item side is exactly the grid cell — the shape adds nothing.
+        assert_eq!(
+            nx.pages[0]
+                .text_items
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grid"]
+        );
+    }
+
+    /// A grouped child paints in its share of the anchor box: the group's
+    /// `chOff`/`chExt` map the child's declared quarter onto a quarter of
+    /// the page rect. 3,547 corpus inked shapes are inside a group; without
+    /// this mapping every one of them would smear across the full anchor.
+    #[test]
+    fn a_grouped_child_paints_in_its_share_of_the_anchor_box() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="914400"/>
+             <xdr:grpSp>
+               <xdr:nvGrpSpPr><xdr:cNvPr id="1" name="G"/></xdr:nvGrpSpPr>
+               <xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/>
+                 <a:chOff x="0" y="0"/><a:chExt cx="200" cy="200"/></a:xfrm></xdr:grpSpPr>
+               <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="2" name="Full"/></xdr:nvSpPr>
+                 <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="200" cy="200"/></a:xfrm>
+                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                   <a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></xdr:spPr></xdr:sp>
+               <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="3" name="Quarter"/></xdr:nvSpPr>
+                 <xdr:spPr><a:xfrm><a:off x="100" y="100"/><a:ext cx="100" cy="100"/></a:xfrm>
+                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                   <a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></xdr:spPr></xdr:sp>
+             </xdr:grpSp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        let paths = shape_paths(&nx.layouts[0]);
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        let (fx, fy, fw, fh, ..) = paths[0];
+        let (qx, qy, qw, qh, ..) = paths[1];
+        assert!((fw - 72.0).abs() < 0.5 && (fh - 72.0).abs() < 0.5);
+        assert!(
+            (qw - fw / 2.0).abs() < 0.5 && (qh - fh / 2.0).abs() < 0.5,
+            "the quarter child is half the size: {paths:?}"
+        );
+        assert!(
+            (qx - (fx + fw / 2.0)).abs() < 0.5 && (qy - (fy + fh / 2.0)).abs() < 0.5,
+            "and sits in the bottom-right quarter: {paths:?}"
+        );
+    }
+
+    /// A connector is pure line work: no fill, a stroke, and it reaches the
+    /// paint even though the text channel rightly never surfaces it.
+    #[test]
+    fn a_connector_paints_its_stroke() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:cxnSp><xdr:nvCxnSpPr><xdr:cNvPr id="3" name="L"/></xdr:nvCxnSpPr>
+               <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>
+                 <a:prstGeom prst="line"><a:avLst/></a:prstGeom>
+                 <a:ln w="19050"><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:ln></xdr:spPr></xdr:cxnSp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        let paths = shape_paths(&nx.layouts[0]);
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        let (.., fill, has_stroke) = &paths[0];
+        assert!(matches!(fill, ResolvedFill::None), "{fill:?}");
+        assert!(has_stroke, "the connector strokes");
+    }
+
+    /// A flat line — every horizontal connector declares `cy="0"` — still
+    /// strokes; a zero-extent *point* (540 corpus shapes, all legacy
+    /// `Line NNN` leftovers) paints nothing.
+    #[test]
+    fn a_flat_line_strokes_and_a_point_does_not() {
+        let line = |ext: &str| {
+            format!(
+                r#"<xdr:twoCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:to><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>9525</xdr:rowOff></xdr:to>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="L"/></xdr:nvSpPr>
+               <xdr:spPr><a:xfrm><a:off x="0" y="0"/>{ext}</a:xfrm>
+                 <a:prstGeom prst="line"><a:avLst/></a:prstGeom><a:noFill/>
+                 <a:ln w="19050"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></xdr:spPr></xdr:sp>
+           <xdr:clientData/></xdr:twoCellAnchor>"#
+            )
+        };
+        let flat = painted_shape(&line(r#"<a:ext cx="466725" cy="0"/>"#));
+        assert_eq!(
+            shape_paths(&flat.layouts[0]).len(),
+            1,
+            "a flat line strokes"
+        );
+        let point = painted_shape(&line(r#"<a:ext cx="0" cy="0"/>"#));
+        assert!(
+            shape_paths(&point.layouts[0]).is_empty(),
+            "a point paints nothing"
+        );
+    }
+
+    /// A vertical line rotated a quarter turn into a horizontal one — 88
+    /// corpus shapes — still paints: its unrotated rect is zero-width, and
+    /// only the rotated *bounding box* meaningfully maps onto the anchor.
+    #[test]
+    fn a_quarter_rotated_flat_line_still_paints() {
+        let anchor = r#"<xdr:twoCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>100</xdr:rowOff></xdr:from>
+             <xdr:to><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>100</xdr:rowOff></xdr:to>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="2" name="Line 1"/></xdr:nvSpPr>
+               <xdr:spPr><a:xfrm rot="16200000" flipV="1"><a:off x="2641600" y="13474700"/><a:ext cx="0" cy="660400"/></a:xfrm>
+                 <a:prstGeom prst="line"><a:avLst/></a:prstGeom><a:noFill/>
+                 <a:ln w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></xdr:spPr></xdr:sp>
+           <xdr:clientData/></xdr:twoCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        let paths = shape_paths(&nx.layouts[0]);
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        // The pre-rotation extent is the flat bounding box swapped back
+        // upright: zero wide, anchor-width tall.
+        let (_, _, w, h, _, has_stroke) = &paths[0];
+        assert!(*w < 0.5 && *h > 10.0, "upright extent: {paths:?}");
+        assert!(has_stroke);
+    }
+
+    /// A hidden shape — a legacy form control — paints nothing, the same
+    /// bit the text channel already honours.
+    #[test]
+    fn a_hidden_shape_paints_nothing() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="ctl" hidden="1"/></xdr:nvSpPr>
+               <xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                 <a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></xdr:spPr></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        assert!(shape_paths(&nx.layouts[0]).is_empty());
+    }
+
+    /// A declared run colour reaches the painted text — red glyphs, not the
+    /// black default. 5,041 of 5,902 corpus runs declare one.
+    #[test]
+    fn a_declared_run_colour_reaches_the_painted_text() {
+        let anchor = r#"<xdr:oneCellAnchor>
+             <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+             <xdr:ext cx="914400" cy="457200"/>
+             <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="5" name="T"/></xdr:nvSpPr><xdr:spPr/>
+               <xdr:txBody><a:bodyPr/><a:p><a:r>
+                 <a:rPr sz="1200"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:rPr>
+                 <a:t>warm</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+           <xdr:clientData/></xdr:oneCellAnchor>"#;
+        let nx = painted_shape(anchor);
+        let colors: Vec<RgbColor> = nx.layouts[0]
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { text, color, .. } if text.as_ref() == "warm" => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert!(!colors.is_empty(), "the run painted");
+        assert!(
+            colors.iter().all(|c| c.r == 0xFF && c.g == 0 && c.b == 0),
+            "and in its declared red: {colors:?}"
+        );
+    }
 
     /// A shape with `anchor_xml`, painted with a real registry.
     fn painted_shape(anchor_xml: &str) -> NativeXlsx {

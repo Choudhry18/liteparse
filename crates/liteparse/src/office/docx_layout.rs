@@ -232,7 +232,8 @@ pub fn layout_to_pages(
                 | DrawCommand::Path { .. }
                 | DrawCommand::InternalLink { .. }
                 | DrawCommand::NamedDestination { .. }
-                | DrawCommand::Transform(_) => {}
+                | DrawCommand::Transform(_)
+                | DrawCommand::Float(_) => {}
             }
         }
 
