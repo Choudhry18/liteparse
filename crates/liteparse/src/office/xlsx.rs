@@ -1,31 +1,23 @@
 //! XLSX → [`Block`], reading the workbook grid directly instead of rendering
-//! it through LibreOffice.
-//!
-//! The conversion path's measured failure is not layout, it is *destruction*:
-//! LibreOffice clips every cell at its rendered column width before the PDF
-//! exists, and emits **zero markdown table rows across 218 corpus workbooks**.
+//! it through LibreOffice (which clips cells at their rendered column width).
 //! A workbook states its grid explicitly, so unlike DOCX (no geometry) and
-//! PPTX (reading order), the emitter's job here is mostly to not ruin what the
-//! file already says.
+//! PPTX (reading order), the emitter mostly needs to preserve what the file
+//! already says.
 //!
-//! Every rule below that looks arbitrary is a corpus measurement from
-//! `xlsx_emit_census` (1,248 workbooks, 5,439 non-empty visible sheets):
+//! Emission rules:
 //!
-//! * **Merges are the common case, not the tail** — 68.9% of sheets carry at
-//!   least one, so [`Block::MergedTable`] is the only table variant emitted
-//!   and the plain-grid degeneration to a pipe table is the renderer's call.
-//! * **Rows and columns are emitted sparse.** The bbox is a lie at the tail
-//!   (a stray cell puts one sheet's bbox at 1,048,576 rows); rows the file
-//!   does not write do not become table rows, and columns with no cell
-//!   anywhere are compacted out. Nothing a cell says is dropped — only
-//!   positions where no cell exists.
-//! * **A leading full-width merge is a title, not a row** — 42.1% of sheets
-//!   open with one. Emitting it as a table row buries the sheet's content
-//!   title; it becomes a [`Block::Paragraph`] above the table.
-//! * **Hidden sheets and hidden rows are emitted.** They hold 0.66% and
-//!   0.09% of all cells; the text is real, the spreadsheet merely folds it
-//!   from view, and an extraction pipeline that silently loses it has no way
-//!   to say so. This diverges from what Excel prints on purpose.
+//! * **Merges are common**, so [`Block::MergedTable`] is the only table
+//!   variant emitted; the degeneration to a plain pipe table is the
+//!   renderer's call.
+//! * **Rows and columns are emitted sparse.** Rows the file does not write do
+//!   not become table rows, and columns with no cell anywhere are compacted
+//!   out — a stray cell can otherwise put a sheet's bbox at row 1,048,576.
+//!   Nothing a cell says is dropped, only positions where no cell exists.
+//! * **A leading full-width merge is a title, not a row**: it becomes a
+//!   [`Block::Paragraph`] above the table rather than a buried table row.
+//! * **Hidden sheets and hidden rows are emitted.** The text is real; the
+//!   spreadsheet merely folds it from view. This deliberately diverges from
+//!   what Excel prints.
 //!
 //! Cell text goes into [`Cell`] **unescaped**, the same contract as the DOCX
 //! and PPTX table emitters: `render_blocks` escapes per dialect (`|` for pipe
@@ -61,9 +53,9 @@ pub(crate) const SHEET_HEADING_LEVEL: u8 = 1;
 const BANNER_MIN_WIDTH_FRACTION: f64 = 0.6;
 const BANNER_MIN_COLS: usize = 3;
 
-/// Frozen panes freeze title junk along with the header (the corpus histogram
-/// runs to 19); a freeze deeper than this many *grid* rows stops being a
-/// header declaration and the other signals decide instead.
+/// A freeze deeper than this many grid rows tends to include title junk along
+/// with the header, so it stops being read as a header declaration and the
+/// other signals decide instead.
 const FROZEN_HEADER_MAX_ROWS: usize = 5;
 
 /// What the emitter should produce beyond the always-on structure.
@@ -81,9 +73,8 @@ pub struct EmitOptions {
     pub images: bool,
     /// Paint the grid: fill `NativeXlsx::layouts` with the gridlines, cell
     /// fills and cell borders behind the text. Off by default and read only
-    /// by `xlsx_layout` — a parse wants `TextItem`s, and painting one corpus
-    /// sheet can be a quarter-million rects nobody would look at. The
-    /// screenshot path turns it on.
+    /// by `xlsx_layout` — a parse wants `TextItem`s, and painting a sheet can
+    /// be hundreds of thousands of rects. The screenshot path turns it on.
     pub paint: bool,
 }
 
@@ -159,10 +150,9 @@ pub fn emit_workbook(wb: &Workbook, opts: EmitOptions) -> NativeWorkbook {
 }
 
 /// A sheet's pictures in reading order — sorted by anchor cell, top-left
-/// first, with the (single corpus) absolute anchor sorting after every cell
-/// anchor. This order is the id order: the geometry pass numbers
-/// `s{sheet}_{n}` walking the same list, so a `![](…)` ref and its
-/// `ExtractedImage` cannot disagree.
+/// first, with absolute anchors sorting after every cell anchor. This order
+/// is the id order: the geometry pass numbers `s{sheet}_{n}` walking the same
+/// list, so a `![](…)` ref and its `ExtractedImage` cannot disagree.
 pub(crate) fn ordered_pics(sheet: &Sheet) -> Vec<&SheetPic> {
     let mut pics: Vec<&SheetPic> = sheet.pics.iter().collect();
     pics.sort_by_key(|p| match p.anchor.from_cell() {
@@ -221,17 +211,15 @@ pub fn ordered_shapes(sheet: &Sheet) -> Vec<&SheetShape> {
 /// The paragraph blocks for a sheet's floating text shapes, split at the
 /// grid: `(before the table, after the table)`.
 ///
-/// The census (plan doc, floating text-shape entry) measured where shapes
-/// anchor: 33% sit *above* the sheet's first written row, and the eye check
-/// says those are titles and section navigation — emitting them after the
-/// table would bury every title under its own data. Everything else follows
-/// the figures precedent: shapes float *over* the grid, so interleaving with
-/// specific rows would be false precision, and they emit after the table,
-/// before the figure refs.
+/// A shape anchored above the sheet's first written row is treated as a title
+/// and emitted before the table, so it is not buried under its own data.
+/// Everything else follows the figures precedent: shapes float over the grid,
+/// so interleaving with specific rows would be false precision — they emit
+/// after the table, before the figure refs.
 ///
-/// Census-scoped non-goals: bullets (7 shapes corpus-wide) emit as plain
-/// paragraphs; `a:hlinkClick` (7) keeps its text and drops the link, which
-/// would need the drawing part's rels threaded through the reader.
+/// Non-goals: bullets emit as plain paragraphs; `a:hlinkClick` keeps its text
+/// and drops the link, which would need the drawing part's rels threaded
+/// through the reader.
 pub(crate) fn shape_blocks(sheet: &Sheet) -> (Vec<Block>, Vec<Block>) {
     let first_row = first_written_row(sheet);
     let mut above = Vec::new();
@@ -295,9 +283,8 @@ fn shape_chunks(para: &TextParagraph) -> Vec<Chunk> {
                         match el {
                             RunElement::Text(t) => text.push_str(t),
                             RunElement::Tab => text.push('\t'),
-                            // `a:br` inside one paragraph; `Block`'s
-                            // single-line text cannot hold it (the PPTX
-                            // path's rule, same reason).
+                            // `Block`'s single-line text cannot hold an `a:br`,
+                            // so it collapses to a space (as on the PPTX path).
                             RunElement::LineBreak(_) => text.push(' '),
                             _ => {}
                         }
@@ -343,18 +330,17 @@ pub(crate) struct SheetPlan<'a> {
     /// but §18.3.1.4 does not require it). Banner rows included.
     pub(crate) rows: Vec<(&'a Row, Vec<&'a GridCell>)>,
     /// Retained columns: every column that holds at least one cell. Wholly
-    /// empty columns inside the bbox carry no text and are compacted out —
-    /// padding 16,384 pipes onto every row of a sheet whose stray formatting
-    /// touched column XFD is the failure this prevents.
+    /// empty columns inside the bbox carry no text and are compacted out, so a
+    /// stray cell in column XFD does not pad every row with 16,384 pipes.
     pub(crate) cols: Vec<u32>,
     pub(crate) plans: Vec<MergePlan>,
     pub(crate) anchors: HashMap<(u32, u32), usize>,
     /// Emitted-row index → merges whose clamped range includes that row.
     cover: HashMap<u32, Vec<usize>>,
     /// Text folded into each merge (pass A): every covered cell's text, the
-    /// anchor's own first. A *valued* cell under a neighbour's merge is a
-    /// producer bug Excel never writes — folding keeps its text, because
-    /// "absorbed" must never mean "silently gone".
+    /// anchor's own first. A valued cell under a neighbour's merge is a
+    /// producer bug Excel never writes; folding keeps its text so "absorbed"
+    /// never means "silently gone".
     merge_text: Vec<Vec<String>>,
     /// Plan index of each leading banner row, in row order. `len()` is the
     /// number of leading rows emitted as paragraphs instead of table rows.
@@ -429,8 +415,7 @@ impl<'a> SheetPlan<'a> {
         let max_col = *plan.cols.last().unwrap();
 
         // Plan the merges against the emitted grid. First-wins on a shared
-        // anchor: overlapping merges are invalid and Excel repairs them on
-        // open.
+        // anchor: overlapping merges are invalid and Excel repairs them.
         for m in &sheet.merges {
             let Some((p, _rowspan)) = plan_merge(m, &row_indices, &plan.cols, max_row, max_col)
             else {
@@ -467,8 +452,8 @@ impl<'a> SheetPlan<'a> {
         }
 
         // Banners: leading rows whose every valued cell sits inside one
-        // shallow near-full-width merge anchored on that row. 42.1% of sheets
-        // open with one; it reads as a title and is emitted as one.
+        // shallow near-full-width merge anchored on that row. Such a row reads
+        // as a title and is emitted as one.
         let min_banner_cols =
             BANNER_MIN_COLS.max((width as f64 * BANNER_MIN_WIDTH_FRACTION) as usize);
         for (row, cells) in &plan.rows {
@@ -695,8 +680,8 @@ impl<'a> SheetPlan<'a> {
 
 /// Clamp a merge to the emitted grid and count its spans in emitted units.
 /// `None` means the merge touches no emitted row or retained column and
-/// renders as nothing. The rowspan is returned for the census-facing tests;
-/// emission recounts spans per slice.
+/// renders as nothing. The rowspan is returned for tests; emission recounts
+/// spans per slice.
 fn plan_merge(
     m: &xlsx::RangeRef,
     row_indices: &[u32],
@@ -760,13 +745,12 @@ fn banner_plan(
 
 /// How many leading grid rows are headers.
 ///
-/// The signals, in order of how explicitly the file states them (census
-/// coverage in parens):
-/// 1. Frozen panes covering 1–5 grid rows (18.8% of sheets freeze, but the
-///    freeze includes banner junk — deeper freezes fall through).
-/// 2. `<autoFilter>` whose range starts on the first grid row (5.0%).
-/// 3. First grid row entirely bold with ≥2 cells (12.7%).
-/// 4. Type transition: first grid row has no numbers, second does (14.3%).
+/// The signals, in order of how explicitly the file states them:
+/// 1. Frozen panes covering 1–[`FROZEN_HEADER_MAX_ROWS`] grid rows (a deeper
+///    freeze includes banner junk and falls through).
+/// 2. `<autoFilter>` whose range starts on the first grid row.
+/// 3. First grid row entirely bold with ≥2 cells.
+/// 4. Type transition: first grid row has no numbers, second does.
 fn header_rows(wb: &Workbook, sheet: &Sheet, grid: &[(&Row, Vec<&GridCell>)]) -> usize {
     if grid.is_empty() {
         return 0;
@@ -904,8 +888,8 @@ pub(crate) mod tests {
         assert_eq!(rows[2], vec![Cell::new("3"), Cell::new("4")]);
     }
 
-    /// The census: 37.1% of merges anchor on a value-less cell. The span must
-    /// still occupy its place, or every row below shifts left.
+    /// A merge can anchor on a value-less cell. The span must still occupy its
+    /// place, or every row below shifts left.
     #[test]
     fn a_valueless_anchor_still_claims_its_span() {
         let blocks = blocks_of(
@@ -947,8 +931,8 @@ pub(crate) mod tests {
         assert_eq!(rows[1], vec![Cell::new("3"), Cell::new("")]);
     }
 
-    /// The 42.1%: a leading near-full-width shallow merge is a title, emitted
-    /// as a paragraph above the table rather than buried as a row.
+    /// A leading near-full-width shallow merge is a title, emitted as a
+    /// paragraph above the table rather than buried as a row.
     #[test]
     fn a_leading_full_width_merge_is_a_banner_paragraph() {
         let blocks = blocks_of(
@@ -1032,8 +1016,8 @@ pub(crate) mod tests {
         assert_eq!(header_rows, 1);
     }
 
-    /// The corpus freezes run to 19 rows — a freeze that deep is a viewport
-    /// choice, not a header declaration, and the other signals decide.
+    /// A very deep freeze is a viewport choice, not a header declaration, so
+    /// the other signals decide.
     #[test]
     fn a_deep_freeze_is_not_a_header() {
         let rows_xml: String = (1..=10)
@@ -1246,8 +1230,8 @@ pub(crate) mod tests {
         <row r="4"><c r="A4" t="inlineStr"><is><t>b</t></is></c><c r="B4"><v>2</v></c></row>
     </sheetData><drawing r:id="rId7"/></worksheet>"#;
 
-    /// The census's placement rule: a shape anchored above the first written
-    /// row is a title and must not be buried under its own table.
+    /// A shape anchored above the first written row is a title and must not be
+    /// buried under its own table.
     #[test]
     fn a_shape_above_the_grid_emits_before_the_table() {
         let blocks = shape_blocks_of(
@@ -1276,8 +1260,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// 54 corpus shapes sit on sheets with no written cells — today those
-    /// sheets emit nothing at all; the shape is the sheet's only content.
+    /// A shape can sit on a sheet with no written cells, where it is the
+    /// sheet's only content.
     #[test]
     fn a_shape_on_an_empty_sheet_is_its_only_content() {
         let blocks = shape_blocks_of(

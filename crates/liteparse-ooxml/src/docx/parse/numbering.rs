@@ -289,10 +289,9 @@ mod tests {
     use super::*;
 
     #[test]
-    /// Upstream failed the document on a non-integer id. We drop the
-    /// definition instead — but the guard it existed for still holds, and is
-    /// the important part: `"1.0"` must never be silently accepted *as* id 1,
-    /// which would shadow the real abstract numbering 1 and renumber lists.
+    /// A non-integer id is dropped rather than parsed: `"1.0"` must never be
+    /// silently accepted *as* id 1, which would shadow the real abstract
+    /// numbering 1 and renumber lists.
     fn non_integer_numbering_ids_are_dropped_never_coerced() {
         let xml = br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="1.0"/></w:numbering>"#;
         let defs = parse_numbering(xml).expect("a bad id must not fail the document");
@@ -399,7 +398,7 @@ mod tests {
     #[test]
     fn start_override_without_lvl_is_captured() {
         // A `<w:lvlOverride>` may carry only `<w:startOverride>` (no `<w:lvl>`);
-        // the old filter_map dropped such overrides entirely.
+        // such overrides must still be captured, not dropped.
         let xml = br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:num w:numId="3">
               <w:abstractNumId w:val="1"/>

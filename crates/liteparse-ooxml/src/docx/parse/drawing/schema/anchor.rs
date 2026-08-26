@@ -229,14 +229,24 @@ pub(crate) struct InlineXml {
     pub graphic: Option<GraphicXml>,
 }
 
+/// Build the T/R/B/L distance rectangle shared by `distT/B/L/R` attributes.
+fn dist_edge_insets(
+    t: Option<Dimension<Emu>>,
+    b: Option<Dimension<Emu>>,
+    l: Option<Dimension<Emu>>,
+    r: Option<Dimension<Emu>>,
+) -> EdgeInsets<Emu> {
+    EdgeInsets::new(
+        t.unwrap_or_default(),
+        r.unwrap_or_default(),
+        b.unwrap_or_default(),
+        l.unwrap_or_default(),
+    )
+}
+
 impl InlineXml {
     pub(crate) fn into_image(self, ctx: &mut crate::docx::parse::body::ConvertCtx) -> Image {
-        let distance = EdgeInsets::new(
-            self.dist_t.unwrap_or_default(),
-            self.dist_r.unwrap_or_default(),
-            self.dist_b.unwrap_or_default(),
-            self.dist_l.unwrap_or_default(),
-        );
+        let distance = dist_edge_insets(self.dist_t, self.dist_b, self.dist_l, self.dist_r);
         Image {
             extent: Size::new(self.extent.cx, self.extent.cy),
             effect_extent: self.effect_extent.map(Into::into),
@@ -278,11 +288,10 @@ pub(crate) struct AnchorXml {
     pub dist_r: Option<Dimension<Emu>>,
     #[serde(rename = "@simplePos", default)]
     pub simple_pos_attr: Option<AttrBool>,
-    // §20.4.2.3 marks these four `use="required"`, but a single nonconformant
-    // `<wp:anchor>` (some third-party / hand-edited producers omit them) would
-    // otherwise fail deserialization and abort the whole-document parse. Accept
-    // them as optional and apply Word's effective defaults at the `into_image`
-    // seam — matching `layout_in_cell` / `hidden`, which are already lenient.
+    // §20.4.2.3 marks these four `use="required"`, but a nonconformant
+    // `<wp:anchor>` that omits one would otherwise abort the whole-document
+    // parse. Accept them as optional and apply Word's effective defaults in
+    // `into_image`, matching `layout_in_cell` / `hidden` below.
     #[serde(
         rename = "@relativeHeight",
         default,
@@ -566,12 +575,7 @@ impl From<StWrapText> for WrapText {
 
 impl AnchorXml {
     pub(crate) fn into_image(self, ctx: &mut crate::docx::parse::body::ConvertCtx) -> Image {
-        let distance = EdgeInsets::new(
-            self.dist_t.unwrap_or_default(),
-            self.dist_r.unwrap_or_default(),
-            self.dist_b.unwrap_or_default(),
-            self.dist_l.unwrap_or_default(),
-        );
+        let distance = dist_edge_insets(self.dist_t, self.dist_b, self.dist_l, self.dist_r);
         let simple_pos = self.simple_pos.map(|s| Offset::new(s.x, s.y));
         let use_simple_pos = self.simple_pos_attr.map(|b| b.0);
         let horizontal_position = position(self.pos_h);
@@ -721,11 +725,9 @@ mod tests {
         assert_eq!(effect.b.unwrap().raw(), 48);
     }
 
+    /// A negative extent must not fail the whole document; it degrades to
+    /// zero instead, and the sibling axis stays untouched.
     #[test]
-    /// Upstream rejected a negative extent, failing the whole document over a
-    /// shape's size. We degrade it to zero instead — but the guard it existed
-    /// for still holds: a negative extent must never become a real size, and
-    /// the sibling axis must survive untouched.
     fn negative_decimal_extent_degrades_to_zero() {
         let parsed: ExtentXml = quick_xml::de::from_str(r#"<extent cx="-1.5" cy="100"/>"#)
             .expect("a negative extent must not fail the parse");

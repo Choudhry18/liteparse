@@ -102,8 +102,8 @@ fn table() -> &'static HashMap<PresetShapeType, CustomGeometry> {
 /// absent from the table (`PresetShapeType::Other` for a name the spec has no
 /// definition for).
 /// Borrowed whenever the shape declares no `<a:avLst>` of its own, which is
-/// the common case — the whole definition is then shared, not copied per
-/// shape. This is the difference between ~50ns and ~600ns per shape built.
+/// the common case — the whole definition is then shared rather than cloned
+/// per shape.
 pub fn resolve<'a>(
     preset: &PresetShapeType,
     adjust_values: &[GeomGuide],

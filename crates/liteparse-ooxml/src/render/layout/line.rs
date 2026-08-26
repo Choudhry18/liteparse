@@ -67,8 +67,8 @@ pub fn fit_lines_with_first(
     // §17.3.1.30: where the pen actually *is*, as opposed to how much width
     // the line has accumulated. The two differ only across a position tab,
     // which jumps the pen to its anchor while contributing a nominal width.
-    // Tracking it separately keeps `line_width` — and therefore every
-    // non-ptab paragraph's fitting — bit-for-bit unchanged.
+    // Tracking it separately leaves `line_width` — and therefore fitting of
+    // every paragraph without a position tab — unchanged.
     let line_pen_start = |is_first_line: bool| {
         ptab_geometry.indent_left
             + if is_first_line {
@@ -146,11 +146,9 @@ pub fn fit_lines_with_first(
                         matches!(relative_to, crate::model::PTabRelativeTo::Margin);
                 }
                 crate::render::layout::paragraph::PTabPlacement::AdvancesToNextLine { .. } => {
-                    // Only break when doing so can help. A tab already first
-                    // on its line would find the same anchor behind the same
-                    // pen on the next one — acting on a condition the action
-                    // cannot change is how this engine's pagination loops have
-                    // historically become infinite.
+                    // Only break when doing so can help: a tab already first on
+                    // its line would find the same anchor behind the same pen on
+                    // the next line, so breaking would loop forever.
                     if line_start < i {
                         let m = measure_range(fragments, line_start, i);
                         lines.push(FittedLine {

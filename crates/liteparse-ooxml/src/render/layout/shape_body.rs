@@ -20,10 +20,9 @@ use crate::render::layout::section::{LayoutBlock, PageParity};
 /// §20.1.2.1.1 spec defaults for an absent inset: 91440 EMU horizontal,
 /// 45720 EMU vertical.
 ///
-/// Materializing these is not optional. `BodyProperties` keeps an absent
-/// attribute as `None` rather than substituting the default, so a consumer that
-/// reads the field directly lays the body out at the full shape width — which
-/// on the PPTX corpus is 47.2% of text shapes, every one of them wrong.
+/// Applying these is required for correctness: `BodyProperties` keeps an absent
+/// attribute as `None` rather than substituting the default, so reading the
+/// field directly would lay the body out at the full shape width.
 const DEFAULT_INSET_LR: f32 = 91440.0 / 12700.0; // ≈ 7.2pt
 const DEFAULT_INSET_TB: f32 = 45720.0 / 12700.0; // ≈ 3.6pt
 
@@ -225,16 +224,13 @@ pub fn layout_shape_body(
 /// Total over [`TextVertOverflow`] with no catch-all, so a new value of the
 /// attribute has to state its own behaviour here.
 ///
-/// **This drops whole commands, which is a line-granular approximation of what
-/// Word does.** Word clips at the pixel, so a line straddling the box edge
-/// shows its top sliver; here it disappears. Real clipping needs a canvas clip
-/// that survives into paint, and draw commands are flattened into one flat
-/// per-page list with no scoping — so it would mean a new `DrawCommand`
-/// wrapper variant and an arm in every consumer. Dropping is the safe
-/// direction (`clip`'s contract is that nothing paints outside the box), and
-/// no corpus document asks for `clip` at all — 4 explicit `overflow`, 10
-/// `bodyPr` with the attribute absent, zero `clip` or `ellipsis` — so this is
-/// worth revisiting only once a real document needs the sliver.
+/// **This drops whole commands, a line-granular approximation of what Word
+/// does.** Word clips at the pixel, so a line straddling the box edge shows its
+/// top sliver; here it disappears. Real clipping needs a canvas clip that
+/// survives into paint, but draw commands are flattened into one flat per-page
+/// list with no scoping, so it would mean a new `DrawCommand` wrapper variant
+/// and an arm in every consumer. Dropping is the safe direction: `clip`'s
+/// contract is that nothing paints outside the box.
 fn overflow_keeps(
     overflow: crate::model::TextVertOverflow,
     cmd: &DrawCommand,
@@ -260,8 +256,7 @@ mod tests {
     use super::*;
     use crate::model::{BodyProperties, TextAnchoringType, TextVertOverflow};
 
-    /// An `a:bodyPr` that is *present* but declares no insets — the shape the
-    /// PPTX corpus is full of.
+    /// An `a:bodyPr` that is *present* but declares no insets.
     fn body_pr() -> BodyProperties {
         BodyProperties {
             rotation: None,
@@ -288,9 +283,8 @@ mod tests {
 
     #[test]
     fn present_bodypr_with_absent_attrs_still_takes_defaults() {
-        // The case that matters: `a:bodyPr` is declared on 100% of PPTX text
-        // shapes, but half of them declare no insets. Reading the `None` as
-        // zero would widen the body by 14.4pt.
+        // A present `a:bodyPr` that declares no insets must still take the spec
+        // defaults; reading the `None` as zero would widen the body by 14.4pt.
         let insets = BodyInsets::resolve(Some(&body_pr()));
         assert_eq!(insets, BodyInsets::resolve(None));
     }

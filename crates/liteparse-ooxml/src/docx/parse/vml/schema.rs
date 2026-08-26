@@ -6,7 +6,7 @@
 //! color names/hex) are reused from `vml::{style, color, path_commands,
 //! formulas}` as pure `&str` → value parsers.
 
-#![allow(dead_code, clippy::large_enum_variant)]
+#![allow(clippy::large_enum_variant)]
 
 use serde::Deserialize;
 
@@ -89,6 +89,7 @@ pub(crate) enum VmlPrimitiveXml {
     /// but `$value` collects *every* child — this variant lets serde
     /// absorb the duplicate match without erroring.
     #[serde(rename = "shapetype")]
+    #[allow(dead_code, reason = "captured for serde routing only, see into_model")]
     ShapeType(Box<ShapeTypeXml>),
     /// Unknown / unsupported VML element. Dropped at conversion time.
     #[serde(other)]
@@ -181,7 +182,7 @@ impl From<FillXml> for crate::docx::model::VmlFill {
             color2: x.color2.as_deref().and_then(parse_color),
             opacity: x.opacity.as_deref().and_then(|s| {
                 // VML opacity admits "0.5" or "32768f" (fixed-point fraction
-                // of 65536). For phase C we accept the float form.
+                // of 65536). Only the plain float form is handled here.
                 s.parse::<f32>().ok()
             }),
             src: x.src,
@@ -293,18 +294,20 @@ pub(crate) struct ShapeXml {
 
 impl ShapeXml {
     fn into_model(self, ctx: &mut crate::docx::parse::body::ConvertCtx) -> VmlShape {
+        let common = CommonAttrsXml {
+            id: self.id,
+            style: self.style,
+            fillcolor: self.fillcolor,
+            stroked: self.stroked,
+            stroke: self.stroke,
+            textbox: self.textbox,
+            wrap: self.wrap,
+            imagedata: self.imagedata,
+            fill: self.fill,
+        }
+        .into_model(ctx);
         VmlShape {
-            common: crate::model::VmlCommonAttrs {
-                id: self.id.map(VmlShapeId::new),
-                style: parse_style(self.style),
-                fill_color: self.fillcolor.as_deref().and_then(parse_color),
-                stroked: self.stroked.map(|b| b.0),
-                stroke: self.stroke.map(Into::into),
-                text_box: self.textbox.map(|t| t.into_model(ctx)),
-                wrap: self.wrap.map(Into::into),
-                image_data: self.imagedata.map(Into::into),
-                fill: self.fill.map(Into::into),
-            },
+            common,
             shape_type_ref: self
                 .ty
                 .map(|s| VmlShapeId::new(s.strip_prefix('#').unwrap_or(&s))),
@@ -318,15 +321,11 @@ impl ShapeXml {
 
 /// VML §14.1.2.16 `<v:rect>`.
 ///
-/// Common attrs are inlined here (rather than via
-/// `#[serde(flatten)]` on a `CommonAttrsXml`) because quick-xml's
-/// serde drops the deeply-nested `<v:textbox><w:txbxContent>...`
-/// when the field carrying `<v:textbox>` lives behind a flatten
-/// boundary — the rect's textbox content silently vanishes. Inlining
-/// keeps every child element on the same struct level so it parses
-/// faithfully. The other primitives keep `flatten` because they
-/// don't host text-box content in practice (or do but were simpler
-/// to wire that way).
+/// Common attrs are inlined here (rather than via `#[serde(flatten)]`
+/// on `CommonAttrsXml`) because quick-xml's serde drops deeply-nested
+/// `<v:textbox><w:txbxContent>...` content when the field carrying
+/// `<v:textbox>` lives behind a flatten boundary. Inlining keeps every
+/// child element at the same struct level so it parses correctly.
 #[derive(Deserialize)]
 pub(crate) struct RectXml {
     #[serde(rename = "@id", default)]
@@ -352,17 +351,18 @@ pub(crate) struct RectXml {
 impl RectXml {
     fn into_model(self, ctx: &mut crate::docx::parse::body::ConvertCtx) -> VmlRect {
         VmlRect {
-            common: VmlCommonAttrs {
-                id: self.id.map(VmlShapeId::new),
-                style: parse_style(self.style),
-                fill_color: self.fillcolor.as_deref().and_then(parse_color),
-                stroked: self.stroked.map(|b| b.0),
-                stroke: self.stroke.map(Into::into),
-                text_box: self.textbox.map(|t| t.into_model(ctx)),
-                wrap: self.wrap.map(Into::into),
-                image_data: self.imagedata.map(Into::into),
-                fill: self.fill.map(Into::into),
-            },
+            common: CommonAttrsXml {
+                id: self.id,
+                style: self.style,
+                fillcolor: self.fillcolor,
+                stroked: self.stroked,
+                stroke: self.stroke,
+                textbox: self.textbox,
+                wrap: self.wrap,
+                imagedata: self.imagedata,
+                fill: self.fill,
+            }
+            .into_model(ctx),
         }
     }
 }
@@ -1204,11 +1204,9 @@ mod tests {
 
     #[test]
     fn rect_textbox_content_is_populated() {
-        // Regression for the gray-bar text bug: `<v:rect>` with a
-        // `<v:textbox><w:txbxContent>` should reach the model with
-        // its inner paragraphs intact, just like `<v:shape>` does.
-        // The `flatten` indirection on `RectXml.common` was dropping
-        // the inner content when this test was first added.
+        // Regression: `<v:rect>` with a `<v:textbox><w:txbxContent>` must
+        // reach the model with its inner paragraphs intact, just like
+        // `<v:shape>` does — see the `flatten` note on `RectXml`.
         use crate::docx::model::VmlPrimitive;
         let p = parse(
             r#"<pict>

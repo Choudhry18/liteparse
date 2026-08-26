@@ -10,14 +10,13 @@ use crate::render::layout::draw_command::DrawCommand;
 ///
 /// Three states rather than `Option<TableBorderLine>`, because [MS-OI29500]
 /// §17.4.66 distinguishes "nothing said about this edge" from "declared
-/// `val="nil"`". The difference is entirely about **inheritance**: an omitted
-/// or `none` edge falls back to the table style, then `tblPrEx`, then
-/// `tblBorders`; `nil` declines that fallback and stays empty.
+/// `val="nil"`". The difference is about **inheritance**: an omitted or `none`
+/// edge falls back to the table style, then `tblPrEx`, then `tblBorders`; `nil`
+/// declines that fallback and stays empty. It does *not* outrank the facing
+/// cell — `nil` removes this cell's border and nothing else (see
+/// [`resolve_border_conflict`]).
 ///
-/// It is *not* about outranking the facing cell. `nil` removes this cell's
-/// border and nothing else — see [`resolve_border_conflict`].
-///
-/// The distinction survives resolution for one downstream reader: the page-split
+/// The distinction survives resolution for one reader: the page-split
 /// top-border restore in `emit.rs` may revive an `Absent` top but must not
 /// revive a `Suppressed` one. For painting they are identical, which is what
 /// [`CellEdge::line`] expresses.
@@ -151,61 +150,34 @@ pub(super) fn resolve_cell_effective_borders(
 /// Resolve a border conflict between two competing borders on a shared edge.
 /// Returns the winning border (or `None` if both are `None`).
 ///
-/// The algorithm is **not in ISO/IEC 29500-1** — the standard only says a method
-/// exists. It is spelled out in [MS-OI29500] §17.4.66 (`tcBorders`, note a),
-/// which is the authority for every step below:
+/// The algorithm is not in ISO/IEC 29500-1 — the standard only says a method
+/// exists. It is spelled out in [MS-OI29500] §17.4.66 (`tcBorders`, note a):
 ///   1. An edge with no border yields to one that has it. `none` counts as
-///      no border, per *"If the conflicting table cell border is `none` (no
-///      border), then the opposing border shall be displayed."*
+///      no border.
 ///   2. Weight = width in eighths of a point × style number. Higher wins.
-///   3. Equal weight: the style **earlier in the spec's precedence list** wins —
+///   3. Equal weight: the style earlier in the spec's precedence list wins —
 ///      `Single` over `Double`. See `style_precedence_index`.
 ///   4. Equal style: darker colour wins (`R+B+2G`, then `B+2G`, then `G`).
 ///
-/// **What `nil` does, and what it does not.** The note adds *"If the conflicting
-/// table cell border is `nil`, then no border shall be displayed"*, which reads
-/// as `nil` beating everything on the far side of the edge. It does not, and
-/// implementing it that way deleted borders Word draws. `nil` acts on **its own
-/// cell only**: it is how a cell declines the inheritance the note describes one
-/// step earlier (style → `tblPrEx` → `tblBorders`), which is the whole of its
-/// difference from `none`. The facing cell's border is untouched, so
-/// `Suppressed` yields here exactly like `Absent`.
+/// `nil` acts on its own cell only: it declines the inheritance in step 0
+/// (style → `tblPrEx` → `tblBorders`), which is its whole difference from
+/// `none`, but does not remove the facing cell's border. The note's literal
+/// wording (*"If the conflicting table cell border is `nil`, then no border
+/// shall be displayed"*) would delete borders Word draws — a cell paints one
+/// border across its whole width, so a wide cell's `nil` cannot punch a hole in
+/// the cell above it. So `Suppressed` yields here exactly like `Absent`. `nil`
+/// is still not a no-op: with nothing facing it (a table's outer edge, or a
+/// facing `nil`) declining inheritance is what removes the border.
 ///
-/// Three independent facts in `IP 05 Trenches` fix the reading, and no evidence
-/// contradicts it:
+/// The comparison is a **total order** so the result is independent of argument
+/// order: the caller feeds (upper row's bottom, lower row's top) and (left
+/// cell's right, right cell's left), and the winner must not depend on which
+/// side of the edge a border came from.
 ///
-/// * a cell declaring `<w:bottom w:val="single"/>` above one declaring
-///   `<w:top w:val="nil"/>` — Word draws the line, as does macOS's own DOCX
-///   renderer on the same markup;
-/// * a cell that *inherits* its bottom from `insideH`, faced by a `gridSpan=2`
-///   spacer cell whose `nil` was aimed at the neighbouring column — Word draws
-///   that line too, and it could not do otherwise: a cell paints one border
-///   across its whole width, so a wide cell's `nil` cannot punch a hole in the
-///   cell above it;
-/// * down the document's spacer columns the generator writes `nil` on **both**
-///   sides of every shared edge. Writing both is only necessary because one
-///   alone does not suppress.
-///
-/// `nil` is still not a no-op: with nothing facing it — a table's outer edge, or
-/// a facing cell that is also `nil` — declining inheritance is exactly what
-/// removes the border. Both halves are pinned by
-/// `tests/table_border_conflict.rs`.
-///
-/// **The comparison is a total order, and that is the point.** The caller feeds
-/// this (upper row's bottom, lower row's top) and (left cell's right, right
-/// cell's left), so a rule that stops at step 2 leaves the winner decided by
-/// *which side of the edge a border came from* — an implementation detail. Ties
-/// used to fall through to whichever argument came first, which meant an
-/// equal-weight 3pt single beat a 1pt double or lost to it depending on
-/// argument order, and of two equal borders differing only in colour the paler
-/// one won half the time. `resolve_border_conflict(a, b)` now always equals
-/// `resolve_border_conflict(b, a)`.
-///
-/// Suppression is still a *third* state, which is why the argument type is
-/// [`CellEdge`] and not `Option<TableBorderLine>`: when neither side paints,
-/// returning `Suppressed` rather than `Absent` keeps the two distinguishable for
-/// the caller — a suppressed edge must not be revived by the page-split
-/// top-border restore in `emit.rs`, whereas an absent one should be.
+/// Suppression is a third state — the reason the argument type is [`CellEdge`],
+/// not `Option<TableBorderLine>`. When neither side paints, returning
+/// `Suppressed` rather than `Absent` keeps them distinguishable: a suppressed
+/// edge must not be revived by the page-split top-border restore in `emit.rs`.
 pub(super) fn resolve_border_conflict(a: CellEdge, b: CellEdge) -> CellEdge {
     match (a, b) {
         (CellEdge::Line(la), CellEdge::Line(lb)) => {
@@ -229,14 +201,11 @@ pub(super) fn resolve_border_conflict(a: CellEdge, b: CellEdge) -> CellEdge {
 ///
 /// Returns integers so the key is `Ord`: comparing `f32` weights directly would
 /// need `partial_cmp`, and a `NaN` width (unreachable, but the type permits it)
-/// would silently make the comparison non-transitive and reintroduce the
-/// order-dependence this exists to remove.
+/// would make the comparison non-transitive and reintroduce order-dependence.
 ///
-/// **Two fields are inverted, and for the same reason.** The spec states both
-/// style and colour as "lower value wins" rankings — earliest in the precedence
-/// list, and smallest brightness. This key is "greater wins", so each is
-/// subtracted from its type's maximum. Inverting one and not the other is the
-/// defect this layout is meant to make obvious.
+/// Style and colour are both spec-ranked as "lower value wins" (earliest in the
+/// precedence list, smallest brightness). This key is "greater wins", so each is
+/// subtracted from its type's maximum.
 fn border_precedence(b: &TableBorderLine) -> (u32, u8, u32, u32, u32) {
     let (l0, l1, l2) = colour_luminance(b);
     (
@@ -258,12 +227,9 @@ fn border_precedence(b: &TableBorderLine) -> (u32, u8, u32, u32, u32) {
 /// "Higher on the list" means **earlier**, so this returns the 0-based index
 /// into it and **lower wins** — `border_precedence` inverts it.
 ///
-/// So `Single` beats `Double` at equal weight, which is worth stating plainly
-/// because the intuition runs the other way: a double border has the greater
-/// *style number* (3 vs 1) and therefore the greater weight at equal width, and
-/// it is easy to carry that ordering into the tie-break, where the spec
-/// reverses it. Equal weight means the single is three times wider — a 3pt
-/// solid line against two 0.33pt hairlines — and the spec prefers the single.
+/// So `Single` beats `Double` at equal weight (note the intuition runs the other
+/// way: a double border has the greater style number, 3 vs 1, so at equal weight
+/// the single is three times wider, and the spec prefers it).
 ///
 /// Only `Single` and `Double` reach layout (the other 24 §17.4.38 styles are
 /// approximated as `Single` — see `convert_model_border`), so only their two
@@ -698,15 +664,10 @@ mod conflict_tests {
         v
     }
 
-    /// **The property that matters.** The caller passes (upper row's bottom,
-    /// lower row's top) and (left cell's right, right cell's left), so a
-    /// resolution that depends on argument order makes the rendered border
-    /// depend on which *side of the edge* it was declared on.
-    ///
-    /// Before this was a total order, ties fell through to whichever argument
-    /// came first: an equal-weight 3pt single beat a 1pt double or lost to it
-    /// depending on the call, and of two borders differing only in colour the
-    /// paler one won half the time.
+    /// The caller passes (upper row's bottom, lower row's top) and (left cell's
+    /// right, right cell's left), so a resolution that depends on argument order
+    /// would make the rendered border depend on which side of the edge it was
+    /// declared on.
     #[test]
     fn resolution_is_independent_of_argument_order() {
         let borders = sample_borders();
@@ -744,12 +705,7 @@ mod conflict_tests {
 
     /// Step 3 — equal weight, so position in the spec's precedence list decides,
     /// and **`Single` wins**. 3pt single and 1pt double both weigh 3
-    /// (width × style number), which is exactly the tie the pre-E5b#2 code
-    /// resolved by argument position.
-    ///
-    /// This test previously asserted the opposite, and was mutation-checked in
-    /// that state — the code and the assertion shared one error, so no mutation
-    /// could expose it. [MS-OI29500] §17.4.66 orders the list
+    /// (width × style number). [MS-OI29500] §17.4.66 orders the list
     /// `single, thick, double, …` and displays *"the higher of the two on this
     /// precedence list"*, i.e. the earlier one.
     #[test]
@@ -875,17 +831,13 @@ mod conflict_tests {
         );
     }
 
-    /// **`nil` does not reach across the edge.** [MS-OI29500] §17.4.66 says
-    /// *"If the conflicting table cell border is nil, then no border shall be
-    /// displayed"*, and read literally that is wrong: `nil` empties its own
-    /// cell's edge and leaves the facing cell's border alone. It loses from
-    /// either side and at any weight — even a hairline survives it.
-    ///
-    /// `IP 05 Trenches` is the reference. `<w:bottom w:val="single"/>` above
-    /// `<w:top w:val="nil"/>` draws in Word and in macOS's DOCX renderer; so
-    /// does an *inherited* bottom faced by a `gridSpan` spacer cell's `nil`, and
-    /// it must — a cell paints one border across its whole width, so a wide
-    /// cell's `nil` cannot punch a hole in the cell above it.
+    /// `nil` does not reach across the edge. [MS-OI29500] §17.4.66 says *"If the
+    /// conflicting table cell border is nil, then no border shall be displayed"*,
+    /// and read literally that is wrong: `nil` empties its own cell's edge and
+    /// leaves the facing cell's border alone. It loses from either side and at
+    /// any weight — even a hairline survives it, because a cell paints one border
+    /// across its whole width and so a wide cell's `nil` cannot punch a hole in
+    /// the cell above it.
     #[test]
     fn nil_yields_to_the_facing_border() {
         let hair = line(0.25, TableBorderStyle::Single, BLACK);
@@ -1065,12 +1017,12 @@ mod edge_mapping_tests {
         );
     }
 
-    /// E5b#7. `num_rows == 0` is unreachable through `layout_table` — it returns
-    /// early on empty input, and every other caller is inside a row loop — but
-    /// `num_rows` is a free parameter of a `pub(super)` function, so the
-    /// last-row test must not depend on a caller having checked it.
-    /// `row_idx == num_rows - 1` underflows here; `row_idx + 1 == num_rows`
-    /// answers "no row is the last row of an empty table".
+    /// `num_rows == 0` is unreachable through `layout_table` (it returns early on
+    /// empty input, and every other caller is inside a row loop), but `num_rows`
+    /// is a free parameter of a `pub(super)` function, so the last-row check must
+    /// not depend on a caller having validated it. `row_idx == num_rows - 1`
+    /// underflows here; `row_idx + 1 == num_rows` answers "no row is the last row
+    /// of an empty table".
     #[test]
     fn an_empty_table_does_not_underflow_the_last_row_check() {
         assert_eq!(

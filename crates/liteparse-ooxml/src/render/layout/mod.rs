@@ -24,23 +24,18 @@ use crate::render::geometry::{PtEdgeInsets, PtSize};
 /// Exactly one branch is live. A consumer takes the first `<mc:Choice>` whose
 /// requirements it can meet and otherwise the `<mc:Fallback>`; it never takes
 /// both, because both describe the *same* object — the Choice in DrawingML,
-/// the Fallback in VML for clients that predate it.
-///
-/// Every walker that meets the element consults [`live_mc_branch`], so the
-/// answer is a property of the element rather than of who asked. Two
-/// predicates over one element is what produced the original double render,
-/// and a third walker that answered neither is what produced the *missing*
-/// render after it.
+/// the Fallback in VML for clients that predate it. Every walker that meets the
+/// element consults [`live_mc_branch`], so the answer is a property of the
+/// element rather than of who asked; that keeps the branch decision consistent
+/// across the several walkers and avoids double- or missing-render bugs.
 ///
 /// The `Fallback` arm deliberately does **not** split "float" from "inline".
-/// One VML fallback is routinely both, and by design: `extract_vml_primitive`
-/// draws a `<v:rect>`'s geometry and leaves its `text_commands` empty,
+/// One VML fallback is routinely both: `extract_vml_primitive` draws a
+/// `<v:rect>`'s geometry and leaves its `text_commands` empty,
 /// `extract_vml_primitive_image` skips any shape that also hosts text, and the
-/// inline collector picks the text box up at the host paragraph. That division
-/// is by graphic role, not by branch, and it is exactly how a bare `<w:pict>`
-/// already renders — so a live Fallback goes to all of them and each takes the
-/// part it owns. Naming an owner per variant would look tidier and would drop
-/// the text of every VML rect that has one.
+/// inline collector picks the text box up at the host paragraph. The division
+/// is by graphic role, not by branch — the same way a bare `<w:pict>` renders —
+/// so a live Fallback goes to all of them and each takes the part it owns.
 pub(crate) enum McBranch<'a> {
     /// The `<mc:Choice>` elements, in document order.
     Choices(&'a [crate::model::McChoice]),
@@ -55,17 +50,15 @@ pub(crate) enum McBranch<'a> {
 ///
 /// The test is **content-based**, not a `Requires` namespace check: a Choice
 /// may declare a namespace we nominally support and still hold nothing this
-/// renderer turns into geometry, and the honest question is whether we will
-/// actually draw it. What counts is an *anchor* — an anchored `wps:wsp` shape
-/// and an anchored picture are both `Inline::Image` with
-/// `ImagePlacement::Anchor`, so one question covers shapes and pictures alike
-/// and no walker has to ask a narrower version of it for itself.
+/// renderer turns into geometry, and what matters is whether we will actually
+/// draw it. What counts is an *anchor* — an anchored `wps:wsp` shape and an
+/// anchored picture are both `Inline::Image` with `ImagePlacement::Anchor`, so
+/// one test covers shapes and pictures alike.
 ///
 /// Recurses through `Hyperlink`/`Field` wrappers and nested elements. §M.1.2's
 /// content model for a branch is `drawing | pict`, so a nested
-/// `<mc:AlternateContent>` cannot come from a document — but it can be built,
-/// and resolving it innermost-first is the only reading under which the outer
-/// answer stays consistent with the inner one.
+/// `<mc:AlternateContent>` cannot come from a document, but resolving it
+/// innermost-first keeps the outer answer consistent with the inner one.
 pub(crate) fn live_mc_branch(ac: &crate::model::AlternateContent) -> McBranch<'_> {
     use crate::model::{ImagePlacement, Inline};
 
@@ -98,12 +91,10 @@ pub(crate) fn live_mc_branch(ac: &crate::model::AlternateContent) -> McBranch<'_
 /// Lives here rather than beside `BuildState` because both the block builder
 /// and the fragment layer apply it, and `fragment` must not depend on `build`.
 ///
-/// [`ShapeAutoFit::NONE`] is the identity and is what every call site outside a
-/// shape text body passes. The functions that resolve a font size or a line
-/// spacing take it as an explicit *parameter* rather than reaching for a
-/// default, so that a new call site has to say which it is — a silently
-/// inherited `1.0` is how these attributes came to be dropped in the first
-/// place.
+/// [`ShapeAutoFit::NONE`] is the identity, passed by every call site outside a
+/// shape text body. The functions that resolve a font size or line spacing take
+/// it as an explicit *parameter* rather than defaulting, so a new call site must
+/// state which it means and cannot silently inherit `1.0`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapeAutoFit {
     font_scale: f32,

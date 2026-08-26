@@ -1,14 +1,14 @@
 //! A worksheet part (`xl/worksheets/sheetN.xml`, §18.3): the cell grid, the
 //! row/column metrics the grid is drawn on, and the merges that break it.
 //!
-//! Streamed rather than deserialized. Sheets are the bulk of a workbook — 50.3M
-//! cells across the 1,089-workbook finance corpus, single sheets past 32 MB —
-//! and this is the one part where the reader's memory profile is decided.
+//! Streamed rather than deserialized. Sheets are the bulk of a workbook — a
+//! single sheet can hold tens of millions of cells and exceed 32 MB — and
+//! this is the one part where the reader's memory profile is decided.
 //!
 //! Two allocation decisions follow from that and are load-bearing:
 //!
 //! * **Shared strings are not resolved here.** A cell keeps its index into the
-//!   shared-string table. The table exists precisely so a string used 40,000
+//!   shared-string table. The table exists precisely so a string used many
 //!   times is stored once; resolving eagerly would undo that. See
 //!   [`crate::xlsx::Workbook::cell_text`].
 //! * **Value-less cells are dropped from [`Row::cells`].** `<c r="A1" s="7"/>`
@@ -21,19 +21,17 @@
 //!
 //! # The paint side-channel
 //!
-//! `xlsx_unvalued_paint_census` over the 1,248-workbook corpus: **57.6% of all
-//! declared paint reaches the file and not a reader built on valued cells
-//! alone**, in three carriers — value-less styled cells, `<row customFormat>`
-//! and `<col style>`. [`Row::styled_blanks`], [`Row::style`] and
-//! [`ColInfo::style`] are those three, and they exist for the raster; nothing
-//! that reads text sees them.
+//! A meaningful share of a workbook's declared paint never reaches a reader
+//! built on valued cells alone — it lives in three carriers: value-less
+//! styled cells, `<row customFormat>` and `<col style>`.
+//! [`Row::styled_blanks`], [`Row::style`] and [`ColInfo::style`] are those
+//! three, and they exist for the raster; nothing that reads text sees them.
 //!
 //! `styled_blanks` is pruned at `</row>`: a row with no valued cell is not a
 //! row any consumer of this reader emits, so its blanks are unreachable ink
 //! and are dropped rather than stored. That prune is also the memory bound —
-//! it is what keeps the pre-formatted-region sheets (thousands of blank rows
-//! past the data, class C of the census, 41.7% of all paint) from being held
-//! at all.
+//! it is what keeps a sheet with a large pre-formatted region (thousands of
+//! blank-but-styled rows past the data) from being held at all.
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -75,8 +73,8 @@ pub struct Cell {
     pub style: Option<u32>,
     pub value: CellValue,
     /// The cell holds an `<f>`. The formula text itself is not kept — the
-    /// cached `<v>` is what renders, and 49.3% of corpus workbooks have
-    /// formulas, so storing their source would be pure weight.
+    /// cached `<v>` is what renders, so storing the source would be pure
+    /// weight.
     pub has_formula: bool,
 }
 
@@ -101,8 +99,7 @@ pub struct Row {
     /// `<row s=… customFormat="1">`: a format for every cell of the row that
     /// states none of its own. Recorded **only** under `customFormat`, which
     /// is the attribute that says the `s=` is meant rather than inherited
-    /// (§18.3.1.73); 33,562 rows in the corpus declare one, carrying 482,334
-    /// cells of paint.
+    /// (§18.3.1.73).
     pub style: Option<u32>,
     /// Cells in written order, which is ascending column order in every
     /// producer seen. Sparse: absent columns are absent.
@@ -128,8 +125,7 @@ pub struct ColInfo {
     pub custom_width: bool,
     /// `<col style=…>`: a format for every cell of the span that states none
     /// of its own, and none through its row. Paint only, like
-    /// [`Row::styled_blanks`]: 8,372 corpus spans declare one, carrying
-    /// 163,350 cells of ink.
+    /// [`Row::styled_blanks`].
     pub style: Option<u32>,
 }
 
@@ -180,8 +176,7 @@ pub struct Sheet {
     pub default_row_height: Option<f64>,
     pub cols: Vec<ColInfo>,
     pub rows: Vec<Row>,
-    /// Present in 80.7% of real workbooks, which is why they are read by the
-    /// first version of this reader rather than deferred.
+    /// Merged cell ranges, common enough to read directly rather than defer.
     pub merges: Vec<RangeRef>,
     pub hyperlinks: Vec<Hyperlink>,
     /// `<pane ySplit=… state="frozen">`: rows frozen at the top. A direct
@@ -194,16 +189,16 @@ pub struct Sheet {
     /// `<sheetView showGridLines=…>`, from the first view only. `None` means
     /// the file did not say, which is Excel's default of *visible* — read it
     /// through [`Sheet::gridlines_visible`] rather than unwrapping to
-    /// `false`. It matters to the raster and nothing else: 12.1% of corpus
-    /// sheets declare neither a fill nor a border anywhere, so gridlines are
-    /// the only ink holding their numbers in a grid.
+    /// `false`. It matters to the raster and nothing else: a sheet with no
+    /// fill or border anywhere relies on gridlines as the only ink holding
+    /// its numbers in a grid.
     pub show_gridlines: Option<bool>,
     /// `<drawing r:id>`: the sheet's DrawingML part, scoped to the sheet's
     /// own relationships. At most one per §18.3.1.36.
     pub drawing_rel_id: Option<String>,
     /// Pictures placed over the grid, resolved by [`crate::xlsx::read`] from
-    /// the drawing part — empty until then, and empty for the 69% of corpus
-    /// workbooks whose sheets draw nothing.
+    /// the drawing part — empty until then, and empty for a sheet that draws
+    /// nothing.
     pub pics: Vec<crate::xlsx::drawings::SheetPic>,
     /// Visible text-bearing shapes floating over the grid, from the same
     /// drawing part as `pics`. Titles, form labels, instructions — content
@@ -228,11 +223,6 @@ impl Sheet {
     /// value-less cells, which this reader has already dropped.
     pub fn merge_anchored_at(&self, at: CellRef) -> Option<&RangeRef> {
         self.merges.iter().find(|m| m.start == at)
-    }
-
-    /// The merge covering `at`, anchor or not.
-    pub fn merge_covering(&self, at: CellRef) -> Option<&RangeRef> {
-        self.merges.iter().find(|m| m.contains(at))
     }
 
     /// Are the sheet's gridlines drawn? Undeclared means yes (§18.3.1.87).
@@ -499,10 +489,9 @@ fn finish_cell(pending: PendingCell, raw: &str, row: &mut Option<Row>, sheet: &m
     let value = match pending.kind.as_str() {
         "inlineStr" => pending.text.map(CellValue::Text),
         // An empty body is a styled-but-blank cell that the producer happened
-        // to write as `<c …></c>` rather than `<c …/>`. Not corruption, and
-        // counting it as a dangling index would report 480 fake anomalies on
-        // one corpus workbook — which is exactly what it did before this
-        // distinction existed.
+        // to write as `<c …></c>` rather than `<c …/>`. Not corruption —
+        // counting it as a dangling index would report a false anomaly for
+        // every one of these.
         "s" if raw.trim().is_empty() => None,
         "s" => match raw.trim().parse::<u32>() {
             Ok(i) => Some(CellValue::SharedString(i)),
@@ -675,9 +664,9 @@ mod tests {
         assert_eq!(s.stats.empty_styled_cells, 1);
     }
 
-    /// The memory bound and the class-C rule in one: a row with no value is
-    /// emitted by nobody, so its blanks are dropped rather than stored — for
-    /// the row written `<c/>`-style and for the one written `<c></c>`.
+    /// A row with no value is emitted by nobody, so its blanks are dropped
+    /// rather than stored — for the row written `<c/>`-style and for the one
+    /// written `<c></c>`.
     #[test]
     fn a_valueless_row_keeps_its_metrics_and_drops_its_blanks() {
         let xml = r#"<worksheet><sheetData>
@@ -787,7 +776,7 @@ mod tests {
 
     /// `<c t="s"></c>` — a blank cell a producer wrote with an explicit close
     /// tag instead of self-closing. It is styled-but-blank, not a broken
-    /// index; one corpus workbook has 480 of them.
+    /// index.
     #[test]
     fn an_empty_shared_string_cell_is_blank_not_dangling() {
         let xml = r#"<worksheet><sheetData><row r="1">
@@ -829,13 +818,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_lookup_distinguishes_the_anchor_from_the_covered_cells() {
+    fn merge_lookup_finds_only_the_anchor_cell() {
         let s = sheet();
         let a1 = parse_cell("A1").unwrap();
         let b1 = parse_cell("B1").unwrap();
         assert!(s.merge_anchored_at(a1).is_some());
         assert!(s.merge_anchored_at(b1).is_none());
-        assert!(s.merge_covering(b1).is_some());
     }
 
     #[test]

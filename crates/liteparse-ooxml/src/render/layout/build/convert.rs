@@ -105,26 +105,16 @@ pub(super) fn resolve_paragraph_defaults(
 }
 
 /// §17.3.2.20 / §17.7.2: the language in effect for a paragraph's own layout
-/// decisions.
+/// decisions (e.g. the separator of a §17.18.85 `decimal` tab stop).
 ///
 /// The cascade is the paragraph **mark**'s `w:rPr`, then the paragraph style's
-/// run defaults, then `docDefaults` — the same order §17.7.2 resolves any other
-/// run property in, minus the runs themselves.
-///
-/// Leaving the runs out is deliberate, and is the one judgement call in
-/// threading locale. The decisions this answers belong to the *paragraph*: a
-/// §17.18.85 `decimal` stop is declared in `w:pPr/w:tabs`, and its zone may span
-/// several runs that each declare a different `w:lang` — there is no single
-/// run to ask. The paragraph mark is the nearest thing the file offers to
-/// "the language of this paragraph", and it is already what the §17.9.22 list
-/// label reads its formatting from, so the two agree.
-///
-/// Word itself is reported to take a decimal tab's separator from the host's
-/// regional settings rather than from the document at all, which a converter
-/// cannot reproduce and should not want to: the same file would render
-/// differently on two machines. This reading is deterministic and keyed to the
-/// document instead — but it is an assumption, not a verified match, and has
-/// never been checked against a Word render.
+/// run defaults, then `docDefaults` — the same order §17.7.2 uses for any run
+/// property, minus the runs. Runs are excluded deliberately: a decimal tab zone
+/// may span several runs with differing `w:lang`, so there is no single run to
+/// ask; the paragraph mark is the file's closest thing to "the language of this
+/// paragraph", and is also what the §17.9.22 list label reads. Keying to the
+/// document (rather than the host's regional settings, as Word reportedly does)
+/// keeps the render deterministic across machines.
 pub(super) fn paragraph_locale(
     para: &model::Paragraph,
     resolved: &ResolvedDocument,
@@ -188,8 +178,7 @@ pub(super) fn paragraph_outline(
 ///
 /// The §17.9.22 list label is deliberately absent: it is injected at layout,
 /// not part of the paragraph, and both Word and LibreOffice title a numbered
-/// heading with its text alone (measured against the reference PDF attached to
-/// issue #90).
+/// heading with its text alone.
 fn outline_title(inlines: &[model::Inline]) -> String {
     fn walk(inlines: &[model::Inline], out: &mut String) {
         for inline in inlines {

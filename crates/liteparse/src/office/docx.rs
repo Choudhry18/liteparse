@@ -3,8 +3,8 @@
 //! Deliberately avoids the vendored crate's `render::layout` stage: structure
 //! alone — headings, lists, emphasis, merged cells, notes — is recoverable
 //! without a layout engine, and layout is where the font/measurement
-//! dependencies live. Geometry is a separate concern (see `NATIVE_OFFICE_PLAN.md`
-//! stage 2); this module produces no bounding boxes.
+//! dependencies live. Geometry is a separate concern (see `docx_layout`); this
+//! module produces no bounding boxes.
 //!
 //! What `resolve()` hands us is *not* fully cascaded: it walks `basedOn` chains
 //! and flattens numbering (including `lvlOverride`/`startOverride`), but leaves
@@ -108,9 +108,8 @@ pub fn emit_with_sources(doc: &ResolvedDocument, opts: EmitOptions) -> Vec<(Bloc
     // Note bodies are appended after the document, behind a rule. Emit *all* of
     // them, not just those whose reference we walked past: notes are frequently
     // referenced from headers, footers and textboxes, and content-completeness
-    // is what matters here (spike 4 measured `present` 0.568 → 0.921 from this
-    // one choice). Note ids 0 and 1 are the separator and continuationSeparator
-    // — chrome, never real content.
+    // is what matters here. Note ids 0 and 1 are the separator and
+    // continuationSeparator — chrome, never real content.
     let mut notes = Vec::new();
     for map in [&doc.footnotes, &doc.endnotes] {
         let mut ids: Vec<NoteId> = map.keys().copied().filter(|i| i.value() > 1).collect();
@@ -158,8 +157,8 @@ struct Emitter<'a> {
     box_depth: u8,
 }
 
-/// Nesting depth past which a text box's interior is not walked. No corpus
-/// document nests at all; this only bounds a pathological or cyclic file.
+/// Nesting depth past which a text box's interior is not walked. Bounds a
+/// pathological or cyclic file; real documents do not nest text boxes.
 const MAX_TEXT_BOX_DEPTH: u8 = 4;
 
 impl<'a> Emitter<'a> {
@@ -399,10 +398,8 @@ impl<'a> Emitter<'a> {
     /// Run text inside a choice is already rendered by whichever branch the
     /// layout picked, and popping a figure id here would desync the queue,
     /// which pairs the nth structure occurrence with the nth *drawn* placement
-    /// and does not walk `mc:AlternateContent` at all. No corpus document has a
-    /// picture inside one (0 of 32 elements across 165 documents), so this
-    /// costs nothing measurable and keeps the figure pairing provably
-    /// unchanged.
+    /// and does not walk `mc:AlternateContent` at all. A picture inside one
+    /// does not occur in practice, so this keeps the figure pairing unchanged.
     fn harvest_boxes(&mut self, content: &[Inline]) {
         for inline in content {
             match inline {
@@ -484,9 +481,8 @@ impl<'a> Emitter<'a> {
             // flattened too: heading text feeds the outline and anchors.
             let text: String = chunks.iter().map(|c| c.text.as_str()).collect();
             out.push(Block::Heading {
-                // Emitted as declared. A dense 1..N remap was measured on the
-                // 48-doc corpus and lost 39 of 66 heading rules; see the
-                // "heading levels" note in NATIVE_OFFICE_PLAN.md.
+                // The declared outline level, not a remapped one: a dense 1..N
+                // remap discards the author's intended heading ranks.
                 level: OutlineLevel::value(lvl).clamp(1, 6),
                 text: self.escape(text.trim()),
             });

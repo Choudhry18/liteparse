@@ -36,13 +36,11 @@ pub fn layout_cell(
 ) -> CellLayout {
     let content_width = (cell_width - margins.horizontal()).max(Pt::ZERO);
 
-    // §20.4.3.1: a cell is measured before its table is paginated — a row can
-    // split across pages, and the split is decided from these measurements —
-    // so the page this cell lands on, and its parity, do not exist yet. An
-    // `inside`/`outside` float inside a table therefore takes the odd-page
-    // reading. That is the Tier-0 the page and header paths no longer need;
-    // removing it here means making cell measurement page-aware, which is a
-    // far larger change than the anchor resolution itself.
+    // §20.4.3.1: a cell is measured before its table is paginated (the row
+    // split is decided from these measurements), so the page this cell lands on
+    // and its parity do not exist yet. An `inside`/`outside` float inside a
+    // table therefore takes the odd-page reading; resolving it correctly would
+    // require making cell measurement page-aware.
     let result = stack_blocks(
         blocks,
         content_width,

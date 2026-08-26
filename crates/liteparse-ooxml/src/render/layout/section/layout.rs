@@ -223,8 +223,8 @@ impl<'doc> PageLayoutState<'doc> {
         // page. Only rescan when the page changes. The scan tracks inline
         // column/page boundaries (`scan_inline_page_boundary`) so a float past
         // an in-paragraph break isn't attributed to this page, and skips blocks
-        // whose absolute float has been relocated to a later page (#86's
-        // relocation replay), so wrapped text on the replayed page ignores it.
+        // whose absolute float has been relocated to a later page (relocation
+        // replay), so wrapped text on the replayed page ignores it.
         if self.abs_floats_dirty {
             self.current_page_abs_floats.clear();
             let mut scan_col = self.current_col;
@@ -1557,7 +1557,7 @@ pub(crate) fn layout_section_with_clearance(
                 let page_chunks = split_at_page_breaks(fragments);
                 let mut para_start_y = state.cursor_y;
                 state.last_para_start_y = state.cursor_y;
-                // §17.4.56 (#86 relocation): true once any of this paragraph's
+                // §17.4.56: true once any of this paragraph's
                 // content has been placed, so a later overflow relocates its
                 // absolute float instead of double-wrapping earlier text.
                 let mut paragraph_content_placed = false;
@@ -1687,7 +1687,7 @@ pub(crate) fn layout_section_with_clearance(
                         // the first segment by the unbreakable-prefix guard, so
                         // the tail reuses its fitted lines). Paragraphs that own
                         // floating objects stay atomic (the object anchors to one
-                        // page) and take the #86 relocation path in the `else`
+                        // page) and take the relocation path in the `else`
                         // branch below. Footnotes are reserved per segment, but
                         // only for a single, unbroken chunk — with explicit
                         // page/column breaks their reference→segment mapping is
@@ -1734,7 +1734,7 @@ pub(crate) fn layout_section_with_clearance(
                                 // and re-placing at the destination page, whose
                                 // max_height differs and re-clamps the height.
                                 drop(placed);
-                                // #86: if this atomic paragraph owns an absolute
+                                // If this atomic paragraph owns an absolute
                                 // wrap float and moves to a new page before any of
                                 // its own content is placed, earlier source-page
                                 // text may already have wrapped around that future
@@ -1814,7 +1814,7 @@ pub(crate) fn layout_section_with_clearance(
                             }
                             state.cursor_y += para.size.height;
                         }
-                        // #86: mark that content of this paragraph has landed
+                        // Mark that content of this paragraph has landed
                         // (either split segments or the atomic block), so a
                         // later block's absolute-float overflow relocates rather
                         // than double-wrapping this already-placed text.
@@ -2102,9 +2102,6 @@ pub(crate) fn layout_section_with_clearance(
                             // attribute exists for tables.
                             wrap_text: float::WrapTextSide::BothSides,
                         });
-                        // Suppress unused warning when `is_anchor` is no
-                        // longer the discriminant for registration.
-                        let _ = is_anchor;
                     }
                     block_idx += 1;
                     continue;
@@ -2203,7 +2200,7 @@ mod keep_next_chain_tests {
 
 /// §17.3.1.14 / §17.3.1.15 — `paragraph_breakable`, the predicate shared by the
 /// placement gate and the keepNext predictor. Extracted precisely because the
-/// two had drifted apart on the footnote condition (E4a#3).
+/// two had drifted apart on the footnote condition.
 #[cfg(test)]
 mod paragraph_breakable_tests {
     use super::*;

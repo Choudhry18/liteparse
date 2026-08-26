@@ -8,19 +8,17 @@
 //!
 //! It is the sibling of [`pptx::cascade`], which does the same job for
 //! geometry, and it reuses that module's [`MatchRule`] verbatim. It differs
-//! from it in three ways that a shared implementation would have got wrong,
-//! each measured on the 45-deck corpus before any of this was written.
+//! from it in three ways that a shared implementation would have got wrong.
 //!
 //! [`pptx::cascade`]: crate::pptx::cascade
 //!
 //! ## 1. The merge is per-property, not whole-value
 //!
 //! Geometry inherits a whole `Transform2D` because a transform is never
-//! partial — 0 counterexamples on the corpus. Text is the opposite: **5,954
-//! layout `a:lstStyle` levels supply a size *and* other properties, and 5,232
-//! supply properties but no size.** A rung that answers "bold" and stays silent
-//! on "size" is the common case, so every property resolves independently and
-//! the walk continues past a rung that answered partially.
+//! partial. Text is the opposite: a layout `a:lstStyle` level routinely
+//! supplies some properties but not others — bold and silence on size is
+//! the common case — so every property resolves independently and the walk
+//! continues past a rung that answered partially.
 //!
 //! That merge is [`merge_run_properties`], vendored for DOCX and field-complete
 //! (its `merge_run_all_fields_covered` test is the guard). Text inheritance in
@@ -45,42 +43,37 @@
 //! `defaultTextStyle` is simply deck-wide.
 //!
 //! **Rung 5 is the one that would have been dropped.** It looks redundant
-//! beside rung 6, and python-pptx's documented chain omits it. The corpus says
-//! otherwise: of the 150 master placeholders carrying their own size, **742
-//! level-values disagree with what `p:txStyles` says and only 29 agree** —
-//! including a `bodyStyle` reading 32pt against `p:txStyles`' 14pt. Skipping
-//! this rung would not have been a rounding error, it would have been 2.3x
-//! wrong on real slides.
+//! beside rung 6, and python-pptx's documented chain omits it. In practice
+//! a master placeholder's own size routinely disagrees with what
+//! `p:txStyles` says for the same kind — sometimes by a wide margin (e.g. a
+//! `bodyStyle` reading 32pt against `p:txStyles`' 14pt) — so skipping this
+//! rung would produce real, not just cosmetic, size errors.
 //!
-//! ## 3. Non-placeholder shapes are 41% of the need and no matcher can see them
+//! ## 3. Non-placeholder shapes are a large fraction of the need and no matcher can see them
 //!
-//! 2,301 of the 5,566 size-less corpus runs sit on shapes with **no `p:ph` at
-//! all**, so rungs 4-6 do not exist for them. Their chain was traced end to end
-//! rather than assumed, and it closes exactly:
+//! A great many size-less runs sit on shapes with **no `p:ph` at all**, so
+//! rungs 4-6 do not exist for them. Their chain was traced end to end
+//! rather than assumed, and closes on exactly three suppliers:
 //!
-//! | supplier | runs |
-//! |---|---|
-//! | shape's own `a:lstStyle` (rung 3) | 123 |
-//! | presentation `defaultTextStyle` (rung 7) | 2,144 |
-//! | nothing — spec default (rung 8) | 34 |
-//!
-//! The 34 are from exactly 2 decks whose `p:defaultTextStyle` declares no
-//! size at level 1. That residue is *classified*, not a mystery, and
-//! [`SizeSource::SpecDefault`] is how it stays visible.
+//! - the shape's own `a:lstStyle` (rung 3)
+//! - the presentation's `defaultTextStyle` (rung 7) — by far the largest
+//!   supplier for this population
+//! - nothing, landing on the spec default (rung 8) — [`SizeSource::SpecDefault`]
+//!   is how that residue stays visible rather than a silent guess
 //!
 //! **The theme rung does not exist.** §20.1.6.7's `a:objectDefaults` is the
-//! obvious place for a non-placeholder shape's text defaults, and 91 corpus
-//! themes declare one (10 `a:spDef`, 8 `a:txDef`). **Not one supplies a font
-//! size.** So it is not implemented — measured, not assumed, and recorded here
-//! so the next reader does not re-derive it.
+//! obvious place for a non-placeholder shape's text defaults, but decks that
+//! declare one do not use it to supply a font size in practice. So it is
+//! not implemented, and that is a deliberate, measured omission rather than
+//! an oversight.
 //!
 //! ## The chain terminates
 //!
-//! For placeholders it terminates before the spec default ever applies: all
-//! 3,463 corpus (kind, level) pairs a slide actually uses are covered by the
-//! master's `p:txStyles`, and all 70 masters declare all three children with a
-//! size at level 1. As with geometry's "no master placeholder lacks an
-//! `xfrm`", the top of the chain is real.
+//! For placeholders it terminates before the spec default ever applies:
+//! every (kind, level) pair a slide actually uses is expected to be
+//! covered by the master's `p:txStyles`, and every master is expected to
+//! declare all three children with a size at level 1. As with geometry's
+//! "no master placeholder lacks an `xfrm`", the top of the chain is real.
 
 use std::collections::HashMap;
 
@@ -94,9 +87,9 @@ use super::text::{Bullet, ListStyle, Spacing, TextParagraphProperties, TextStyle
 
 /// §21.1.2.2.9 — `a:defRPr/@sz` defaults to 1800, i.e. 18pt.
 ///
-/// Only reachable when every rung above stays silent; on the corpus that is 34
-/// runs in 2 decks. Emitting it is right, but a consumer that wants to know
-/// should read [`SizeSource`] rather than compare against this constant.
+/// Only reachable when every rung above stays silent, which should be rare.
+/// Emitting it is right, but a consumer that wants to know should read
+/// [`SizeSource`] rather than compare against this constant.
 pub const SPEC_DEFAULT_FONT_SIZE: Dimension<HalfPoints> = Dimension::new(36);
 
 /// Which `p:txStyles` child a placeholder kind reads (rung 6).
@@ -114,7 +107,6 @@ pub enum TextStyleClass {
 }
 
 impl TextStyleClass {
-    /// The corpus exercises all three: 868 title, 714 body, 348 other.
     pub fn of(kind: PlaceholderKind) -> Self {
         use PlaceholderKind::*;
         match kind {
@@ -146,9 +138,9 @@ impl TextStyleClass {
 /// It does **not** pre-flatten the two rungs the way `PlaceholderGeometry`
 /// does. Flattening is only sound when a rung either answers or does not;
 /// here a rung answers *some* properties, so folding the master into the
-/// layout would lose which of the two supplied what, and rung 5's 742
-/// disagreements are exactly the values that would be silently misattributed.
-/// The walk visits both in order instead.
+/// layout would lose which of the two supplied what — and rung 5's
+/// disagreements with `p:txStyles` are exactly the values that would be
+/// silently misattributed. The walk visits both in order instead.
 ///
 /// [`PlaceholderGeometry`]: crate::pptx::cascade::PlaceholderGeometry
 #[derive(Clone, Debug, Default)]
@@ -174,8 +166,8 @@ impl PlaceholderTextStyles {
             if style.is_empty() {
                 continue;
             }
-            // First in document order wins, as in the geometry cascade: 4
-            // corpus layouts declare the same `@idx` twice, and a stable rule
+            // First in document order wins, as in the geometry cascade: a
+            // layout can declare the same `@idx` twice, and a stable rule
             // beats a `HashMap`-iteration coin flip.
             out.by_idx.entry(ph.idx).or_insert_with(|| style.clone());
             out.by_kind
@@ -244,8 +236,8 @@ pub enum SizeSource {
     MasterTextStyles,
     /// Rung 7.
     DefaultTextStyle,
-    /// Rung 8 — nothing in the document supplied one. 34 corpus runs across 2
-    /// decks. A non-trivial count here means a rung is not being reached.
+    /// Rung 8 — nothing in the document supplied one. Should be rare; a
+    /// non-trivial count here means a rung is not being reached.
     SpecDefault,
 }
 
@@ -477,7 +469,7 @@ mod tests {
         assert_eq!(r.size_source, SizeSource::SpecDefault);
     }
 
-    /// The 2,144-run path: a non-placeholder shape reaches `defaultTextStyle`
+    /// The common non-placeholder path: a shape reaches `defaultTextStyle`
     /// and nothing between.
     #[test]
     fn a_non_placeholder_shape_reaches_default_text_style() {
@@ -537,7 +529,7 @@ mod tests {
     }
 
     /// The layout rung matches on `@idx` and ignores `@type`, exactly as the
-    /// geometry cascade does — the same 2-of-737 bare-`<p:ph/>` case.
+    /// geometry cascade does — the same bare-`<p:ph/>` case.
     #[test]
     fn the_layout_rung_matches_idx_not_type() {
         let layout_shapes = part(&[
@@ -557,8 +549,8 @@ mod tests {
         assert_eq!(r.size_source, SizeSource::LayoutPlaceholder);
     }
 
-    /// Rung 5, the one that looks redundant. 742 corpus level-values disagree
-    /// with `p:txStyles`; the master placeholder must win.
+    /// Rung 5, the one that looks redundant. A master placeholder's own
+    /// size can disagree with `p:txStyles`; the master placeholder must win.
     #[test]
     fn the_master_placeholder_rung_beats_tx_styles() {
         let master_shapes = part(&[("body", "1", r#"<a:defRPr sz="3200"/>"#)]);
@@ -647,8 +639,8 @@ mod tests {
     }
 
     /// The finding that separates this cascade from the geometry one: a rung
-    /// answers *some* properties and the walk continues past it for the rest.
-    /// 5,232 corpus layout levels supply properties but no size.
+    /// answers *some* properties and the walk continues past it for the
+    /// rest. A layout level supplying properties but no size is common.
     #[test]
     fn a_partial_rung_does_not_stop_the_walk() {
         // Layout says bold and centred, but nothing about size.
@@ -863,7 +855,7 @@ mod tests {
     }
 
     /// Duplicate `@idx`: first in document order wins, matching the geometry
-    /// cascade's rule on the same 4 corpus layouts.
+    /// cascade's rule.
     #[test]
     fn duplicate_idx_resolves_first_in_document_order() {
         let shapes = part(&[

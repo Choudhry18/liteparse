@@ -1,6 +1,6 @@
 //! Color resolution — Color::Auto to RGB, theme color index to RGB.
 
-use crate::model::{Color, ThemeColorIndex, ThemeColorScheme};
+use crate::model::Color;
 
 /// Resolved RGB color (0xRRGGBB).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,11 +37,6 @@ pub fn resolve_color(color: Color, context: ColorContext) -> RgbColor {
             ColorContext::Background => RgbColor::WHITE,
         },
     }
-}
-
-/// Resolve a theme color index to RGB via the color scheme.
-pub fn resolve_theme_color(index: ThemeColorIndex, scheme: &ThemeColorScheme) -> RgbColor {
-    rgb_from_u32(scheme.resolve(index))
 }
 
 /// Convert a packed u32 (0xRRGGBB) to RgbColor.
@@ -111,49 +106,5 @@ mod tests {
     fn resolve_color_auto_background_is_white() {
         let c = resolve_color(Color::Auto, ColorContext::Background);
         assert_eq!(c, RgbColor::WHITE);
-    }
-
-    #[test]
-    fn resolve_theme_color_accent1() {
-        let scheme = ThemeColorScheme {
-            accent1: 0x4472C4,
-            ..Default::default()
-        };
-        let c = resolve_theme_color(ThemeColorIndex::Accent1, &scheme);
-        assert_eq!(
-            c,
-            RgbColor {
-                r: 0x44,
-                g: 0x72,
-                b: 0xC4
-            }
-        );
-    }
-
-    #[test]
-    fn resolve_theme_color_dark1() {
-        let scheme = ThemeColorScheme {
-            dark1: 0x000000,
-            ..Default::default()
-        };
-        let c = resolve_theme_color(ThemeColorIndex::Dark1, &scheme);
-        assert_eq!(c, RgbColor::BLACK);
-    }
-
-    #[test]
-    fn resolve_theme_color_hyperlink() {
-        let scheme = ThemeColorScheme {
-            hyperlink: 0x0563C1,
-            ..Default::default()
-        };
-        let c = resolve_theme_color(ThemeColorIndex::Hyperlink, &scheme);
-        assert_eq!(
-            c,
-            RgbColor {
-                r: 0x05,
-                g: 0x63,
-                b: 0xC1
-            }
-        );
     }
 }

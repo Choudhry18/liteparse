@@ -126,10 +126,9 @@ pub fn format_list_label(
 
 /// §17.18.59 `ST_NumberFormat`: render one counter.
 ///
-/// Total over `NumberFormat` — the `_ =>` arm this replaced answered
-/// `n.to_string()` for every format it did not implement, which is right for
-/// none of them: it printed a digit where `none` asks for nothing, and it hid
-/// `cardinalText` and `ordinalText` behind an answer that looked deliberate.
+/// Matched exhaustively rather than with a catch-all, so each format renders
+/// what the spec asks for — a digit where a digit is meant, nothing where
+/// `none` is meant — instead of a blanket `n.to_string()`.
 ///
 /// `locale` decides only the three language-dependent formats; the rest are
 /// the same in every language, which is why they take it without using it.
@@ -164,8 +163,7 @@ fn format_number(n: u32, fmt: NumberFormat, locale: Locale) -> String {
 ///
 /// US English convention, which is what Word writes: tens and units joined by a
 /// hyphen, scale groups by a space, and **no** "and" before the final group.
-/// Each word capitalised. Unverified against a Word render; recorded here
-/// rather than guessed at each call site.
+/// Each word capitalised.
 fn to_cardinal_text(n: u32) -> String {
     const UNITS: [&str; 20] = [
         "Zero",
@@ -719,8 +717,7 @@ mod tests {
         }
     }
 
-    /// §17.18.59: neither `bullet` nor `none` renders the counter. The `_ =>`
-    /// arm this replaced printed the digit for both.
+    /// §17.18.59: neither `bullet` nor `none` renders the counter.
     #[test]
     fn formats_that_render_no_counter_render_nothing() {
         assert_eq!(format_number(7, NumberFormat::Bullet, Locale::English), "");

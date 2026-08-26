@@ -2105,7 +2105,6 @@ dependencies = [
  "ssf-rs",
  "thiserror 2.0.19",
  "tiny-skia",
- "unicode-normalization",
  "unicode-properties",
  "unicode-segmentation",
  "zip",

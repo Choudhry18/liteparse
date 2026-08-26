@@ -55,10 +55,8 @@ pub fn build_custom(geom: &CustomGeometry, extent: PtSize) -> Option<ShapePath> 
 fn build_subpath(geom: &CustomGeometry, path: &PathDef, extent: PtSize) -> Option<SubPath> {
     // §20.1.9.15 @w/@h: "If this attribute is omitted, then a value of 0 is
     // implied" — which names the shape's own coordinate space, not an empty
-    // path (see `path_space`). This is what makes the preset table work at
-    // all: 270 of the spec's 320 preset paths omit both attributes, and none
-    // of those 270 uses a literal coordinate, so every value in them is a
-    // guide resolved against this context.
+    // path (see `path_space`). Most preset paths omit both attributes and use
+    // only guides, so they resolve against this context.
     let path_w = path_space(path.w.raw() as f64, extent.width.raw() as f64);
     let path_h = path_space(path.h.raw() as f64, extent.height.raw() as f64);
     let ctx = GuideContext::new(path_w, path_h);

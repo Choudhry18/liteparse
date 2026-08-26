@@ -3,33 +3,27 @@
 //! Unlike DOCX (a layout engine) and PPTX (a cascade), XLSX geometry is
 //! *stated*: the file declares every column width and row height, so this
 //! pass is unit conversion plus pagination — no fonts, no measurement, no
-//! host dependence. Every constant traces to `xlsx_geometry_census` over the
-//! 1,248-workbook corpus.
+//! host dependence.
 //!
-//! The **paint** built on top of it does measure, and that is a deliberate
-//! divergence between the two consumers of one read rather than a crack in
-//! the claim above: a raster has to decide where a glyph lands and where a
-//! string stops, and a `TextItem` does not. Nothing the measurer returns
+//! The **paint** built on top of it does measure, but that stays a private
+//! detail of the raster: a raster has to decide where a glyph lands and where
+//! a string stops, and a `TextItem` does not. Nothing the measurer returns
 //! reaches a [`Page`] — the items are byte-identical with and without a font
-//! registry, and a test says so. Constants:
+//! registry (a test enforces this). Rules:
 //!
 //! * **Packed, not canvas.** Item positions honour the emitted grid (rows
 //!   the file wrote, columns holding at least one cell), the same sparse
-//!   rule as the emitter. Honouring declared positions instead puts one
-//!   sheet's canvas at 16,777,274 pt tall (a stray cell on row 1,048,576);
-//!   packed and canvas differ by >2× on only 256 of 5,606 sheets.
-//! * **Pages are Letter-height, content-width.** At 792 pt, 49% of sheets
-//!   paginate (a sheet is not a page: the corpus median workbook is 4 pages,
-//!   the largest 6,612) — but 67.5% of sheets are *wider* than Letter, so
-//!   width is never split: the page takes the content's width and a
-//!   downstream consumer sees an unclipped row, which is the native path's
-//!   whole advantage over LibreOffice.
-//! * **Geometry inputs are declared, not guessed**: 100% of sheets state
-//!   `defaultRowHeight`, 97% of retained columns have a declared width. The
-//!   8.43-unit / 15 pt fallbacks carry the remainder.
-//! * **A merge cut by a page break** (1.05% of merges) keeps its item on the
-//!   anchor's page, clamped to that page's rows — mirroring the block
-//!   slicer, where the continuation is an empty spanning cell.
+//!   rule as the emitter. Honouring declared positions instead can put a
+//!   sheet's canvas millions of points tall (a stray cell on row 1,048,576).
+//! * **Pages are Letter-height, content-width.** Rows paginate at 792 pt, but
+//!   width is never split: the page takes the content's width so a downstream
+//!   consumer sees an unclipped row, which is the native path's advantage
+//!   over LibreOffice.
+//! * **Geometry inputs are declared, not guessed.** The 8.43-unit column /
+//!   15 pt row fallbacks carry the few cells that state nothing.
+//! * **A merge cut by a page break** keeps its item on the anchor's page,
+//!   clamped to that page's rows — mirroring the block slicer, where the
+//!   continuation is an empty spanning cell.
 //!
 //! An item's rectangle is the **cell box** (inset by the cell padding the
 //! pixel formula bakes in), not a measured text box: the file states no
@@ -69,8 +63,7 @@ use crate::types::{ExtractedImage, OutlineTarget, Page, Rect, TextItem};
 const MDW: f64 = 7.0;
 const PAD_PX: f64 = 5.0;
 const PX_TO_PT: f64 = 72.0 / 96.0;
-/// Excel's fallbacks when the file declares nothing (3% of retained columns,
-/// 0% of corpus sheets for row height).
+/// Excel's fallbacks when the file declares no width or height.
 const DEFAULT_COL_WIDTH: f64 = 8.43;
 const DEFAULT_ROW_HEIGHT_PT: f64 = 15.0;
 
@@ -87,8 +80,8 @@ const MIN_PAGE_WIDTH: f32 = 612.0;
 const TEXT_INSET: f32 = (PAD_PX / 2.0 * PX_TO_PT) as f32;
 
 /// Excel's gridline grey, and one device pixel of it at 96 DPI. Gridlines are
-/// not decoration: 12.1% of corpus sheets declare neither a fill nor a border
-/// anywhere, so this is the only ink holding their numbers in a grid.
+/// not decoration: a sheet that declares neither a fill nor a border anywhere
+/// has only these lines holding its numbers in a grid.
 const GRIDLINE_COLOR: RgbColor = RgbColor {
     r: 0xD0,
     g: 0xD7,
@@ -133,8 +126,7 @@ pub struct NativeXlsx {
     /// — the same contract the picture ordinal carries.
     ///
     /// The rectangle is the shape's box, which is *not* where its text is:
-    /// the items inside it are stacked evenly rather than laid out. That gap
-    /// is what this field exists to let a census measure.
+    /// the items inside it are stacked evenly rather than laid out.
     pub shape_rects: Vec<(usize, Rect)>,
     /// The paint of each page, aligned with `pages`: gridlines, cell fills
     /// and cell borders as [`DrawCommand::Rect`]s, then the cell text as
@@ -145,12 +137,12 @@ pub struct NativeXlsx {
     ///
     /// Command order carries no z-order here: the rasterizer paints in fixed
     /// passes (`Path` → `Rect` → `Image` → ink), so a picture always covers
-    /// the grid beneath it and cell text always covers the picture. Excel
-    /// floats a picture above cell text, so that last relation is inverted —
-    /// see the overlap census for how often it can be seen.
+    /// the grid beneath it and cell text always covers the picture. A picture
+    /// with `float: true` overrides that so it draws above cell text, matching
+    /// Excel.
     pub layouts: Vec<LayoutedPage>,
     /// What the text pass met, summed over the workbook. Zero when nothing
-    /// was painted; read by the corpus gate, not by `parser.rs`.
+    /// was painted; read by the corpus recall gate, not by `parser.rs`.
     pub text_stats: TextPaintStats,
 }
 
@@ -449,8 +441,8 @@ pub fn workbook_to_pages(
                     src_rect: None,
                     // Excel floats a picture above the grid *and* its values,
                     // so this is the one producer that opts out of the
-                    // painter's flow order — without it 29.2% of corpus
-                    // placements have cell text drawn through them.
+                    // painter's flow order; otherwise cell text draws through
+                    // the picture.
                     float: true,
                 });
             }
@@ -512,14 +504,13 @@ pub fn workbook_to_pages(
                 // content is a picture — or a shape — has no grid to paint
                 // and still has something to draw.
                 //
-                // The floating drawing layer, in Excel's z-order: shape
-                // fills and outlines, then shape text, both bracketed into
-                // the rasterizer's `Float` pass so they draw over the grid
-                // *and* the cell values (the same relation pictures already
-                // claim via their flag), then the pictures on top. Within
-                // the layer the approximation is the PPTX painter's: all
-                // fills before all text, so an overlapping shape's box never
-                // covers a neighbour's words.
+                // The floating drawing layer, in Excel's z-order: shape fills
+                // and outlines, then shape text, both wrapped in a `Float`
+                // bracket so they draw over the grid *and* the cell values
+                // (the same relation pictures claim via their flag), then the
+                // pictures on top. Within the layer all fills paint before all
+                // text, so an overlapping shape's box never covers a
+                // neighbour's words.
                 use liteparse_ooxml::render::layout::draw_command::FloatMark;
                 if !ink_cmds_per_page[i].is_empty() {
                     layout.commands.push(DrawCommand::Float(FloatMark::Begin));
@@ -546,9 +537,8 @@ pub fn workbook_to_pages(
 /// One `TextItem` per non-empty shape paragraph, stacked evenly inside the
 /// shape's box — the same fidelity contract as a cell's item (the box is
 /// real, the intra-box line layout is not attempted). Font facts come from
-/// the paragraph's first run: 99.5% of corpus shape runs declare `sz`, and a
-/// theme-referenced face (no explicit name) stays `None` like an unstyled
-/// cell would.
+/// the paragraph's first run; a theme-referenced face (no explicit name)
+/// stays `None` like an unstyled cell would.
 fn shape_text_items(shape: &SheetShape, rect: &Rect, out: &mut Vec<TextItem>) {
     let paras: Vec<&liteparse_ooxml::pptx::TextParagraph> = shape
         .body
@@ -589,30 +579,22 @@ fn shape_text_items(shape: &SheetShape, rect: &Rect, out: &mut Vec<TextItem>) {
 
 /// One floating text shape's body as page-absolute [`DrawCommand`]s.
 ///
-/// This is the *paint* half of a shape, and it is a real §20.1.10.60
-/// sub-layout — the same [`layout_shape_body`] the PPTX shape and DOCX
-/// textbox paths use, so insets, measured wrapping, `a:pPr/@algn`, the
-/// anchor and `@vertOverflow` all apply. The `TextItem`s beside it stay the
-/// even stack `shape_text_items` builds, and the two deliberately disagree
-/// about where a *line* falls inside the box.
+/// This is the *paint* half of a shape: a real §20.1.10.60 sub-layout via the
+/// same [`layout_shape_body`] the PPTX shape and DOCX textbox paths use, so
+/// insets, measured wrapping, `a:pPr/@algn`, the anchor and `@vertOverflow`
+/// all apply. The `TextItem`s beside it stay the even stack
+/// `shape_text_items` builds, and the two deliberately disagree about where a
+/// *line* falls inside the box.
 ///
-/// That split is the same one the cell path already makes — an item is the
-/// cell box, the painted glyphs are measured inside it — and it is what keeps
-/// this module's host-independence claim intact: items come from declared
-/// geometry and need no registry, paint measures and does. Feeding items from
-/// the layout instead would make a plain parse depend on the host's fonts for
-/// 154 corpus workbooks, which is a far larger price than the disagreement.
+/// That split is the same one the cell path makes — an item is the box, the
+/// painted glyphs are measured inside it — and it keeps items host-independent:
+/// they come from declared geometry and need no font registry, while paint
+/// measures and does. Feeding items from the layout instead would make a plain
+/// parse depend on the host's fonts.
 ///
-/// The layout census (1,637 shapes) is what bought the sub-layout rather than
-/// painting the stack: 61.5% anchor non-top, 34.8% of paragraphs wrap (2.29x
-/// the line count the stack draws), 51.1% declare an alignment the stack
-/// cannot express, and the first line moves by more than 24pt on 19.2% of
-/// shapes.
-///
-/// Run colour and theme faces resolve against the workbook's full `Theme` —
-/// the shape-visuals census measured 5,041 of 5,902 runs declaring a colour,
-/// 52% of them `schemeClr`, which is what made keeping the whole theme (not
-/// just its colour scheme) worth it.
+/// Run colour and theme faces resolve against the workbook's full `Theme`
+/// (not just its colour scheme), because a shape run's colour is often a
+/// `schemeClr` reference.
 fn shape_commands(
     shape: &SheetShape,
     rect: &Rect,
@@ -628,10 +610,9 @@ fn shape_commands(
 
     let body_pr = shape.body.body_pr.as_ref();
     let auto_fit = ShapeAutoFit::from_body(body_pr.and_then(|b| b.auto_fit));
-    // Rung 3 only. A sheet shape has no layout, master or deck above it, so
-    // the cascade's other rungs are genuinely absent rather than unwired —
-    // and rung 2 (the paragraph's own `a:pPr`) plus the spec default is what
-    // `resolve` seeds itself with.
+    // A sheet shape has no layout, master or deck above it, so only the
+    // shape's own list style is supplied; the paragraph's `a:pPr` and the spec
+    // default are what `resolve` seeds itself with.
     let cascade = TextCascade {
         shape: Some(&shape.body.list_style),
         layout: None,
@@ -667,15 +648,13 @@ fn shape_commands(
         });
     }
 
-    // The insets cliff. `layout_shape_body` returns *nothing* when the left
-    // and right insets leave no width to wrap in, and the §20.1.2.1.1
-    // defaults are 7.2pt a side — so every shape narrower than 14.4pt paints
-    // empty. That is **6.5% of corpus shapes (106)**, and they are not
-    // decorative: they are the narrow vertical marker labels a timeline is
-    // made of. Excel draws them, overflowing the box rather than vanishing,
-    // so the horizontal insets are dropped for exactly those shapes. The
-    // clamp lives here rather than in the shared sub-layout because it is a
-    // statement about this producer's boxes, not about §20.1.10.60.
+    // `layout_shape_body` returns nothing when the left and right insets leave
+    // no width to wrap in, and the §20.1.2.1.1 defaults are 7.2pt a side — so
+    // a shape narrower than 14.4pt would paint empty. Excel draws such a shape,
+    // overflowing the box rather than vanishing, so the horizontal insets are
+    // dropped for exactly those shapes. The clamp lives here rather than in the
+    // shared sub-layout because it is about this producer's boxes, not about
+    // §20.1.10.60.
     let extent = PtSize::new(Pt::new(rect.width), Pt::new(rect.height));
     let squeezed = BodyInsets::resolve(body_pr).content_width(extent) <= Pt::ZERO;
     let unsqueezed;
@@ -733,12 +712,10 @@ impl AnchorMap {
         target: &Rect,
     ) -> Option<Self> {
         let (bw, bh) = (base.size.width.raw() as f64, base.size.height.raw() as f64);
-        // A box that is zero in *both* axes is a point — 540 corpus shapes,
-        // one workbook, all legacy `Line NNN` leftovers — and a point has no
-        // ink. A box that is zero in *one* axis is a flat line (every
-        // horizontal connector declares `cy="0"`), and Excel draws those:
-        // the degenerate axis collapses (scale 0) instead of vetoing the
-        // whole tree.
+        // A box zero in *both* axes is a point and has no ink. A box zero in
+        // *one* axis is a flat line (every horizontal connector declares
+        // `cy="0"`), which Excel draws: the degenerate axis collapses
+        // (scale 0) instead of vetoing the whole tree.
         if bw <= 0.0 && bh <= 0.0 {
             return None;
         }
@@ -798,10 +775,10 @@ fn ink_commands(
     match root.slide_rect {
         Some(sr) => {
             // The anchor covers the object as *seen* — its rotated bounding
-            // box, not its unrotated rect. 88 corpus shapes are vertical
-            // lines rotated a quarter turn into horizontal ones, whose
-            // unrotated rect is zero-width; scaling through it collapses
-            // them, scaling through the bounding box does not.
+            // box, not its unrotated rect. A vertical line rotated a quarter
+            // turn into a horizontal one has a zero-width unrotated rect;
+            // scaling through it collapses the line, scaling through the
+            // bounding box does not.
             let Some(map) = AnchorMap::new(sr.bounding_box(), rect) else {
                 return;
             };
@@ -948,8 +925,8 @@ fn paint_ink_shape(
         style.and_then(|s| s.effect_ref.as_ref()),
         style.and_then(|s| s.fill_ref.as_ref()),
         ctx,
-        // No `PartMedia`: a blip fill on an XLSX shape (4 on the corpus)
-        // resolves to nothing and the shape paints its outline alone.
+        // No `PartMedia`: a blip fill on an XLSX shape resolves to nothing and
+        // the shape paints its outline alone.
         None,
         group_fill,
     );
@@ -1047,9 +1024,7 @@ fn shape_fragments(
 
 /// A shape run's declared colour, resolved against the workbook's theme —
 /// the XLSX twin of the PPTX path's `run_color`, minus the `p:clrMap` (a
-/// workbook has no master to remap `bg1`/`tx1` through) and minus the
-/// counters (the corpus census already sized both branches: 5,041 of 5,902
-/// runs declare, 52% of them `schemeClr`).
+/// workbook has no master to remap `bg1`/`tx1` through).
 ///
 /// Alpha is dropped, as it is on the PPTX side: `DrawCommand::Text` carries
 /// an opaque colour, and solid is a smaller error than the black it
@@ -1150,8 +1125,7 @@ fn fill_split_of(
 /// Blending is also what makes a hatch safe to paint at all: slot 1 of every
 /// styles part is `gray125` with a black `fg` — Excel's "no fill" placeholder
 /// — and at 12.5% coverage it lands as the light grey Excel shows rather than
-/// the black a solid reading would give it. 323 corpus cells are hatched, 210
-/// of them `gray0625`.
+/// the black a solid reading would give it.
 fn fill_color(wb: &Workbook, fill: &liteparse_ooxml::xlsx::Fill) -> Option<RgbColor> {
     let fg = fill.fg.and_then(|c| wb.resolve_color(c))?;
     match fill.pattern {
@@ -1184,7 +1158,7 @@ fn fill_color(wb: &Workbook, fill: &liteparse_ooxml::xlsx::Fill) -> Option<RgbCo
 ///
 /// Value-less styled cells come from the paint side-channel and are treated
 /// exactly like a cell's own `s=`; the ones on columns the packed grid
-/// compacted out are dropped here (class C's column half).
+/// compacted out are dropped here.
 fn row_paint_styles(
     row: &Row,
     cells: &[&liteparse_ooxml::xlsx::Cell],
@@ -1293,13 +1267,12 @@ fn push_border(
 /// `pen` one stroke's thickness; `horizontal` says which way the edge runs.
 /// Three shapes come out of here:
 ///
-/// * a continuous edge is one rect — the shape every edge had before;
+/// * a continuous edge is one rect;
 /// * a `double` edge is two pens with a pen-wide gap, filling the band
-///   [`BorderStyle::extent_pt`] reserves for it. 27,300 corpus edges, more
-///   than every broken style put together;
+///   [`BorderStyle::extent_pt`] reserves for it;
 /// * a broken edge is one rect per "on" run of
 ///   [`BorderStyle::dash_pattern`], the last clipped to the cell rather than
-///   allowed to overhang it. 14,094 corpus edges.
+///   allowed to overhang it.
 ///
 /// The dash phase restarts at each cell, so a row of dashed cells shows a
 /// stroke at every boundary rather than one pattern running across it. Excel
@@ -1318,11 +1291,10 @@ fn push_edge(
     let c = color(edge);
     // One stroke: `at` runs along the edge, `off` across it.
     //
-    // A zero-*length* run still paints, and the corpus insists on it: a hidden
-    // column is a retained column of zero width, and its cells' horizontal
-    // edges were zero-area rects before this walk existed. Dropping them looks
-    // like a tidy-up and is a silent 1,230-rect change on one corpus sheet.
-    // Only a negative run — which the dash walk cannot produce — is skipped.
+    // A zero-*length* run still paints: a hidden column is a retained column
+    // of zero width, and its cells' horizontal edges are zero-area rects that
+    // must not be dropped. Only a negative run — which the dash walk cannot
+    // produce — is skipped.
     let mut stroke = |at: f64, run: f64, off: f64| {
         if run < 0.0 {
             return;
@@ -1362,13 +1334,10 @@ fn push_edge(
 
 /// The cell's diagonal, as one stroked line per declared direction.
 ///
-/// A `Line` rather than a `Rect` because a rect cannot express a diagonal —
-/// and the recorded objection to `Line`, that it "paints in the Ink pass, over
-/// everything", is only half right. It does paint over the fills and borders,
-/// which is where a diagonal belongs; and it paints *under* the cell's text so
-/// long as it is emitted before it, which the paint walk does. The whole class
-/// is **2 corpus edges in 1 workbook**, and it is here because the note
-/// explaining its absence was longer than the code.
+/// A `Line` rather than a `Rect` because a rect cannot express a diagonal. It
+/// paints in the Ink pass, over the fills and borders (where a diagonal
+/// belongs) but under the cell's text, so long as it is emitted before the
+/// text — which the paint walk does.
 fn push_diagonal(
     out: &mut Vec<DrawCommand>,
     wb: &Workbook,
@@ -1416,20 +1385,18 @@ const DEFAULT_FONT_SIZE: f32 = 11.0;
 /// §18.8.1: one `indent` step is three characters' worth of the cell's font.
 const INDENT_STEP: &str = "   ";
 
-/// What the text pass did with the overflow it met, per the four rules Excel
-/// applies — the counters the corpus gate reads back against the paint
-/// census's independent predictions (12.8% clipped, 6.1% spilled, 2.0%
-/// hashed, 6.9% wrapped).
+/// What the text pass did with the overflow it met, per Excel's overflow
+/// rules. Counters the corpus recall gate reads back; not consumed by
+/// `parser.rs`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TextPaintStats {
     /// Cells that painted at least one line.
     pub cells: u64,
     /// Cells with text that painted nothing: the fit left no character at
     /// all, which is a hidden (zero-width) column or a number in a column too
-    /// narrow for one `#`. Named rather than silent — `cells + blank` is what
-    /// the recall oracle must equal.
+    /// narrow for one `#`. Tracked so `cells + blank` covers every text cell.
     pub blank: u64,
-    /// Cells whose style declares `wrapText`. The census's denominator.
+    /// Cells whose style declares `wrapText`.
     pub wrap_declared: u64,
     /// Cells whose text actually broke over more than one line — a declared
     /// wrap on a string that fits does not.
@@ -1438,9 +1405,9 @@ pub struct TextPaintStats {
     pub spilled: u64,
     /// Overflowing cells whose *declared* right neighbour is unwritten but
     /// whose *packed* one is not: the spill Excel would do and this pass
-    /// cannot, because the empty column between them is compacted out of the
-    /// page. The size of the one divergence between this pass's grid and
-    /// Excel's that the text rules can see.
+    /// cannot, because the empty column between them is compacted out. This is
+    /// the one divergence between this pass's grid and Excel's that the text
+    /// rules can see.
     pub spill_lost_to_packing: u64,
     /// Cells whose text was cut because the room ran out.
     pub clipped: u64,
@@ -1593,28 +1560,6 @@ fn occupied_columns(
     occupied
 }
 
-/// One cell's text as [`DrawCommand::Text`]s, one per line.
-///
-/// The rules are Excel's, and each carries the census number that justified
-/// building it (paint census, 1,247 workbooks):
-///
-/// * **`wrapText` or an embedded newline** (6.9% + 76,952 cells) breaks over
-///   lines inside the box.
-/// * **Text wider than its box spills** into the run of empty neighbours in
-///   the direction its alignment points (6.1% of unwrapped text cells), and is
-///   **clipped** where a written neighbour stops it (12.8%) — the case a
-///   painter that just draws the string at its origin turns into overlapping
-///   mush.
-/// * **A number wider than its column becomes `#######`** (2.0% of unwrapped
-///   numeric cells). Numbers never spill; that is Excel's rule, not a
-///   simplification.
-/// * **`General` is "numbers right, text left"** — the alignment nobody
-///   declares, and the reason a spreadsheet reads as a table.
-///
-/// The clip is at a character boundary rather than mid-glyph: the command
-/// stream has no clip bracket, and adding one to paint half a glyph would put
-/// a variant in front of every consumer that matches on `DrawCommand`.
-#[allow(clippy::too_many_arguments)]
 /// One line of a cell's text, placed on its baseline in page coordinates.
 fn text_cmd(line: &str, fp: &FontProps, color: RgbColor, x: f64, baseline: f64) -> DrawCommand {
     DrawCommand::Text {
@@ -1633,6 +1578,20 @@ fn text_cmd(line: &str, fp: &FontProps, color: RgbColor, x: f64, baseline: f64) 
     }
 }
 
+/// One cell's text as [`DrawCommand::Text`]s, one per line, per Excel's rules:
+///
+/// * **`wrapText` or an embedded newline** breaks over lines inside the box.
+/// * **Text wider than its box spills** into the run of empty neighbours in
+///   the direction its alignment points, and is **clipped** where a written
+///   neighbour stops it.
+/// * **A number wider than its column becomes `#######`**. Numbers never
+///   spill; that is Excel's rule, not a simplification.
+/// * **`General` is "numbers right, text left"** — the alignment nobody
+///   declares, and the reason a spreadsheet reads as a table.
+///
+/// The clip is at a character boundary rather than mid-glyph: the command
+/// stream has no clip bracket, and adding one to paint half a glyph would put
+/// a variant in front of every consumer that matches on `DrawCommand`.
 #[allow(clippy::too_many_arguments)]
 fn paint_cell_text(
     out: &mut Vec<DrawCommand>,
@@ -1783,12 +1742,10 @@ fn paint_cell_text(
 /// One attribute with three meanings: `1..=90` is degrees **counter-clockwise**,
 /// `91..=180` is `value - 90` degrees **clockwise**, and `255` is not a
 /// rotation at all — it is Excel's *stacked* text, upright glyphs one under the
-/// next. Paint census, 1,247 workbooks / 1,902 rotated cells, and the corpus
-/// declares only five values: 951 at `90`, 40 at `180`, 184 at `60`, 48 at
-/// `45`, 679 stacked.
+/// next.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CellRotation {
-    /// No rotation, and 99.994% of text cells.
+    /// No rotation; the overwhelming majority of text cells.
     None,
     /// Degrees counter-clockwise from the cell's own baseline; negative for
     /// the `91..=180` clockwise spellings.
@@ -1815,9 +1772,9 @@ fn cell_rotation(align: &Alignment) -> CellRotation {
 /// A `W × H` box laid along θ covers `W·|cos θ| + H·|sin θ|` of the cell's
 /// width and `W·|sin θ| + H·|cos θ|` of its height, so a quarter turn may run
 /// the cell's whole *height* and an oblique angle gets whichever of the two
-/// constraints binds first. `H` is one line, which is what the corpus's angled
-/// cells are: a rotated header is a single string, and wrapping and *then*
-/// rotating would need the line count before the length that decides it.
+/// constraints binds first. `H` is one line: a rotated header is a single
+/// string, and wrapping and *then* rotating would need the line count before
+/// the length that decides it.
 fn rotated_run_length(theta_deg: f64, b: &CellBox, line_h: f64) -> f64 {
     let (s, c) = theta_deg.to_radians().sin_cos();
     let (s, c) = (s.abs(), c.abs());
@@ -1867,18 +1824,16 @@ fn block_bounds(
 /// shared painter with [`MARGIN`] already in them and are shifted off it, which
 /// is cheaper than teaching every `text_cmd` call site a second origin.
 ///
-/// **Alignment does not rotate with the text, and that is measured rather than
-/// assumed.** The obvious model — the alignment frame turns with the glyphs, so
-/// a 90° cell's `horizontal` runs up the column — is wrong: rendering a probe
-/// workbook of every rotation × `vertical` × `horizontal` combination through
-/// LibreOffice puts `horizontal` on the page's x axis and `vertical` on its y
-/// axis at every angle, quarter turn included. So the text is laid out flush,
-/// its finished block is measured, and *the block's upright bounding box* is
-/// what the two alignments place inside the cell's inset rect. Centre-on-centre
-/// then does the rest: `place_transform` turns the local box about its own
-/// centre before translating, so putting the local centre on the bounding box's
-/// centre lands the rotated block exactly where the alignment put it, at any
-/// angle and with no case split per quadrant.
+/// **Alignment does not rotate with the text**: Excel keeps `horizontal` on
+/// the page's x axis and `vertical` on its y axis at every angle, quarter turn
+/// included — not the intuitive model where a 90° cell's `horizontal` runs up
+/// the column. So the text is laid out flush, its finished block is measured,
+/// and *the block's upright bounding box* is what the two alignments place
+/// inside the cell's inset rect. Centre-on-centre then does the rest:
+/// `place_transform` turns the local box about its own centre before
+/// translating, so putting the local centre on the bounding box's centre lands
+/// the rotated block where the alignment put it, at any angle and with no case
+/// split per quadrant.
 ///
 /// **A rotated cell does not spill**: Excel keeps angled text inside its own
 /// cell, so the room the flat path would grow into is passed as zero and the
@@ -1942,9 +1897,9 @@ fn paint_rotated_cell_text(
     // spoken for — the same two constraints `rotated_run_length` solves, read
     // the other way round. A wrapped cell is the only one that can exceed it,
     // and a quarter-turned one that did would run its lines out across the
-    // whole sheet rather than down its own column: 3 corpus cells wrap on an
-    // 8 pt column. Lines past it are cut, which is the cross-axis twin of the
-    // clip the flat path applies along the baseline.
+    // whole sheet rather than down its own column. Lines past it are cut,
+    // which is the cross-axis twin of the clip the flat path applies along the
+    // baseline.
     let (s, c) = theta_deg.to_radians().sin_cos();
     let (s, c) = (s.abs(), c.abs());
     let cross_max = if c < 1e-9 {
@@ -2026,7 +1981,7 @@ fn paint_rotated_cell_text(
 /// is expressed as one: the string becomes one character per line and the flat
 /// painter lays it out, which is what keeps the alignment, the font and the
 /// vertical placement the cell's own. Excel breaks between characters, not
-/// grapheme clusters, and every stacked cell in the corpus is ASCII.
+/// grapheme clusters.
 ///
 /// The lines are cut to what the row is tall enough to hold, the vertical twin
 /// of the horizontal clip: 40 stacked glyphs in a 15 pt row would otherwise
@@ -2167,12 +2122,11 @@ impl SheetGeometry {
     /// page.
     ///
     /// Position is packed, **extent is canvas**: a two-cell anchor's corners
-    /// are measured over the *declared* grid (`canvas`), because the corpus
-    /// says the packed difference is a lie — 818 of 2,126 pictures anchor
+    /// are measured over the *declared* grid (`canvas`). Many pictures anchor
     /// across rows or columns the packed grid does not have (a logo floating
-    /// right of the data, a photo below the table) and collapse to 1 pt
-    /// slivers under a packed reading. The top-left still snaps to the
-    /// packed corner so the picture sits next to the text it belongs with.
+    /// right of the data, a photo below the table) and would collapse to 1 pt
+    /// slivers under a packed reading. The top-left still snaps to the packed
+    /// corner so the picture sits next to the text it belongs with.
     fn place_pic(
         &self,
         cols: &[u32],
@@ -2243,8 +2197,8 @@ impl SheetGeometry {
     }
 
     /// Greedy pagination over emitted rows: break before the row that would
-    /// overflow the page, never breaking an empty page (a row taller than
-    /// the page — the corpus max is 410 pt — gets a page to itself).
+    /// overflow the page, never breaking an empty page (a row taller than the
+    /// page gets a page to itself).
     fn page_ranges(&self) -> Vec<Range<usize>> {
         let n = self.y_off.len() - 1;
         let mut ranges = Vec::new();
@@ -2263,35 +2217,24 @@ impl SheetGeometry {
         ranges
     }
 
-    /// One page's paint: gridlines under fills under borders, every one of
-    /// them a [`DrawCommand::Rect`] so the raster's Shading pass keeps them in
+    /// One page's paint: gridlines under fills under borders, each a
+    /// [`DrawCommand::Rect`] so the raster's Shading pass keeps them in
     /// emission order (its pass order is fixed — `Path` < `Rect` < `Image` <
-    /// `Line`/`Text` — so three variants would be three *layers*, in the wrong
-    /// sequence).
+    /// `Line`/`Text`). Diagonals are the exception: a `Rect` cannot express
+    /// one, so they are `Line`s in the Ink pass.
     ///
-    /// The population is the census's classes A + B + D + E: valued cells,
-    /// the value-less styled cells the reader keeps in [`Row::styled_blanks`],
-    /// `<row customFormat>` and `<col style>`. That is 15.9% of all declared
-    /// paint on top of the 42.4% a valued-cells-only painter sees, and every
-    /// unit of it lands on a cell box the geometry pass has already placed —
-    /// no page changes size, no `TextItem` moves. Class C (paint on cells
-    /// outside the packed grid, 41.7%) is dropped by design: honouring it
-    /// means inventing the rows and columns to hang it on, which is the canvas
-    /// explosion this pass exists to prevent, and Excel does not print it
-    /// either.
+    /// The painted population is valued cells plus the value-less styled cells
+    /// the reader keeps in [`Row::styled_blanks`], `<row customFormat>` and
+    /// `<col style>`. Each lands on a cell box the geometry pass already
+    /// placed, so no page changes size and no `TextItem` moves. Paint on cells
+    /// outside the packed grid is dropped: honouring it means inventing the
+    /// rows and columns to hang it on (the canvas explosion this pass exists
+    /// to prevent), and Excel does not print it either.
     ///
-    /// Three approximations, each with its number:
-    ///
-    /// * **Only `solid` fills paint.** 100.0% of filled corpus cells are
-    ///   solid; the hatch branch is skipped rather than approximated because
-    ///   slot 1 of every styles part is `gray125` — Excel's "no fill"
-    ///   placeholder, usually with a black `fg` — and painting it solid would
-    ///   black out sheets that asked for nothing.
-    /// * **Dashed edges paint solid** (0.2% of edges), the same trade
-    ///   [`BorderStyle`](liteparse_ooxml::xlsx::BorderStyle) already made by
-    ///   keeping the full enum rather than mapping the tail to `None`.
-    /// * **Diagonals are not drawn**: a `Rect` cannot express one, and the
-    ///   variant that could (`Line`) paints in the Ink pass, over everything.
+    /// A solid fill paints its colour; a hatch paints its coverage blend (see
+    /// [`fill_color`]); gradient and no-fill paint nothing. An automatic `fg`
+    /// is the consumer's background and is not painted, so it does not cover
+    /// the gridlines it sits on.
     ///
     /// Merged regions paint per cell rather than as one box. Excel writes the
     /// covered cells with the merge's own style, so the fill is right; the
@@ -2916,10 +2859,10 @@ mod tests {
         );
     }
 
-    /// The census's classes B, D and E — the 15.9% of declared paint that a
-    /// valued-cells-only painter cannot see. A styled blank paints its own
-    /// cell, `<row customFormat>` paints the row's retained columns, and
-    /// `<col style>` paints its span; the cascade is cell > row > column.
+    /// Paint that a valued-cells-only painter cannot see: a styled blank
+    /// paints its own cell, `<row customFormat>` paints the row's retained
+    /// columns, and `<col style>` paints its span; the cascade is
+    /// cell > row > column.
     #[test]
     fn blanks_and_row_and_column_formats_all_paint() {
         let nx = painted(
@@ -2931,10 +2874,9 @@ mod tests {
             </sheetData></worksheet>"#,
         );
         let r = rects(&nx.layouts[0]);
-        // Row 1: A1 takes the column's blue (class E), B1's own style wins and
-        // is the `gray125` placeholder, which blends rather than covering
-        // (class B). Row 2: the row's yellow on both columns (class D), with
-        // B2's own blue overriding it.
+        // Row 1: A1 takes the column's blue, B1's own style wins and is the
+        // `gray125` placeholder, which blends rather than covering. Row 2: the
+        // row's yellow on both columns, with B2's own blue overriding it.
         assert_eq!(r.len(), 4, "{r:?}");
         assert_eq!((r[0].1, r[0].4), (MARGIN, BLUE));
         assert!((r[0].2 - 56.25).abs() < 1e-4, "the column's own width");
@@ -3014,8 +2956,7 @@ mod tests {
     }
 
     /// `double` is two strokes and a gap, filling the three-pen band
-    /// `extent_pt` reserves — not one thin line, which is what 27,300 corpus
-    /// edges were painted as before.
+    /// `extent_pt` reserves — not one thin line.
     #[test]
     fn a_double_edge_paints_two_strokes_with_a_gap() {
         let nx = one_cell(2);
@@ -3413,8 +3354,8 @@ mod tests {
     }
 
     /// The doc-level block stream from the geometry pass must equal the
-    /// emitter's, figures included — the emitter is what the corpus gates
-    /// score, and the CLI ships the geometry pass's.
+    /// emitter's, figures included — the two share one plan, and the CLI ships
+    /// the geometry pass's.
     #[test]
     fn doc_blocks_match_the_emitter_with_figures_on() {
         let sheet = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>
@@ -3662,9 +3603,8 @@ mod tests {
             .collect()
     }
 
-    /// The carrier gap closed: a textless filled rectangle — dropped by the
-    /// text channel, invisible before this step — paints as a `Path` in a
-    /// `Float` bracket, and the item stream never hears about it.
+    /// A textless filled rectangle — dropped by the text channel — paints as a
+    /// `Path` in a `Float` bracket, and the item stream never hears about it.
     #[test]
     fn a_textless_filled_shape_paints_a_path_and_adds_no_item() {
         let anchor = r#"<xdr:oneCellAnchor>
@@ -3711,9 +3651,9 @@ mod tests {
     }
 
     /// A grouped child paints in its share of the anchor box: the group's
-    /// `chOff`/`chExt` map the child's declared quarter onto a quarter of
-    /// the page rect. 3,547 corpus inked shapes are inside a group; without
-    /// this mapping every one of them would smear across the full anchor.
+    /// `chOff`/`chExt` map the child's declared quarter onto a quarter of the
+    /// page rect. Without this mapping a grouped shape smears across the full
+    /// anchor.
     #[test]
     fn a_grouped_child_paints_in_its_share_of_the_anchor_box() {
         let anchor = r#"<xdr:oneCellAnchor>
@@ -3770,8 +3710,7 @@ mod tests {
     }
 
     /// A flat line — every horizontal connector declares `cy="0"` — still
-    /// strokes; a zero-extent *point* (540 corpus shapes, all legacy
-    /// `Line NNN` leftovers) paints nothing.
+    /// strokes; a zero-extent *point* paints nothing.
     #[test]
     fn a_flat_line_strokes_and_a_point_does_not() {
         let line = |ext: &str| {
@@ -3799,9 +3738,9 @@ mod tests {
         );
     }
 
-    /// A vertical line rotated a quarter turn into a horizontal one — 88
-    /// corpus shapes — still paints: its unrotated rect is zero-width, and
-    /// only the rotated *bounding box* meaningfully maps onto the anchor.
+    /// A vertical line rotated a quarter turn into a horizontal one still
+    /// paints: its unrotated rect is zero-width, and only the rotated
+    /// *bounding box* meaningfully maps onto the anchor.
     #[test]
     fn a_quarter_rotated_flat_line_still_paints() {
         let anchor = r#"<xdr:twoCellAnchor>
@@ -3838,7 +3777,7 @@ mod tests {
     }
 
     /// A declared run colour reaches the painted text — red glyphs, not the
-    /// black default. 5,041 of 5,902 corpus runs declare one.
+    /// black default.
     #[test]
     fn a_declared_run_colour_reaches_the_painted_text() {
         let anchor = r#"<xdr:oneCellAnchor>
@@ -3899,9 +3838,8 @@ mod tests {
     }
 
     /// A sentence too wide for its box paints as several measured lines while
-    /// the item stays the single unmeasured stack entry. This is the whole
-    /// shape of step 5b: paint is a layout, items are not, and the census
-    /// says 34.8% of corpus paragraphs are on this path.
+    /// the item stays the single unmeasured stack entry: paint is a layout,
+    /// items are not.
     #[test]
     fn shape_text_wraps_in_the_paint_and_not_in_the_items() {
         // 72 x 72 pt box, a sentence far wider than 72pt at 12pt Calibri.
@@ -3938,8 +3876,8 @@ mod tests {
         assert_eq!(shape_items.len(), 1, "the item side is still one paragraph");
     }
 
-    /// `anchor="ctr"` moves the painted body down the box — 61.5% of corpus
-    /// shapes, and the reason the even stack could not be painted as-is.
+    /// `anchor="ctr"` moves the painted body down the box — the reason the
+    /// even stack could not be painted as-is.
     #[test]
     fn a_centred_anchor_moves_the_painted_body_and_not_the_item() {
         let shape = |anchor: &str| {
@@ -4035,8 +3973,8 @@ mod tests {
     }
 
     /// A box narrower than the two default 7.2pt insets still paints. Without
-    /// the clamp `layout_shape_body` returns nothing at all, which is 6.5% of
-    /// corpus shapes — the narrow marker labels a timeline is made of.
+    /// the clamp `layout_shape_body` returns nothing at all — the narrow
+    /// vertical marker labels a timeline is made of would vanish.
     #[test]
     fn a_box_narrower_than_its_insets_still_paints() {
         // 114300 EMU = 9pt wide, against 14.4pt of default horizontal inset.
@@ -4274,9 +4212,8 @@ mod tests {
         }
     }
 
-    /// The 12.8% / 6.1% pair from the paint census, as one fixture: the same
-    /// oversized string clips against a written neighbour and spills past an
-    /// empty one.
+    /// Clip and spill in one fixture: the same oversized string clips against
+    /// a written neighbour and spills past an empty one.
     #[test]
     fn overflow_spills_into_an_empty_neighbour_and_clips_against_a_written_one() {
         let long = "the quick brown fox jumps over the lazy dog";

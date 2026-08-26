@@ -18,12 +18,10 @@ use crate::render::resolve::shape_geometry::SubPath;
 /// baked into the float's resolved page-coordinate rectangle before
 /// registration.
 ///
-/// Tier 1 treats `Tight` and `Through` as spec-compliant placeholders: both
-/// take `Square`'s path exactly — registered as an active float
-/// ([`WrapMode::registers_as_wrap_float`]) and narrowing each line by the
-/// float's bounding rect and the side constraint, never by the polygon the
-/// two modes actually name. Full polygon-aware line fitting is deferred to
-/// Tier 2 and not yet designed.
+/// `Tight` and `Through` currently take `Square`'s path exactly — registered
+/// as an active float ([`WrapMode::registers_as_wrap_float`]) and narrowing
+/// each line by the float's bounding rect and the side constraint, not by the
+/// polygon those two modes name. Polygon-aware line fitting is not implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WrapMode {
     /// §20.4.2.15 wrapNone — no reflow; drawing paints over or under text.
@@ -112,8 +110,7 @@ pub struct FloatingImage {
 }
 
 impl FloatingImage {
-    /// §20.4.2.18 convenience — kept for call-site ergonomics during the
-    /// wrap-mode rollout. Equivalent to `matches!(self.wrap_mode, WrapMode::TopAndBottom)`.
+    /// §20.4.2.18 convenience — true when `wrap_mode` is `TopAndBottom`.
     pub fn is_wrap_top_and_bottom(&self) -> bool {
         matches!(self.wrap_mode, WrapMode::TopAndBottom)
     }
@@ -224,15 +221,13 @@ pub struct FloatingShape {
     /// §20.4.2.3 distL/distR — horizontal distance from surrounding text.
     pub dist_left: Pt,
     pub dist_right: Pt,
-    /// §20.4.2.3 @behindDoc — painted behind document text.
-    pub behind_doc: bool,
     /// Path subpaths in shape-local Pt (already scaled into `size`).
     pub paths: Vec<SubPath>,
     /// Resolved fill.
     pub fill: ResolvedFill,
     /// Optional resolved stroke.
     pub stroke: Option<ResolvedStroke>,
-    /// Resolved post-processing effects (painter may defer all in Tier 0).
+    /// Resolved post-processing effects (the painter may defer them).
     pub effects: Vec<ResolvedEffect>,
     /// §17.17.1 / §20.1.2.1.1: pre-laid-out commands for the shape's
     /// text-box content (`wps:wsp/wps:txbx/w:txbxContent`). Each

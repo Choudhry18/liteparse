@@ -1,12 +1,10 @@
 //! Number formatting — the seam [`Workbook::format_code`] left open.
 //!
 //! A cell stores `0.155`; the sheet shows `15.5%`. The gap between the two is
-//! ECMA-376 §18.8.31's format grammar, and the finance-slice census said it is
-//! not a small one: **50.0% of documents need multi-section `pos;neg;zero;text`
-//! dispatch**, 36.0% need quoted literals, 34.9% need `_` skip-width padding,
-//! 23.2% `?` placeholders, 23.0% `*` fill, 14.4% `[Red]`. Excel's Accounting
-//! code — `_("$"* #,##0.00_);…` in 99 documents — exercises five of those at
-//! once.
+//! ECMA-376 §18.8.31's format grammar: multi-section `pos;neg;zero;text`
+//! dispatch, quoted literals, `_` skip-width padding, `?` placeholders, `*`
+//! fill, and `[Red]` condition brackets are all in common use. Excel's
+//! Accounting code — `_("$"* #,##0.00_);…` — exercises five of those at once.
 //!
 //! So the interpreter is [`ssf_rs`], a port of SheetJS's `ssf`, and this module
 //! is only the adapter: which of [`CellValue`]'s six shapes gets fed to it,
@@ -80,12 +78,10 @@ pub fn render(code: &str, value: &CellValue, date1904: bool) -> Result<String, S
 /// The detection is on the **output**, not the input, and the difference is
 /// load-bearing: `1.23e-7` under `0.00` is `"0.00"` in both implementations,
 /// because the rounding discards the mantissa before the splice can go wrong.
-/// Rejecting every out-of-range magnitude would have broken those, which the
-/// oracle diff duly reported.
+/// Rejecting every out-of-range magnitude would break those cases too.
 ///
-/// The corpus reaches an out-of-range magnitude in **1,436 cells across 9 of
-/// 1,178 workbooks**, so the guard is not hypothetical and is also not the
-/// common path.
+/// Out-of-range magnitudes are rare but real, so the guard is not
+/// hypothetical, and it is also not the common path.
 fn is_spliced_exponent(n: f64, code: &str, out: &str) -> bool {
     let mag = n.abs();
     if n == 0.0 || !n.is_finite() || (1e-6..1e21).contains(&mag) {
@@ -190,11 +186,11 @@ fn bool_text(b: bool) -> &'static str {
 ///
 /// A code with no sections and no `@` — `0.00`, `#,##0` — leaves a string
 /// alone, which is both Excel's behaviour and the reason a shared string used
-/// 40,000 times is not run through the interpreter 40,000 times. Anything with
+/// many times is not run through the interpreter for each use. Anything with
 /// a `;` in it goes to the interpreter, because the *fourth* section is the
 /// text section and an **empty** one blanks the cell: `#,##0.00;;;` displays
-/// nothing at all, and a `@`-check alone would have rendered the string. The
-/// oracle diff caught exactly that, on three corpus codes.
+/// nothing at all, and a `@`-check alone would have rendered the string
+/// instead.
 fn render_text(code: &str, text: &str) -> String {
     if code == GENERAL || (!code.contains('@') && !code.contains(';')) {
         return text.to_string();
@@ -202,15 +198,14 @@ fn render_text(code: &str, text: &str) -> String {
     let out = ssf_rs::format(code, &Value::Text(text.to_string()), false)
         .unwrap_or_else(|_| text.to_string());
     let out = strip_nan(code, out, Some(text));
-    // `ssf-rs` 0.1 truncates the text at the fill character when `*`'s fill
-    // char also occurs in the text: `@*.` renders `"1. kvartal:"` as `"1."`.
-    // (`@* ` is unaffected — the defect is per fill char, and `.` is the one
-    // the corpus hits.) A section with `@` places the text verbatim, so an
-    // output that lost it is a wrong answer, not a presentation choice; fall
-    // back to the raw text — keep the data, lose the fill. Detect on the
-    // output, not the input: same rule as the `NaN` guard above, and for the
-    // same reason (the first version of that guard rejected inputs and
-    // regressed 1,100 correct renders).
+    // `ssf-rs` truncates the text at the fill character when `*`'s fill char
+    // also occurs in the text: `@*.` renders `"1. kvartal:"` as `"1."`. A
+    // section with `@` places the text verbatim, so an output that lost it
+    // is a wrong answer, not a presentation choice; fall back to the raw
+    // text — keep the data, lose the fill. Detect on the output, not the
+    // input, for the same reason as the `NaN` guard below: rejecting on the
+    // input would also reject correct renders that merely contain the fill
+    // character.
     if code.contains('*') && code.contains('@') && !out.contains(text) {
         return text.to_string();
     }
@@ -227,17 +222,16 @@ fn render_text(code: &str, text: &str) -> String {
 ///
 /// Gated on the `*` that leaks it, and on the code not writing `NaN` as a
 /// literal — and then applied **only outside the value's own text**, because a
-/// blind `replace` is a data-loss bug waiting for the right cell. The Zenodo
-/// corpus supplied that cell: a conference named `NaNA`, in a paper title, and
-/// an ungated strip shortens it to `A`. Skipping the repair whenever the source
-/// contains `NaN` would be the opposite error — it leaves the leak in the one
-/// title that has both.
+/// blind `replace` is a data-loss bug waiting for the right cell: a source
+/// string containing the literal substring `NaN` (e.g. a title with
+/// "NaNA" in it) must keep it, while the interpreter's own leaked `NaN`
+/// around it must go.
 ///
 /// `protect` is the source text a text cell renders from; a number has none,
 /// and only renders `NaN` when the value itself is one.
 ///
-/// **4 cells in 24M** hit the real leak; the guard is here because a cell
-/// reading `NaN` is not a presentation defect, it is a wrong answer.
+/// This is rare but real; the guard is here because a cell reading `NaN` is
+/// not a presentation defect, it is a wrong answer.
 fn strip_nan(code: &str, out: String, protect: Option<&str>) -> String {
     if !out.contains("NaN") || code.contains("NaN") || !code.contains('*') {
         return out;
@@ -308,11 +302,7 @@ impl Workbook {
     /// byte for byte**. Verifying on the output is what makes the substitution
     /// safe to do at all — [`render`]'s two repairs are both gated on the `*`
     /// the substitution removes, so a sentinel render can legitimately differ,
-    /// and when it does the answer is `None` rather than a guess. Over the
-    /// 1,248-workbook corpus: 193,244 cells carry a `*` code, 181,117 (93.7%)
-    /// recover an offset, 12,123 declare the fill in a section this value does
-    /// not use, and **4 diverge** — the same four `@*.` cells
-    /// [`strip_nan`] documents.
+    /// and when it does the answer is `None` rather than a guess.
     ///
     /// `None` also for the overwhelming majority of cells, whose code has no
     /// `*` at all; that case costs one `contains` and no render.
@@ -332,11 +322,11 @@ impl Workbook {
         let mut marks = rendered.match_indices(FILL_SENTINEL);
         let (at, _) = marks.next()?;
         // More than one active fill would need more than one split point, and
-        // the painter has one gap to give. The corpus holds none.
+        // the caller has one gap to give.
         if marks.next().is_some() {
             return None;
         }
-        let mut stripped = rendered.clone();
+        let mut stripped = rendered;
         stripped.remove(at);
         (stripped == plain).then_some(at)
     }
@@ -388,24 +378,24 @@ mod tests {
         render(code, &CellValue::Number(n), false).unwrap()
     }
 
-    /// The six mechanisms the finance-slice census named, each at the value
-    /// that exercises it. Failing any one of these is a whole class of the
-    /// corpus rendering wrong, not a rounding difference.
+    /// The core mechanisms of the format grammar, each at the value that
+    /// exercises it. Failing any one of these is a whole class of documents
+    /// rendering wrong, not a rounding difference.
     #[test]
     fn the_censused_mechanisms_render() {
-        // multi-section dispatch: 50.0% of documents
+        // multi-section dispatch
         let acct = r#"_("$"* #,##0.00_);_("$"* \("$"* #,##0.00\);_("$"* "-"??_);_(@_)"#;
         assert_eq!(num(acct, 1234.5678), " $1,234.57 ");
         assert_eq!(num(acct, -1234.5678), " $($1,234.57)");
         // zero section: `"-"??` is the accounting dash, padded to two digits
         assert_eq!(num(acct, 0.0), " $-   ");
-        // quoted literal: 36.0%
+        // quoted literal
         assert_eq!(num(r#"0.00"kg""#, 1234.5678), "1234.57kg");
-        // skip-width `_)`: 34.9% — one space, not a dropped character
+        // skip-width `_)` — one space, not a dropped character
         assert_eq!(num("0.00_);(0.00)", 1234.5678), "1234.57 ");
-        // `[Red]` is consumed, never emitted: 14.4%
+        // `[Red]` is consumed, never emitted
         assert_eq!(num(r"#,##0.0;[Red]\-#,##0.0;0", -1234.5678), "-1,234.6");
-        // comma scaling: 0.2% of docs, but silently 1000x wrong if unhandled
+        // comma scaling — silently 1000x wrong if unhandled
         assert_eq!(num("#,##0.00,,", 45000.25), "0.05");
         // suppressed sections render empty rather than falling back
         assert_eq!(num("0;;", -1234.5678), "");
@@ -471,8 +461,7 @@ mod tests {
 
     /// The fourth section governs text even when it is empty, and empty means
     /// the cell displays nothing. Skipping the interpreter for codes without
-    /// `@` renders the string instead — three corpus codes, found by the
-    /// SheetJS diff rather than by reading the spec.
+    /// `@` renders the string instead, which is wrong for this case.
     #[test]
     fn an_empty_fourth_section_blanks_text() {
         assert_eq!(render_text(";;;", "NO"), "");
@@ -484,25 +473,25 @@ mod tests {
     }
 
     /// The port leaks its `*`-repeat count into the string when there is no
-    /// column width to fill. Four corpus cells, found by the oracle diff.
+    /// column width to fill.
     #[test]
     fn a_leaked_nan_is_removed_but_a_literal_one_is_kept() {
         assert_eq!(render_text("@*.", "Vareforbrug"), "Vareforbrug.");
         assert_eq!(render_text(r#"@" NaN""#, "x"), "x NaN");
-        // The Zenodo counterexample: a conference called NaNA, under a fill
-        // code. An ungated strip shortens the title.
+        // A title that legitimately contains "NaN" as a substring, under a
+        // fill code. An ungated strip would shorten the title.
         assert_eq!(
             render_text("@*.", "Networking and Network Applications (NaNA)"),
             "Networking and Network Applications (NaNA)."
         );
     }
 
-    /// The upstream defect the emitter's recall gate caught: `ssf-rs` 0.1
-    /// truncates the text at the fill character when it also occurs in the
-    /// text — `@*.` on `"1. kvartal:"` came back `"1."`. The guard keeps the
-    /// data and drops the fill, and must not disturb the two behaviours next
-    /// to it: an intact render keeps its fill, and the empty fourth section
-    /// still blanks (no `@` in that code, so the guard stays out of its way).
+    /// An upstream `ssf-rs` defect: it truncates the text at the fill
+    /// character when the character also occurs in the text — `@*.` on
+    /// `"1. kvartal:"` came back `"1."`. The guard keeps the data and drops
+    /// the fill, and must not disturb the two behaviours next to it: an
+    /// intact render keeps its fill, and the empty fourth section still
+    /// blanks (no `@` in that code, so the guard stays out of its way).
     #[test]
     fn a_fill_char_inside_the_text_does_not_truncate_it() {
         assert_eq!(render_text("@*.", "1. kvartal:"), "1. kvartal:");

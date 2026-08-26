@@ -16,15 +16,9 @@ pub struct Theme {
     /// §20.1.4.1.7 bgFillStyleLst — the *background* fill matrix, a list
     /// distinct from [`Self::fill_styles`] and reached only through a
     /// §19.3.1.3 `<p:bgRef>` whose `idx` is 1001 or greater (`idx - 1000`,
-    /// then 0-based here). A shape's `<a:fillRef>` never reaches it.
-    ///
-    /// Parsed because the corpus leaves no choice: **all 440 `bgRef`
-    /// backgrounds across the 45-deck PPTX corpus use `idx="1001"`, and not
-    /// one uses `fillStyleLst`.** Resolving those against `fill_styles` — a
-    /// 3-entry list — is an out-of-range lookup that yields `None` and
-    /// renders every one of them with no background at all, silently. All
-    /// 115 corpus themes declare a 3-entry `bgFillStyleLst`, so with this
-    /// field the same 440 resolve.
+    /// then 0-based here). A shape's `<a:fillRef>` never reaches it, so a
+    /// `bgRef` resolved against `fill_styles` instead would silently render
+    /// with no background.
     pub bg_fill_styles: Vec<DrawingFill>,
     /// §20.1.4.1.21 lnStyleLst — theme line styles referenced via
     /// `<a:lnRef idx="N">`. 0-based in storage — `lnRef idx="1"` is
@@ -51,43 +45,6 @@ pub struct ThemeColorScheme {
     pub accent6: u32,
     pub hyperlink: u32,
     pub followed_hyperlink: u32,
-}
-
-impl ThemeColorScheme {
-    /// Resolve a theme color index to an RGB value.
-    pub fn resolve(&self, idx: ThemeColorIndex) -> u32 {
-        match idx {
-            ThemeColorIndex::Dark1 => self.dark1,
-            ThemeColorIndex::Light1 => self.light1,
-            ThemeColorIndex::Dark2 => self.dark2,
-            ThemeColorIndex::Light2 => self.light2,
-            ThemeColorIndex::Accent1 => self.accent1,
-            ThemeColorIndex::Accent2 => self.accent2,
-            ThemeColorIndex::Accent3 => self.accent3,
-            ThemeColorIndex::Accent4 => self.accent4,
-            ThemeColorIndex::Accent5 => self.accent5,
-            ThemeColorIndex::Accent6 => self.accent6,
-            ThemeColorIndex::Hyperlink => self.hyperlink,
-            ThemeColorIndex::FollowedHyperlink => self.followed_hyperlink,
-        }
-    }
-}
-
-/// Index into the theme color scheme (ST_ThemeColor).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ThemeColorIndex {
-    Dark1,
-    Light1,
-    Dark2,
-    Light2,
-    Accent1,
-    Accent2,
-    Accent3,
-    Accent4,
-    Accent5,
-    Accent6,
-    Hyperlink,
-    FollowedHyperlink,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,40 +117,4 @@ pub enum ScriptTag {
     Yiii,
     /// Unrecognized script code — preserved as-is.
     Other(Box<str>),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_maps_each_index_to_its_slot() {
-        // Distinct value per slot catches an accidental field swap in `resolve`.
-        let cs = ThemeColorScheme {
-            dark1: 1,
-            light1: 2,
-            dark2: 3,
-            light2: 4,
-            accent1: 5,
-            accent2: 6,
-            accent3: 7,
-            accent4: 8,
-            accent5: 9,
-            accent6: 10,
-            hyperlink: 11,
-            followed_hyperlink: 12,
-        };
-        assert_eq!(cs.resolve(ThemeColorIndex::Dark1), 1);
-        assert_eq!(cs.resolve(ThemeColorIndex::Light1), 2);
-        assert_eq!(cs.resolve(ThemeColorIndex::Dark2), 3);
-        assert_eq!(cs.resolve(ThemeColorIndex::Light2), 4);
-        assert_eq!(cs.resolve(ThemeColorIndex::Accent1), 5);
-        assert_eq!(cs.resolve(ThemeColorIndex::Accent2), 6);
-        assert_eq!(cs.resolve(ThemeColorIndex::Accent3), 7);
-        assert_eq!(cs.resolve(ThemeColorIndex::Accent4), 8);
-        assert_eq!(cs.resolve(ThemeColorIndex::Accent5), 9);
-        assert_eq!(cs.resolve(ThemeColorIndex::Accent6), 10);
-        assert_eq!(cs.resolve(ThemeColorIndex::Hyperlink), 11);
-        assert_eq!(cs.resolve(ThemeColorIndex::FollowedHyperlink), 12);
-    }
 }

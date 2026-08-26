@@ -2,11 +2,11 @@
 //!
 //! Upstream this module is `resolve → layout → subset → paint`. Vendored here
 //! are `resolve` (style/numbering cascade — everything the structure path
-//! needs) and, as of the C′ port, `layout` — dxpdf's full pagination engine
-//! with its Skia `TextMeasurer` swapped for fontdb + skrifa
-//! (`layout::measurer`, `fonts`). `subset` and `painter` are PDF-emission
-//! concerns and stay out; that is why `render()` / PDF output do not exist
-//! here and layout ends at [`layout::draw_command::LayoutedPage`].
+//! needs) and `layout` — dxpdf's pagination engine with its Skia
+//! `TextMeasurer` swapped for fontdb + skrifa (`layout::measurer`, `fonts`).
+//! `subset` and `painter` are PDF-emission concerns and stay out; that is why
+//! `render()` / PDF output do not exist here and layout ends at
+//! [`layout::draw_command::LayoutedPage`].
 
 pub mod dimension;
 pub mod emoji;

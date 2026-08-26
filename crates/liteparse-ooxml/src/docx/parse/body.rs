@@ -48,10 +48,9 @@ struct DocXml {
 
 // ── Conversion ────────────────────────────────────────────────────────────
 
-/// Conversion context. Previously carried a pre-pass iterator of parsed
-/// drawings/picts; now empty, since drawings and picts are serde-parsed
-/// inline. Kept as a type for future extensibility (e.g., if a later phase
-/// needs cross-node state during conversion).
+/// Conversion context, threaded through the body walk. Currently empty —
+/// drawings and picts are serde-parsed inline — but kept as a type so a
+/// later phase can add cross-node state without changing every call site.
 pub(crate) struct ConvertCtx {
     _private: (),
 }
@@ -620,7 +619,7 @@ mod tests {
     #[test]
     fn ins_content_is_rendered() {
         // Tracked insertions are part of the final document — their runs must
-        // survive (previously `<w:ins>` hit the `Other` catch-all and vanished).
+        // survive, not fall into the `Other` catch-all.
         assert_eq!(
             para_text(r#"<w:p xmlns:w="x"><w:ins><w:r><w:t>kept</w:t></w:r></w:ins></w:p>"#),
             "kept"
@@ -788,11 +787,11 @@ mod tests {
         );
     }
 
-    /// Regression: a `<w:tr>` whose `<w:tc>` cells are interleaved with
-    /// cell-level `<w:sdt>` (CT_SdtCell) wrappers must (a) parse — the old
-    /// `Vec<TableCellXml>` field reported a duplicate `tc` when cells were
-    /// non-contiguous — and (b) recover every cell, including the ones nested
-    /// inside `<w:sdtContent>`.
+    /// A `<w:tr>` whose `<w:tc>` cells are interleaved with cell-level
+    /// `<w:sdt>` (CT_SdtCell) wrappers must (a) parse — a plain
+    /// `Vec<TableCellXml>` field would report a duplicate `tc` when cells
+    /// are non-contiguous — and (b) recover every cell, including the ones
+    /// nested inside `<w:sdtContent>`.
     #[test]
     fn row_with_interspersed_sdt_cells_recovers_all_cells() {
         let xml = r#"
@@ -833,8 +832,8 @@ mod tests {
     }
 
     /// A `<w:customXml>` row wrapper (CT_CustomXmlRow) inside `<w:tbl>` must
-    /// have its nested `<w:tr>` rows recovered — the element is `customXml`,
-    /// not `customXmlIns`/etc., so the wrong rename previously dropped them.
+    /// have its nested `<w:tr>` rows recovered — the element name is
+    /// `customXml`, not `customXmlIns`/etc.
     #[test]
     fn table_with_custom_xml_row_wrapper_recovers_rows() {
         let xml = r#"

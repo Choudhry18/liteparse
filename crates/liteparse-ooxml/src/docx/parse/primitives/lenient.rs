@@ -1,13 +1,9 @@
 //! Tolerant deserializers for OOXML simple-type (`ST_*`) attribute values.
 //!
-//! Vendoring divergence from dxpdf, and a standing requirement of this copy:
-//! **one bad attribute value must not fail the whole document.**
-//!
-//! Upstream models each `ST_*` simple type as a plain serde enum, so an
-//! unrecognized value (a newer spec revision, a producer quirk, or plain
-//! corruption) aborts the entire parse. That is the same fail-closed pattern
-//! that cost us 4% of the `docx_files` corpus via unknown *elements*; unknown
-//! *values* are the other half of it.
+//! One bad attribute value must not fail the whole document. dxpdf models
+//! each `ST_*` simple type as a plain serde enum, so an unrecognized value
+//! (a newer spec revision, a producer quirk, or plain corruption) aborts the
+//! entire parse; these helpers swallow that failure instead.
 //!
 //! ECMA-376 §17.17 treats an invalid attribute value as if the attribute were
 //! absent, so the correct degradation is "unspecified", not "some other value".
@@ -16,7 +12,7 @@
 //!
 //! These helpers only apply where absence is representable. Required
 //! attributes with no meaningful "unspecified" state are handled at their own
-//! definition instead — see `ATTRIBUTION.md`.
+//! definition instead.
 
 use serde::Deserialize;
 use serde::de::value::Error as ValueError;

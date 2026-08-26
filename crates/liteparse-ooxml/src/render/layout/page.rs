@@ -138,16 +138,14 @@ const MIN_COLUMN_WIDTH: Pt = Pt::new(1.0);
 /// show anything, so a count implying narrower columns describes no layout a
 /// document could have meant.
 ///
-/// **The gaps count.** `n` columns carry `n - 1` gaps of `space`, so the widest
+/// The gaps count: `n` columns carry `n - 1` gaps of `space`, so the widest
 /// usable count solves
 /// `(content_width - space·(n-1)) / n >= MIN_COLUMN_WIDTH`, i.e.
-/// `n <= (content_width + space) / (MIN_COLUMN_WIDTH + space)`. **This is the
-/// only thing keeping the column width non-negative** — `compute_columns`
+/// `n <= (content_width + space) / (MIN_COLUMN_WIDTH + space)`. This bound is
+/// **the only thing keeping the column width non-negative** — `compute_columns`
 /// deliberately does not clamp afterwards. Bounding on
-/// `content_width / MIN_COLUMN_WIDTH` alone ignores the gaps and still admits
-/// counts whose column width comes out **negative** — which is what made a
-/// 15-column section panic. Solving for the gaps is what makes the width
-/// non-negative *by construction* rather than by a later clamp.
+/// `content_width / MIN_COLUMN_WIDTH` alone ignores the gaps and admits counts
+/// whose column width comes out negative.
 fn clamp_column_count(requested: u32, content_width: Pt, space: Pt) -> usize {
     let requested = (requested as usize).max(1);
     if content_width <= Pt::ZERO {
@@ -177,9 +175,9 @@ fn clamp_column_count(requested: u32, content_width: Pt, space: Pt) -> usize {
 /// present — Word writes `equalWidth="0"` whenever it means the individual
 /// definitions to win.
 ///
-/// **Tier 0:** §17.6.4 `w:sep` — the vertical rule drawn between columns — is
-/// parsed onto `model::Columns::separator` but never drawn. Position and width
-/// of the columns themselves are unaffected; only the divider line is missing.
+/// §17.6.4 `w:sep` — the vertical rule drawn between columns — is parsed onto
+/// `model::Columns::separator` but not yet drawn. Column position and width are
+/// unaffected; only the divider line is missing.
 fn compute_columns(content_width: Pt, columns: &Option<Columns>) -> Vec<ColumnGeometry> {
     let single = || {
         vec![ColumnGeometry {
@@ -226,13 +224,10 @@ fn compute_columns(content_width: Pt, columns: &Option<Columns>) -> Vec<ColumnGe
 
     // Equal-width columns.
     let total_gap = default_space * (num as f32 - 1.0);
-    // No clamp here on purpose. `clamp_column_count` is the single guarantee
-    // that this is positive, and a second `.max(Pt::ZERO)` was demonstrably
-    // inert — removing it changed no test, because the bound already excludes
-    // every count that could make it negative. Two mechanisms for one invariant
-    // means the redundant one rots unnoticed; if the bound below ever changes,
-    // this is the line that breaks, and `column_count_never_yields_a_negative_width`
-    // is the test that catches it.
+    // No clamp here on purpose: `clamp_column_count` is the single guarantee
+    // that this is non-negative, since its bound excludes every count that could
+    // make the width negative. A second `.max(Pt::ZERO)` here would be a
+    // redundant invariant that rots unnoticed.
     let col_width = (content_width - total_gap) / num as f32;
     let mut result = Vec::with_capacity(num);
     for i in 0..num {
@@ -514,12 +509,12 @@ mod tests {
         assert_eq!(degenerate.len(), 1);
     }
 
-    // ── E6#1: no route may produce a negative width ──────────────────────
+    // ── No route may produce a negative width ────────────────────────────
     //
-    // Three distinct routes reached the same defect, and only the first was in
-    // the original finding. All three ended at `BoxConstraints::new`'s
-    // `debug_assert!(min_width <= max_width)` — a panic through the public
-    // `convert()` API in debug builds, a negative-width layout in release.
+    // Three distinct routes can reach the same defect. All three end at
+    // `BoxConstraints::new`'s `debug_assert!(min_width <= max_width)` — a panic
+    // through the public `convert()` API in debug builds, a negative-width
+    // layout in release.
 
     /// Route 1: more columns than the text area can hold at the given spacing.
     /// The old bound (`content_width / MIN_COLUMN_WIDTH`) ignored the gaps, so

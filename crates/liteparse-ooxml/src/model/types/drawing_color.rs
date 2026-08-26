@@ -181,11 +181,10 @@ pub enum SchemeColorVal {
 /// master, and a master is free to state the swapped form — which is how a
 /// dark-backgrounded design keeps `tx1` meaning "readable text".
 ///
-/// On the 45-deck corpus, 30 of 70 slide masters declare a non-identity map
-/// (all of them swapping `bg2`/`tx2`; exactly one also swaps `bg1`/`tx1`), so
-/// inferring instead of reading is a wrong colour on 22 of 45 decks, not a
-/// missing one — the failure mode that renders as confidently-legible text in
-/// the wrong hue rather than as an obvious gap.
+/// A non-identity map is common (e.g. a master swapping `bg2`/`tx2`, or even
+/// `bg1`/`tx1`), so inferring the convention instead of reading it produces a
+/// wrong colour rather than a missing one — confidently-legible text in the
+/// wrong hue rather than an obvious gap.
 ///
 /// The four theme-side names (`dk1`/`lt1`/`dk2`/`lt2`) are *not* mapped: they
 /// already name the scheme directly and §19.3.1.6 has no slot for them.
@@ -206,8 +205,7 @@ pub struct ColorMap {
 }
 
 impl Default for ColorMap {
-    /// The mapping a master gets when it declares no `p:clrMap`, which is also
-    /// the one 40 of the corpus's 70 masters declare explicitly.
+    /// The identity mapping used when a master declares no `p:clrMap`.
     fn default() -> Self {
         Self {
             bg1: SchemeColorVal::Lt1,

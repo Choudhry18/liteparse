@@ -160,10 +160,9 @@ pub(super) fn build_table(
     // §17.4.63 / Word heuristic: a full-width left-aligned table extends
     // beyond the body content area by its cell margins so cell content
     // aligns with surrounding paragraph text. Centered/right-aligned tables
-    // are positioned as a unit — extending them would just shift them out
-    // by half the margins, producing a width discrepancy when consecutive
-    // centered tables have different cell margins (cf. the stacked
-    // "Anhang: Sauberkeit" tables in the Volvo Annahme-Protokoll).
+    // are positioned as a unit — extending them would shift them out by half
+    // the margins, so consecutive centered tables with different cell margins
+    // would render at different widths.
     let extends_for_alignment = !matches!(
         t.properties.alignment,
         Some(model::Alignment::Center) | Some(model::Alignment::End)
@@ -289,9 +288,8 @@ pub(super) fn build_table(
                 })
                 .collect();
 
-            // Word/LibreOffice row-uniform content-area quirk — see
-            // `normalize_row_uniform_vertical_insets` for the spec gap and
-            // empirical evidence motivating this pass.
+            // Word/LibreOffice normalize top/bottom cell margins to the
+            // row-wide max — see `normalize_row_uniform_vertical_insets`.
             let mut cells = cells;
             normalize_row_uniform_vertical_insets(&mut cells);
 
@@ -318,14 +316,8 @@ pub(super) fn build_table(
 
             TableRowInput {
                 cells,
-                // §17.4.81: `exact` pins the height, `atLeast` is a minimum,
-                // and `auto` **ignores `val`** — the row sizes to its content,
-                // so it carries no constraint at all. An omitted `hRule`
-                // arrives as `AtLeast` (Word's default, set at the parse seam),
-                // which is why folding `auto` in with it used to be invisible:
-                // [MS-OE376] §2.4.77(c) notes Word requires `val = 0` whenever
-                // `hRule="auto"`, making `AtLeast(0)` a no-op on Word output.
-                // Other producers are not bound by that.
+                // §17.4.81: see `row_height_rule` — `auto` carries no
+                // constraint, `exact`/`atLeast` map through.
                 height_rule: row.properties.height.and_then(row_height_rule),
                 is_header: row.properties.is_header,
                 cant_split: row.properties.cant_split,
@@ -397,57 +389,21 @@ pub(super) fn build_table(
     }
 }
 
-/// Word/LibreOffice row layout quirk: top/bottom cell margins are normalized
-/// to the row-wide maximum across all cells in the row, while left/right stay
-/// per-cell.
+/// Normalize each cell's top/bottom margin to the row-wide maximum; left/right
+/// stay per-cell.
 ///
-/// # Spec relationship
+/// ECMA-376 §17.4.42 (`tcMar`) defines a per-side cell margin as an exception
+/// over §17.4.44 (`tblCellMar`), but is silent on how neighbouring cells in a
+/// row interact when their vertical margins disagree. Word and LibreOffice both
+/// position every cell's content within a row-uniform inset
+/// (`max(top)` / `max(bottom)` across the row); without this pass a cell with
+/// `tcMar.top=0` beside siblings inheriting a larger default would sit flush
+/// against the top border while its neighbours sit padded.
 ///
-/// ECMA-376 §17.4.42 (`tcMar`, "Single Table Cell Margins") defines the cell
-/// margin as a per-side exception over §17.4.44 (`tblCellMar`, the table-level
-/// default). Each side is a `CT_TblWidth` (§17.18.87), where `@type="dxa"
-/// @w="N"` is an explicit `N`-twip value. The spec is silent on how
-/// *neighbouring* cells in the same row interact when their per-cell margins
-/// disagree — there is no row-level "content area" concept defined in
-/// §17.4.78 (`tr`) or §17.4.79 (`trHeight`).
-///
-/// The de-facto behaviour of every mainstream renderer (Word and LibreOffice
-/// Writer in particular) is to compute a row-uniform content inset:
-///
-/// ```text
-/// row.uniform_top    = max(cell.tcMar.top    for cell in row)
-/// row.uniform_bottom = max(cell.tcMar.bottom for cell in row)
-/// ```
-///
-/// and to position every cell's content within that uniform inset regardless
-/// of the cell's own per-cell override. Without this pass, a cell with an
-/// explicit `tcMar.top=0` in a row whose siblings inherit a larger value sits
-/// flush against the row's top border while its neighbours sit padded — a
-/// positioning no mainstream editor produces.
-///
-/// # Empirical basis
-///
-/// Verified against the `Wohnungsübergabeprotokoll` sample (LibreOffice
-/// origin) by editing the DOCX directly and observing Word's render:
-///
-/// 1. Rewriting all `<w:tcMar><w:top w:w="0"/></w:tcMar>` to
-///    `<w:top w:w="1"/>` produced **byte-equivalent visual output** — Word
-///    is invariant to the literal value at this magnitude, ruling out
-///    "Word treats `w=0` as no-override" as the explanation.
-/// 2. Rewriting just one cell's `<w:tcMar>` to `<w:top w:w="500"/>` (≈ 25pt)
-///    pushed **every** cell in that row down by ~25pt, confirming the
-///    row-wide max(...) discipline.
-///
-/// # Scope
-///
-/// Only `top` and `bottom` are normalized. `left` and `right` stay per-cell
-/// because each column's content width is independent — there is no shared
-/// row-wide horizontal area in the de-facto layout, and editors do honour
-/// per-cell horizontal overrides.
-///
-/// Applied at the build layer (post per-side `<w:tcMar>`/`<w:tblCellMar>`
-/// cascade resolution) so downstream measure/emit/split code sees uniform
-/// vertical insets and needs no further changes.
+/// Only top/bottom are normalized: each column's content width is independent,
+/// and editors do honour per-cell left/right overrides. Applied post per-side
+/// cascade resolution so downstream measure/emit/split code sees uniform
+/// vertical insets.
 fn normalize_row_uniform_vertical_insets(cells: &mut [TableCellInput]) {
     let max_top = cells.iter().fold(Pt::ZERO, |acc, c| acc.max(c.margins.top));
     let max_bottom = cells
@@ -700,21 +656,17 @@ mod tests {
         }
     }
 
-    /// Word/Writer row-uniform content-area normalization: when cells in a row
-    /// disagree on `tcMar.top` (or `bottom`), the row-wide *maximum* wins for
-    /// every cell. Verified empirically against MS Word — see
-    /// [`normalize_row_uniform_vertical_insets`] for the experimental
-    /// reproducer and spec references.
+    /// Row-uniform normalization: when cells in a row disagree on `tcMar.top`
+    /// (or `bottom`), the row-wide *maximum* wins for every cell. See
+    /// [`normalize_row_uniform_vertical_insets`] for the spec references.
     #[test]
     fn row_uniform_picks_max_top_and_bottom_across_row() {
-        // Mirrors the Wohnungsübergabe "Keller" row: one cell with
-        // explicit zero top/bottom (the Keller cell after per-side tcMar
-        // cascade) and another with the inherited 57-twip table default
-        // (≈ 2.85 pt) — siblings without a tcMar override.
+        // One cell with explicit zero top/bottom and another with the inherited
+        // 57-twip table default (≈ 2.85 pt).
         let mut cells = vec![
-            cell_with_margins(0.0, 5.4, 0.0, 5.15),   // Keller-like
+            cell_with_margins(0.0, 5.4, 0.0, 5.15),
             cell_with_margins(2.85, 5.4, 2.85, 5.15), // sibling with table default
-            cell_with_margins(0.0, 5.4, 0.0, 5.15),   // another Keller-like
+            cell_with_margins(0.0, 5.4, 0.0, 5.15),
         ];
         normalize_row_uniform_vertical_insets(&mut cells);
 
@@ -735,14 +687,13 @@ mod tests {
         }
     }
 
-    /// Mirrors the `_kellertop500` experiment: a single cell with a `tcMar.top`
-    /// far larger than its siblings becomes the row-wide max, so every cell —
-    /// including the ones with no override — picks up that large top inset.
-    /// In Word, this is observable as the entire row's content shifting down.
+    /// A single cell with a `tcMar.top` far larger than its siblings becomes
+    /// the row-wide max, so every cell — including ones with no override — picks
+    /// up that large top inset (in Word, the whole row's content shifts down).
     #[test]
     fn row_uniform_one_large_cell_top_pushes_whole_row_down() {
         let mut cells = vec![
-            cell_with_margins(25.0, 5.4, 0.0, 5.15), // Keller with top=25pt
+            cell_with_margins(25.0, 5.4, 0.0, 5.15), // dominating cell, top=25pt
             cell_with_margins(2.85, 5.4, 2.85, 5.15), // small sibling
         ];
         normalize_row_uniform_vertical_insets(&mut cells);
@@ -752,7 +703,7 @@ mod tests {
             25.0,
             "sibling cell inherits the large top from the dominating cell"
         );
-        // Bottom max is the smaller cell's 2.85 (Keller bottom stayed 0).
+        // Bottom max is the smaller cell's 2.85 (first cell's bottom stayed 0).
         assert_eq!(cells[0].margins.bottom.raw(), 2.85);
     }
 

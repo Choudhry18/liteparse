@@ -106,18 +106,6 @@ impl Cell {
     }
 }
 
-impl From<&str> for Cell {
-    fn from(s: &str) -> Self {
-        Cell::new(s)
-    }
-}
-
-impl From<String> for Cell {
-    fn from(s: String) -> Self {
-        Cell::new(s)
-    }
-}
-
 /// Resolve a `ParaAccum` to a `Block::Paragraph`. When the paragraph was
 /// uniformly styled across all lines, return the raw text with block-level
 /// `bold`/`italic` flags set so the renderer wraps it once. Otherwise return

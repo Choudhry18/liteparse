@@ -2310,8 +2310,8 @@ mod tests {
 
     #[test]
     fn tab_leader_inherits_the_run_font_and_colour() {
-        // §17.3.1.38: the leader is drawn in the tab run's own formatting.
-        // Previously it was hardcoded to Times New Roman / black.
+        // §17.3.1.38: the leader is drawn in the tab run's own formatting,
+        // not a hardcoded default.
         let frags = vec![
             text_frag("a", 10.0),
             Fragment::Tab {
@@ -2350,8 +2350,8 @@ mod tests {
 
     #[test]
     fn tab_leader_scales_with_the_run_font_size() {
-        // The old code sized the leader from the paragraph line height and
-        // capped it at 12pt, so a large run drew undersized leaders.
+        // §17.3.1.38: the leader is sized from the tab run's font, not from
+        // the paragraph line height (and not capped).
         let frags = vec![
             text_frag("a", 10.0),
             Fragment::Tab {

@@ -18,33 +18,29 @@
 //! Frames compose down the tree, so this is an affine map accumulated
 //! pre-order — which is exactly the order [`Shape::visit`] documents.
 //!
-//! ## What the corpus says this has to handle
+//! ## Invariants the mapping relies on
 //!
-//! Census over the 45-deck corpus (`pptx_geometry_census`), 9,272 top-level
-//! slide shapes and 3,704 inside a group:
-//!
-//! | question | answer | consequence |
-//! |---|---|---|
-//! | is the child space ever absent or partial? | **0 / 0 / 0** — `chOff`, `chExt`, and the xor are all never missing on 575 groups | the mapping is a **total function**; no defaulting rules, and a missing term is a bug rather than a case |
-//! | is `chExt` ever zero? | **0** | the divide is safe — but it is still guarded, because a zero would produce infinities that propagate silently |
-//! | is the scale ever not 1? | **342 of 575 (59%)** | the scale is load-bearing, not a rounding term |
-//! | is it ever non-uniform? | **154 (27%)**, `sx/sy` differing by up to 2.18x | two scalars, never one |
-//! | how extreme does it get? | **1961x** — a 1696x2204 EMU child space onto a 3.3M x 4.1M rect | dropping the scale does not nudge those shapes, it collapses them to invisibility |
-//! | how many *text* shapes are affected? | 457 inside groups, **111 under a non-unit scale** | 111 are wrong by a factor today, 346 by an offset |
-//! | do groups rotate? | **28**, of which **3** contain a rotated child | angle composition is real but rare |
-//! | do groups flip? | **7** | must be modelled: a flip mirrors the child space, changing the *sign* of the map |
-//! | do shapes flip? | 497, but only **9 carry text** | flips are a picture/connector concern |
-//! | is rotation ever oblique? | **302 of 759** (132 with text) | the angle must be carried; an axis-aligned box alone loses the reading direction |
-//! | is `chExt` a clip? | **no** — 102 children legally sit outside it | never treat it as bounds |
+//! - The child space (`chOff`/`chExt`) is always fully declared on a group
+//!   that has one, so the mapping is a **total function** — a missing term
+//!   is a bug, not a case to default.
+//! - `chExt` can in principle be zero and must still be guarded: dividing by
+//!   it would produce an infinity that propagates silently otherwise.
+//! - The scale is routinely not 1, and not uniform between axes, so it must
+//!   be carried as two scalars — dropping it does not merely nudge a shape's
+//!   position, it can collapse the shape to invisibility.
+//! - Groups and shapes both rotate and flip, independently of each other; a
+//!   flip mirrors the child space, changing the *sign* of the map.
+//! - `chExt` is not a clip — children can legally sit outside it, so it must
+//!   never be treated as bounds.
 //!
 //! ## Why the output is a separate field
 //!
-//! [`Shape::slide_rect`] is filled here; `Shape::transform` keeps the declared
-//! child-space values. The two are different facts about the document, the same
-//! way [`Shape::transform_inherited`] and `SizeSource` distinguish a resolved
-//! value from a fallen-back one. It also keeps `bench/pptx_corpus/geometry_probe.py`
-//! honest: it checks declared EMU against the source XML, and would have nothing
-//! to check against if this pass overwrote them.
+//! [`Shape::slide_rect`] is filled here; `Shape::transform` keeps the
+//! declared child-space values. The two are different facts about the
+//! document, the same way [`Shape::transform_inherited`] and `SizeSource`
+//! distinguish a resolved value from a fallen-back one — and it lets a
+//! consumer diff resolved geometry against the declared EMU in the source
+//! XML.
 
 use crate::model::dimension::{Dimension, Emu, SixtieThousandthDeg};
 use crate::model::geometry::{Offset, Rect, Size};
@@ -57,9 +53,9 @@ const FULL_TURN: i64 = 21_600_000;
 /// A shape's resolved position on the slide.
 ///
 /// `rect` is the **unrotated** box: the rectangle the shape would occupy with
-/// `rotation` at zero. Rotation is carried beside it rather than folded into an
-/// axis-aligned bounding box, because 132 corpus shapes carry text at an oblique
-/// angle and their reading direction is not recoverable from a bbox. A consumer
+/// `rotation` at zero. Rotation is carried beside it rather than folded into
+/// an axis-aligned bounding box, because a shape's reading direction is not
+/// recoverable from a bbox once it's rotated to an oblique angle. A consumer
 /// that only wants a bbox can call [`SlideRect::bounding_box`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlideRect {
@@ -72,11 +68,9 @@ pub struct SlideRect {
     /// True when an enclosing group rotated the shape while a *non-uniform*
     /// scale was in effect. The composed map is then a genuine skew, which
     /// `rotation` + `rect` cannot express exactly, so this records that the
-    /// values are the closest similarity rather than the exact map.
-    ///
-    /// Measured at **0** on the corpus. It exists so that if a deck ever hits
-    /// the case, the probe says so instead of the numbers being quietly a few
-    /// EMU wrong.
+    /// values are the closest similarity rather than the exact map. Rare in
+    /// practice, but flagged rather than silently approximated when it does
+    /// occur.
     pub skewed: bool,
 }
 
@@ -114,12 +108,11 @@ pub struct GeometryStats {
     pub unpositioned: usize,
     /// Groups whose frame was composed onto children.
     pub groups: usize,
-    /// Groups declaring a transform but no child space. The corpus says 0; a
-    /// non-zero here means a deck exists that the census did not predict, and
-    /// the identity child space used as a fallback is a guess.
+    /// Groups declaring a transform but no child space. Should be rare in
+    /// practice; the identity child space used as a fallback is a guess.
     pub groups_without_child_space: usize,
-    /// Groups whose `chExt` is zero in an axis. The corpus says 0; the scale
-    /// falls back to 1 rather than producing an infinity.
+    /// Groups whose `chExt` is zero in an axis. The scale falls back to 1
+    /// rather than producing an infinity.
     pub groups_with_zero_child_extent: usize,
     /// See [`SlideRect::skewed`].
     pub skewed: usize,
@@ -475,9 +468,8 @@ mod tests {
         assert_eq!(rect_of(&kids(&shapes)[0]), (10, 10, 50, 50));
     }
 
-    /// The corpus case that matters: a tiny child space blown up onto a
-    /// slide-sized rectangle. Getting this wrong does not shift the shape, it
-    /// makes it invisible.
+    /// A tiny child space blown up onto a slide-sized rectangle. Getting
+    /// this wrong does not shift the shape, it makes it invisible.
     #[test]
     fn non_unit_scale_multiplies_position_and_size() {
         let mut shapes = tree(&grp(
@@ -492,7 +484,7 @@ mod tests {
 
     #[test]
     fn non_uniform_scale_uses_both_axes() {
-        // x scales by 2, y by 4 — 27% of corpus groups scale non-uniformly.
+        // x scales by 2, y by 4 — the two axes must be tracked independently.
         let mut shapes = tree(&grp(
             (0, 0, 2000, 4000),
             Some((0, 0, 1000, 1000)),
@@ -685,8 +677,8 @@ mod tests {
     }
 
     /// Rotation under a non-uniform scale is a genuine skew, which a rect plus
-    /// an angle cannot express. It does not occur on the corpus, so the
-    /// contract is that it is *flagged*, not that it is exact.
+    /// an angle cannot express. Rare in practice; the contract is that it is
+    /// *flagged*, not that it is exact.
     #[test]
     fn rotation_under_non_uniform_scale_is_flagged_as_skewed() {
         let inner = grp(

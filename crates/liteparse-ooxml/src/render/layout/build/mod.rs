@@ -269,8 +269,8 @@ fn build_non_story_content(
                 // `margins.left` — so shapes must be resolved in the stack
                 // frame (not page-absolute), otherwise `margins.left` would
                 // be applied twice. §17.10.1: z-ordering against the
-                // surrounding text in Tier 0 is paragraph-granular, matching
-                // the stack-frame emission order.
+                // surrounding text is paragraph-granular, matching the
+                // stack-frame emission order.
                 let paragraph_shapes = floating::extract_floating_shapes(
                     p,
                     ctx,
@@ -284,7 +284,7 @@ fn build_non_story_content(
                 // can't ride on the per-paragraph anchoring used by
                 // `paragraph_shapes`, so collect them at the
                 // header/footer level — `render_header`/`render_footer`
-                // emits them outside `stack_blocks` (no shift) so the
+                // emit them outside `stack_blocks` (no shift) so the
                 // resolved page-y is honored.
                 let page_anchored_shapes = floating::extract_floating_shapes(
                     p,

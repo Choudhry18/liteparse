@@ -11,12 +11,9 @@ use crate::model::dimension::{Dimension, Unit};
 
 /// Optional non-negative measurement. A value that is unparseable **or**
 /// negative degrades to `None` — "unspecified", so the style cascade supplies
-/// the value — rather than failing the document.
-///
-/// Vendoring divergence from dxpdf, which errors on both. One malformed
-/// measurement anywhere in a file should not cost the whole parse; note that
-/// upstream's behaviour meant a real document with `w:before="-100"` was
-/// unreadable rather than merely imprecise.
+/// the value — rather than failing the document. dxpdf errors on both cases;
+/// here, one malformed measurement (e.g. `w:before="-100"`) must not cost
+/// the whole parse.
 pub(crate) fn deserialize_optional_nonnegative_dimension<'de, D, U>(
     deserializer: D,
 ) -> Result<Option<Dimension<U>>, D::Error>
@@ -101,10 +98,8 @@ mod tests {
         );
     }
 
-    /// Upstream rejected these outright, taking the whole document with them.
-    /// We degrade to `None` instead — but the original guard still holds: a
-    /// negative fraction must never be silently truncated to `0`, which would
-    /// masquerade as an explicitly-specified zero rather than "unspecified".
+    /// A negative fraction must degrade to `None`, not be silently truncated
+    /// to `0` — that would masquerade as an explicit zero.
     #[test]
     fn negative_fractions_are_unspecified_for_optional_nonnegative_dimensions() {
         for raw in ["-0.1", "-0.49"] {

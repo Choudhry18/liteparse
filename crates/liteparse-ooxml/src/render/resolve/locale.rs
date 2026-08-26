@@ -24,8 +24,7 @@ use crate::model::RunProperties;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Locale {
     /// English, in any region — the one language whose number words this engine
-    /// spells. Also the answer for a document that declares no language at all,
-    /// which is what every document was assumed to be before `w:lang` was read.
+    /// spells. Also the answer for a document that declares no language at all.
     #[default]
     English,
     /// A recognised language that writes a decimal **comma**: German, French,
@@ -38,12 +37,10 @@ pub enum Locale {
     PointDecimal,
     /// A tag whose primary subtag is not in the table below.
     ///
-    /// It answers every question exactly as [`Locale::English`] does, on
-    /// purpose: before `w:lang` was read, *every* document got a decimal point
-    /// and English number words, so an unfamiliar tag has to keep rendering as
-    /// it does today rather than silently losing content to a degrade. It is a
-    /// separate variant because it is a different *fact* — it logs, so an
-    /// unhandled language is visible rather than silently assumed English.
+    /// Answers every question exactly as [`Locale::English`] does, so an
+    /// unfamiliar tag keeps rendering with a decimal point and English number
+    /// words rather than silently losing content. A separate variant so it can
+    /// log — an unhandled language stays visible rather than assumed English.
     Unrecognised,
 }
 
@@ -128,8 +125,7 @@ impl Locale {
             _ => {
                 log::warn!(
                     "w:lang: unhandled language tag {tag:?} (§17.3.2.20) — \
-                     assuming a decimal point and English number words, which \
-                     is what every document got before locale was read"
+                     assuming a decimal point and English number words"
                 );
                 Locale::Unrecognised
             }
@@ -162,7 +158,7 @@ mod tests {
 
     #[test]
     fn the_corpus_languages_classify_as_they_should() {
-        // Every tag `test-files/` and `test-cases/` actually declares.
+        // Representative comma-decimal and English tags.
         for tag in ["de-AT", "de-DE", "pl-PL", "it-IT", "ca-ES", "fr-FR"] {
             assert_eq!(Locale::from_tag(tag), Locale::CommaDecimal, "{tag}");
         }

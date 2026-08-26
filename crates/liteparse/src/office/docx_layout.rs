@@ -1,20 +1,20 @@
 //! `LayoutedPage` draw commands → [`Page`]/[`TextItem`] geometry.
 //!
-//! The stage-2 tap (see `NATIVE_OFFICE_PLAN.md`): the vendored layout engine
-//! ends at per-page [`DrawCommand`] streams in Pt with a top-left origin —
-//! already liteparse viewport space, no unit conversion and no y-flip. What a
-//! `Text` command does *not* carry is a bounding box: `position` is the
-//! baseline origin and there is no width field. Both come from re-measuring
-//! with the same [`TextMeasurer`]/[`FontRegistry`] the layout ran with, which
-//! reproduces the engine's own advances bit-for-bit.
+//! The vendored layout engine ends at per-page [`DrawCommand`] streams in Pt
+//! with a top-left origin — already liteparse viewport space, no unit
+//! conversion and no y-flip. What a `Text` command does *not* carry is a
+//! bounding box: `position` is the baseline origin and there is no width field.
+//! Both come from re-measuring with the same [`TextMeasurer`]/[`FontRegistry`]
+//! the layout ran with, which reproduces the engine's own advances
+//! bit-for-bit.
 //!
 //! Facts that are geometric inferences on the PDF path arrive here as data:
 //! `LinkAnnotation` → [`TextItem::link`], `Outline` marks →
 //! [`OutlineTarget`]s, `Image` commands → [`ExtractedImage`]s with the
-//! *original* embedded bytes (see [`collect_images`]). One deliberate v1 gap,
-//! documented in the plan: `TextItem::strike` stays `false` (the vendored
-//! layout never draws strikethrough lines — markdown strike comes from the
-//! block emitter's cascade, which reads the source instead of geometry).
+//! *original* embedded bytes (see [`collect_images`]). `TextItem::strike` stays
+//! `false`: the vendored layout never draws strikethrough lines, and markdown
+//! strike comes from the block emitter's cascade, which reads the source
+//! instead of geometry.
 
 use std::collections::{HashMap, VecDeque};
 

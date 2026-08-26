@@ -12,8 +12,7 @@
 //!
 //! A slide shape's text body is `<p:txBody>` (PresentationML); a table cell's
 //! and a graphic frame's is `<a:txBody>` (DrawingML). Both are `CT_TextBody`
-//! with identical children, so one schema type serves both. On the corpus:
-//! `p:txBody` in 45/45 decks, `a:txBody` in 14/45.
+//! with identical children, so one schema type serves both.
 //!
 //! quick-xml's serde layer matches on the local name with the prefix dropped
 //! (the property `pptx::package` documents the hard way for `r:id`), so both
@@ -28,7 +27,7 @@
 //! because resolving it requires the placeholder cascade — shape `a:lstStyle`
 //! → layout placeholder → master `p:txStyles` → presentation
 //! `defaultTextStyle` — which is a separate step with a different match rule
-//! per rung. Run properties *are* lowered to [`model::RunProperties`]
+//! at each level. Run properties *are* lowered to [`model::RunProperties`]
 //! immediately: every field there is `Option`, so it is already the right
 //! carrier for unresolved direct formatting, and the cascade fills the `None`s
 //! later via `FragmentCtx::paragraph_run_defaults`.
@@ -55,9 +54,9 @@ pub const MAX_LIST_LEVEL: u8 = 9;
 ///
 /// Deliberately not `AttrBool` and not serde's `bool`:
 ///
-/// - serde's `bool` accepts only `"true"`/`"false"`, so `b="1"` — which is how
-///   PowerPoint writes it, in 44 of 45 corpus decks — would silently read as
-///   absent and lose every bold run.
+/// - serde's `bool` accepts only `"true"`/`"false"`, so `b="1"` — which is
+///   how PowerPoint actually writes it — would silently read as absent and
+///   lose every bold run.
 /// - `AttrBool` maps anything unrecognised to `false`. Here that would be an
 ///   *explicit off* that overrides an inherited value, so a typo'd attribute
 ///   would strip bold that the master legitimately supplies.
@@ -87,7 +86,7 @@ pub struct TextBody {
     /// verbatim with the DOCX textbox path.
     pub body_pr: Option<BodyProperties>,
     /// §21.1.2.4.12 `a:lstStyle` — this shape's own per-level overrides, the
-    /// innermost rung of the cascade.
+    /// innermost level of the cascade.
     pub list_style: ListStyle,
     pub paragraphs: Vec<TextParagraph>,
 }
@@ -235,9 +234,9 @@ pub enum Bullet {
     },
 }
 
-/// §20.1.10.61 ST_TextAutonumberScheme. Only the schemes the corpus actually
-/// uses are named; the rest round-trip through `Other` so an unrecognised
-/// scheme degrades to a plain number rather than killing the parse.
+/// §20.1.10.61 ST_TextAutonumberScheme. Only the schemes seen in practice
+/// are named; the rest round-trip through `Other` so an unrecognised scheme
+/// degrades to a plain number rather than killing the parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AutoNumberScheme {
     /// `1.` `2.` `3.`
@@ -292,10 +291,10 @@ pub fn parse_text_body(data: &[u8]) -> Result<TextBody> {
 
 /// §19.3.1.52 `p:txStyles` — a master's three whole-part text styles.
 ///
-/// The outer two rungs of the text cascade are *not* placeholder shapes.
+/// The outer two levels of the text cascade are *not* placeholder shapes.
 /// A master carries one `p:txStyles` for the whole part, and a placeholder
 /// reaches the right child by its **kind**, not by matching a shape. See
-/// [`pptx::textcascade`] for the routing and the corpus measurement behind it.
+/// [`pptx::textcascade`] for the routing.
 ///
 /// [`pptx::textcascade`]: crate::pptx::textcascade
 #[derive(Clone, Debug, Default)]
@@ -319,9 +318,9 @@ impl TextStyles {
 /// Takes `p:sldMaster`'s bytes rather than the `p:txStyles` element, matching
 /// [`parse_shape_tree`]: callers hold parts, not subtrees.
 ///
-/// A master with no `p:txStyles` yields an empty [`TextStyles`] rather than an
-/// error — the fail-open posture of this vendor. On the corpus all 70 masters
-/// declare one, so an empty result means something is genuinely unusual.
+/// A master with no `p:txStyles` yields an empty [`TextStyles`] rather than
+/// an error — masters routinely declare one, so an empty result means
+/// something is genuinely unusual, not a normal case to special-case around.
 ///
 /// [`parse_shape_tree`]: crate::pptx::parse_shape_tree
 pub fn parse_text_styles(data: &[u8]) -> Result<TextStyles> {
@@ -336,15 +335,13 @@ pub fn parse_text_styles(data: &[u8]) -> Result<TextStyles> {
 ///
 /// SmartArt is the one payload whose content is not in the slide at all: the
 /// `p:graphicFrame` carries only `dgm:relIds`, and `@r:dm` points here. A
-/// shape-tree walk therefore cannot see any of it — on the corpus that is
-/// **53 parts, all 53 carrying text, 12,102 characters**, which made it the
+/// shape-tree walk therefore cannot see any of it, which made SmartArt the
 /// largest single content gap for a native reader.
 ///
 /// Returns one [`TextBody`] per `dgm:pt` that has one, in document order.
-/// Nothing is filtered: the corpus says every text-bearing point is untyped
-/// (334 of 334), so the `doc` and `pres` presentation nodes contribute nothing
-/// and there is no duplication to guard against — 2 repeated strings across
-/// the whole corpus, both genuine.
+/// Nothing is filtered by node type: text-bearing points are untyped in
+/// practice, so the `doc` and `pres` presentation nodes contribute nothing
+/// and there is no duplication to guard against.
 ///
 /// The caller resolves the relationship, because relationship resolution needs
 /// the owning [`Part`](crate::pptx::Part) and this layer only sees bytes.
@@ -385,11 +382,11 @@ struct DiagramPtXml {
 
 /// Parse `p:defaultTextStyle` out of a **whole `ppt/presentation.xml` part**.
 ///
-/// The outermost rung, and the only one a non-placeholder shape can reach:
-/// 2,144 of the 2,301 corpus runs on non-placeholder shapes that declare no
-/// size get it from here, so this is not a rare fallback.
+/// The outermost level, and the only one a non-placeholder shape can reach:
+/// most non-placeholder runs that declare no size get it from here, so this
+/// is not a rare fallback.
 ///
-/// Absent yields an empty [`ListStyle`]; 45 of 45 corpus decks declare one.
+/// Absent yields an empty [`ListStyle`].
 pub fn parse_default_text_style(data: &[u8]) -> Result<ListStyle> {
     let xml: PresentationStylesXml = serde_xml::from_xml(data)?;
     Ok(xml
@@ -400,9 +397,8 @@ pub fn parse_default_text_style(data: &[u8]) -> Result<ListStyle> {
 
 // ── Schema ───────────────────────────────────────────────────────────────────
 //
-// Field coverage is driven by a census over the 45-deck corpus rather than by
-// reading the spec front to back: every element and attribute below appears in
-// at least one real deck. Anything absent from the corpus is left to serde's
+// Field coverage is driven by what real decks actually use rather than by
+// reading the spec front to back. Anything not modelled is left to serde's
 // unknown-field tolerance, matching the fail-open posture ATTRIBUTION.md
 // records for the DOCX vendor.
 
@@ -619,9 +615,9 @@ struct BreakXml {
     r_pr: Option<TextCharPropertiesXml>,
 }
 
-/// §21.1.2.2.4 `a:fld` — a text field (slide number, date, …). Present in
-/// 44/45 corpus decks, so dropping it would silently lose the footer line on
-/// nearly every deck.
+/// §21.1.2.2.4 `a:fld` — a text field (slide number, date, …). Common in
+/// footer placeholders, so dropping it would silently lose the footer line
+/// on most decks.
 ///
 /// The element carries both a `@type` instruction and an `a:t` holding the
 /// value PowerPoint last rendered. We take the cached `a:t`: it is what the
@@ -807,7 +803,7 @@ impl SpacingXml {
     fn into_model(self) -> Option<Spacing> {
         // §20.1.10.65 is a choice, but a producer emitting both should not
         // pick arbitrarily — percent is the PowerPoint-authored default and
-        // the one the corpus actually carries (42/45 decks).
+        // by far the more common of the two in practice.
         if let Some(pct) = self.spc_pct.and_then(|v| v.val) {
             return Some(Spacing::Percent(pct));
         }
@@ -948,8 +944,8 @@ struct TextCharPropertiesXml {
     baseline: Option<Dimension<ThousandthPercent>>,
     /// §21.1.2.3.9. The DOCX schema's `solidFill` is the same §20.1.8.54
     /// element with the same `EG_ColorChoice` child, so it is shared rather
-    /// than re-declared — the srgb-only local copy this replaces silently
-    /// dropped the 3,437 corpus runs whose colour is a scheme reference.
+    /// than re-declared — an srgb-only local type would silently drop every
+    /// run whose colour is a scheme reference rather than a literal RGB.
     #[serde(rename = "solidFill", default)]
     solid_fill: Option<SolidFillXml>,
     #[serde(rename = "latin", default)]
@@ -1103,9 +1099,9 @@ impl TextFontXml {
     }
 }
 
-/// §20.1.10.82 ST_TextUnderlineType — a large enum of which the corpus uses a
-/// handful. Unlisted values fall through `lenient::opt_attr` to `None`
-/// (= inherit), per ECMA-376 §17.17.
+/// §20.1.10.82 ST_TextUnderlineType — a large enum of which only the common
+/// values are modelled. Unlisted values fall through `lenient::opt_attr` to
+/// `None` (= inherit), per ECMA-376 §17.17.
 #[derive(Clone, Copy, Debug, Deserialize)]
 enum StTextUnderlineType {
     #[serde(rename = "none")]
@@ -1216,8 +1212,8 @@ mod tests {
         assert_eq!(b.paragraphs[0].text(), "one\ntwo");
     }
 
-    /// `a:fld` appears in 44/45 corpus decks; dropping it loses the footer
-    /// line almost everywhere.
+    /// `a:fld` is common in footer placeholders; dropping it loses the
+    /// footer line almost everywhere it's used.
     #[test]
     fn field_emits_its_cached_value() {
         let b = body(r#"<a:p><a:fld id="{1}" type="slidenum"><a:t>7</a:t></a:fld></a:p>"#);
@@ -1387,9 +1383,9 @@ mod tests {
     }
 
     /// A theme colour is *carried*, not resolved: `schemeClr` needs the theme
-    /// and the master's `p:clrMap`, neither of which is a property of the run.
-    /// It used to be dropped here, which read downstream as "no colour
-    /// declared" and painted 3,437 corpus runs black.
+    /// and the master's `p:clrMap`, neither of which is a property of the
+    /// run. Dropping it here would read downstream as "no colour declared"
+    /// and paint the run black.
     #[test]
     fn scheme_color_is_carried_unresolved() {
         let b = body(

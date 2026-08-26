@@ -3,12 +3,8 @@
 //! Each color-choice element (`srgbClr`, `scRgbClr`, `hslClr`, `sysClr`,
 //! `schemeClr`, `prstClr`) carries attributes for its base color plus an
 //! ordered list of color-transform children (`tint`, `shade`, `alpha`, etc.).
-//!
-//! During Phase 5A these schemas are additive — consumers (fill, stroke,
-//! effect) still use the procedural `drawing/color.rs` parser. When those
-//! parsers migrate in Phase 5B+, they will switch to `DrawingColorXml`.
 
-#![allow(dead_code, clippy::large_enum_variant)]
+#![allow(clippy::large_enum_variant)]
 
 use serde::Deserialize;
 

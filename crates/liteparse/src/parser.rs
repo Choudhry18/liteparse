@@ -831,19 +831,14 @@ impl LiteParse {
         }
     }
 
-    /// Config the native DOCX path cannot honor — these force the conversion
-    /// path so the caller still gets what they asked for. `doc_meta` is not
-    /// in the list: it is `None` for converted inputs already, and the native
-    /// path keeps that rule.
-    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
     /// Config options the native DOCX path cannot honor. Hitting one with
     /// `office_native` on is a hard `Config` error, not a fallback — see the
-    /// check in `parse_input`. Supported and deliberately absent from this
-    /// list: `extract_images` (native media bytes), `extract_xfa_packets`
-    /// (honestly empty — DOCX has no XFA), `extract_annotations` (hyperlink +
-    /// internal-link rects merged to `link` annotations), and
-    /// `include_complexity` (native facts; see
-    /// `calculate_native_page_complexity`).
+    /// check in `parse_input`. Deliberately absent (the native path honors
+    /// these): `extract_images`, `extract_xfa_packets` (empty — DOCX has no
+    /// XFA), `extract_annotations` (hyperlink/internal-link rects as `link`
+    /// annotations), `include_complexity`, and `doc_meta` (`None`, as on the
+    /// conversion path).
+    #[cfg(all(feature = "docx-native", not(target_arch = "wasm32")))]
     fn native_docx_ineligible_reason(&self) -> Option<&'static str> {
         let c = &self.config;
         if c.extract_form_fields {
@@ -864,19 +859,10 @@ impl LiteParse {
     /// Config options the native PPTX path cannot honor. Hitting one with
     /// `office_native` on is a hard `Config` error, not a fallback.
     ///
-    /// One entry is PPTX-specific and is here because the alternative is
-    /// silent under-delivery:
-    ///
-    /// * `extract_annotations` — the geometry adapter builds fragments with no
-    ///   `LinkTarget`, so there are no link rects to merge. Markdown links
-    ///   (`extract_links`) are unaffected: those come from the emitter, which
-    ///   does resolve `a:hlinkClick`.
-    ///
-    /// `extract_images` **was** here, for as long as `ShapeKind::Picture`
-    /// emitted nothing. It now extracts, so the flag is honored rather than
-    /// rejected; `image_mode` never was here, which meant a default-config
-    /// parse silently produced no `![](…)` refs where the conversion path
-    /// produced 2,719 across the corpus. Both are now the same answer.
+    /// `extract_annotations` is PPTX-specific: the geometry adapter builds
+    /// fragments with no `LinkTarget`, so there are no link rects to merge.
+    /// Markdown links (`extract_links`) are unaffected — those come from the
+    /// emitter, which resolves `a:hlinkClick`.
     #[cfg(all(feature = "pptx-native", not(target_arch = "wasm32")))]
     fn native_pptx_ineligible_reason(&self) -> Option<&'static str> {
         let c = &self.config;
@@ -900,17 +886,10 @@ impl LiteParse {
     /// Config options the native XLSX path cannot honor. Hitting one with
     /// `office_native` on is a hard `Config` error, not a fallback.
     ///
-    /// One entry is XLSX-specific:
-    ///
-    /// * `extract_annotations` — hyperlinks reach `TextItem::link`, but no
-    ///   `DocumentAnnotation` list is built (same v1 state the PPTX path
-    ///   started in).
-    ///
-    /// `extract_images` / `image_mode = embed` **were** here, for as long as
-    /// the reader ignored `xl/drawings`. The drawing layer's pictures now
-    /// extract (charts and drawing shapes remain out of scope — a chart has
-    /// no image bytes and either engine's conversion path also extracts none
-    /// for it), so both flags are honored rather than rejected.
+    /// `extract_annotations` is XLSX-specific: hyperlinks reach
+    /// `TextItem::link`, but no `DocumentAnnotation` list is built. Images
+    /// are honored — the drawing layer's pictures extract, though charts and
+    /// drawing shapes carry no image bytes and are out of scope.
     #[cfg(all(feature = "xlsx-native", not(target_arch = "wasm32")))]
     fn native_xlsx_ineligible_reason(&self) -> Option<&'static str> {
         let c = &self.config;
@@ -1016,31 +995,8 @@ impl LiteParse {
         // Page selection mirrors the other native paths: `target_pages`
         // filters by 1-based number, then `max_pages` truncates. The outline
         // stays whole-document.
-        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> = nx
-            .pages
-            .into_iter()
-            .zip(nx.page_blocks)
-            .zip(complexity)
-            .collect();
-        let mut page_filtered = false;
-        if let Some(targets) = self.resolve_target_pages()? {
-            let keep: std::collections::HashSet<usize> =
-                targets.iter().map(|p| *p as usize).collect();
-            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
-            page_filtered = true;
-        }
-        if selected.len() > self.config.max_pages {
-            selected.truncate(self.config.max_pages);
-            page_filtered = true;
-        }
-        let mut pages = Vec::with_capacity(selected.len());
-        let mut page_blocks = Vec::with_capacity(selected.len());
-        let mut page_stats = Vec::with_capacity(selected.len());
-        for ((p, b), s) in selected {
-            pages.push(p);
-            page_blocks.push(b);
-            page_stats.push(s);
-        }
+        let (pages, page_blocks, page_stats, page_filtered) =
+            self.select_native_pages(nx.pages, nx.page_blocks, complexity)?;
 
         let mut result = self.parse_from_native_blocks(
             pages,
@@ -1113,11 +1069,9 @@ impl LiteParse {
             data,
             pptx::EmitOptions {
                 links: self.config.extract_links,
-                // Speaker notes are the single largest content difference
-                // between this path and the converted one — LibreOffice's PDF
-                // export renders 0.5% of them. They land in the slide's
-                // markdown and contribute no `TextItem`s, because the text
-                // genuinely is not on the slide (user, 2026-08-17).
+                // Speaker notes land in the slide's markdown and contribute
+                // no `TextItem`s: the text is not on the slide itself. The
+                // LibreOffice conversion path drops nearly all of them.
                 notes: true,
                 figures: want_figures,
                 images: want_images,
@@ -1165,31 +1119,8 @@ impl LiteParse {
         // Page selection mirrors the PDF and DOCX paths: `target_pages` filters
         // by 1-based number, then `max_pages` truncates. A slide *is* a page,
         // so a page number is a slide number.
-        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> = geo
-            .pages
-            .into_iter()
-            .zip(page_blocks)
-            .zip(complexity)
-            .collect();
-        let mut page_filtered = false;
-        if let Some(targets) = self.resolve_target_pages()? {
-            let keep: std::collections::HashSet<usize> =
-                targets.iter().map(|p| *p as usize).collect();
-            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
-            page_filtered = true;
-        }
-        if selected.len() > self.config.max_pages {
-            selected.truncate(self.config.max_pages);
-            page_filtered = true;
-        }
-        let mut pages = Vec::with_capacity(selected.len());
-        let mut page_blocks = Vec::with_capacity(selected.len());
-        let mut page_stats = Vec::with_capacity(selected.len());
-        for ((p, b), s) in selected {
-            pages.push(p);
-            page_blocks.push(b);
-            page_stats.push(s);
-        }
+        let (pages, page_blocks, page_stats, page_filtered) =
+            self.select_native_pages(geo.pages, page_blocks, complexity)?;
 
         let mut result = self.parse_from_native_blocks(
             pages,
@@ -1202,8 +1133,8 @@ impl LiteParse {
 
         // Same post-passes as the PDF and DOCX paths, same order: duplicate
         // figure refs point at the canonical name, then only canonical files
-        // are written. A deck leans on these harder than a document does —
-        // 3,602 corpus placements resolve to 1,322 files.
+        // are written. Decks reuse images heavily, so this dedup matters more
+        // here than for documents.
         if self.config.output_format == crate::config::OutputFormat::Markdown {
             rewrite_duplicate_image_refs(&mut result.pages, &mut result.text, &result.images);
         }
@@ -1341,31 +1272,8 @@ impl LiteParse {
         // 1-based page number, then `max_pages` truncates. The outline stays
         // whole-document, as it does on the PDF path. A page selection also
         // narrows the doc-level text to the surviving pages' blocks.
-        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> = native
-            .pages
-            .into_iter()
-            .zip(page_blocks)
-            .zip(complexity)
-            .collect();
-        let mut page_filtered = false;
-        if let Some(targets) = self.resolve_target_pages()? {
-            let keep: std::collections::HashSet<usize> =
-                targets.iter().map(|p| *p as usize).collect();
-            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
-            page_filtered = true;
-        }
-        if selected.len() > self.config.max_pages {
-            selected.truncate(self.config.max_pages);
-            page_filtered = true;
-        }
-        let mut pages = Vec::with_capacity(selected.len());
-        let mut page_blocks = Vec::with_capacity(selected.len());
-        let mut page_stats = Vec::with_capacity(selected.len());
-        for ((p, b), s) in selected {
-            pages.push(p);
-            page_blocks.push(b);
-            page_stats.push(s);
-        }
+        let (pages, page_blocks, page_stats, page_filtered) =
+            self.select_native_pages(native.pages, page_blocks, complexity)?;
 
         let mut result = self.parse_from_native_blocks(
             pages,
@@ -1457,11 +1365,10 @@ impl LiteParse {
         let page_count = layouted.len() as u32;
         // A zero-page layout is an engine failure, not an empty document:
         // every reader here gives a sheet, a slide or a section at least one
-        // page, so nothing to draw means nothing was read. Degrading is the
-        // only useful answer — one corpus workbook has 12 KB of junk ahead of
-        // its local headers, which this reader walks to zero sheets and
-        // LibreOffice recovers. Returning "page 1 out of range (0 pages)"
-        // instead would hand the caller a range error it cannot act on.
+        // page, so nothing to draw means nothing was read. Degrade to the
+        // conversion path (LibreOffice may recover a malformed file) rather
+        // than return a "page 1 out of range (0 pages)" the caller cannot act
+        // on.
         if page_count == 0 {
             return Err(LiteParseError::Conversion(format!(
                 "native layout produced no {noun}"
@@ -1613,6 +1520,50 @@ impl LiteParse {
     /// structure path; the per-page markdown is the paged *view* of the same
     /// blocks. `None` (page-filtered parse) falls back to joining the
     /// surviving pages.
+    /// Page selection shared by the native DOCX, PPTX and XLSX paths:
+    /// `target_pages` filters by 1-based page number, then `max_pages`
+    /// truncates. Returns the aligned `(pages, page_blocks, page_stats)`
+    /// triple plus whether any filtering occurred — callers drop the
+    /// doc-level `all_blocks` when it did.
+    #[cfg(all(feature = "office-native", not(target_arch = "wasm32")))]
+    fn select_native_pages(
+        &self,
+        pages: Vec<Page>,
+        page_blocks: Vec<Vec<crate::markdown_layout::Block>>,
+        complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>>,
+    ) -> Result<
+        (
+            Vec<Page>,
+            Vec<Vec<crate::markdown_layout::Block>>,
+            Vec<Option<crate::ocr_merge::PageComplexityStats>>,
+            bool,
+        ),
+        LiteParseError,
+    > {
+        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> =
+            pages.into_iter().zip(page_blocks).zip(complexity).collect();
+        let mut page_filtered = false;
+        if let Some(targets) = self.resolve_target_pages()? {
+            let keep: std::collections::HashSet<usize> =
+                targets.iter().map(|p| *p as usize).collect();
+            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
+            page_filtered = true;
+        }
+        if selected.len() > self.config.max_pages {
+            selected.truncate(self.config.max_pages);
+            page_filtered = true;
+        }
+        let mut pages = Vec::with_capacity(selected.len());
+        let mut page_blocks = Vec::with_capacity(selected.len());
+        let mut page_stats = Vec::with_capacity(selected.len());
+        for ((p, b), s) in selected {
+            pages.push(p);
+            page_blocks.push(b);
+            page_stats.push(s);
+        }
+        Ok((pages, page_blocks, page_stats, page_filtered))
+    }
+
     #[cfg(all(feature = "office-native", not(target_arch = "wasm32")))]
     fn parse_from_native_blocks(
         &self,

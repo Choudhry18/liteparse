@@ -186,8 +186,8 @@ pub(super) fn emit_text_fragments<F>(
     }
 }
 
-/// Word-split + measure path. Identical to the prior body of
-/// [`emit_text_fragments`]; factored out so emoji-cluster fallback can reuse it.
+/// Word-split + measure path, shared by [`emit_text_fragments`] and the
+/// emoji-cluster fallback.
 pub(super) fn emit_text_words<F>(
     text: &str,
     font: &FontProps,

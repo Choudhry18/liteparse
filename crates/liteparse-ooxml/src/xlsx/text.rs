@@ -1,23 +1,18 @@
 //! Rich text: the `<si>` / `<is>` grammar (§18.4.8, §18.4.12) shared by the
 //! shared-string table and by inline strings written straight into a sheet.
 //!
-//! Two things here are not obvious from the schema and both were measured on
-//! the corpus rather than assumed:
+//! Two things here are not obvious from the schema:
 //!
 //! * **`<rPh>` must be stripped.** An `<si>` may carry phonetic runs —
 //!   *furigana*, the ruby Excel draws above a Japanese cell (§18.4.6). Their
 //!   `<t>` elements sit at the same depth as the real ones, so a reader that
 //!   concatenates every `<t>` emits `一般競争入札イッパンキョウソウニュウサツ`:
-//!   the content immediately followed by its own pronunciation. This exact bug
-//!   cost the XLSX baseline oracle 0.021 macro recall across a cohort of
-//!   Japanese workbooks before it was found. 44.2% of real workbooks have rich
-//!   text, so this path is not an edge case.
+//!   the content immediately followed by its own pronunciation. Rich text is
+//!   common in real workbooks, so this path is not an edge case.
 //!
-//! * **Runs are kept, not flattened.** `calamine` concatenates `<r><t>` and
-//!   discards every `<rPr>`; that is the single largest recall penalty the
-//!   LibreOffice baseline measured (−0.067 on workbooks with rich text) and
-//!   throwing the emphasis away here would give it up before the emitter ever
-//!   sees it.
+//! * **Runs are kept, not flattened.** A reader that concatenates `<r><t>`
+//!   and discards every `<rPr>` throws away emphasis (bold, italic, size,
+//!   font) before the emitter ever sees it.
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -195,7 +190,7 @@ pub(crate) fn read_rich_text<R: BufRead>(
                     if !run_text.is_empty() {
                         out.runs.push(TextRun {
                             text: std::mem::take(&mut run_text),
-                            props: props.clone(),
+                            props: std::mem::take(&mut props),
                         });
                     }
                 }

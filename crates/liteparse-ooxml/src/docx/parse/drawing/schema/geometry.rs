@@ -5,7 +5,7 @@
 //! `AdjCoord` attributes are either decimal integers or guide-name
 //! references, resolved by a custom `Deserialize` that tries integer first.
 
-#![allow(dead_code, clippy::large_enum_variant)]
+#![allow(clippy::large_enum_variant)]
 
 use serde::{Deserialize, Deserializer};
 

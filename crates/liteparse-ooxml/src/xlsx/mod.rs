@@ -5,16 +5,8 @@
 //! Unlike those two, nothing here is vendored: SpreadsheetML has no DOCX
 //! counterpart in dxpdf, so the whole reader is new code against ECMA-376 §18.
 //!
-//! # What this replaces
-//!
-//! Today an `.xlsx` goes through LibreOffice → PDF → grid projection, and the
-//! measured cost of that is not subtle. Across 218 real workbooks (63 research
-//! + 150 finance), that path emits **zero markdown table rows** and clips every
-//! cell at its rendered column width — `"Mosaic tree and shrub (>50%) …"`
-//! becomes `"Mosaic tr"`, destroyed before projection ever sees it, with a
-//! cell-text recall of 0.77 macro / 0.66–0.73 micro as the ceiling.
-//!
-//! A workbook states its grid explicitly. There is nothing to reverse-engineer.
+//! A workbook states its grid explicitly, so this reader parses cells and
+//! styles directly rather than going through a rendered layout.
 //!
 //! # Shape
 //!
@@ -66,6 +58,16 @@ use crate::docx::error::Result;
 use crate::docx::relationships::TargetMode;
 use crate::docx::zip::{part_directory, resolve_target};
 
+/// A picture anchored to a sheet, still pending resolution of its media part.
+/// `(sheet index, anchor, crop fraction, name, media part path)`.
+type PendingPic = (
+    usize,
+    drawings::PicAnchor,
+    Option<[f64; 4]>,
+    Option<String>,
+    String,
+);
+
 /// A workbook read end to end.
 pub struct Workbook {
     /// Sheets in tab order, including hidden ones (see [`Sheet::visible`]) and
@@ -83,9 +85,8 @@ pub struct Workbook {
     /// layer also needs `fill_styles`/`line_styles` (for `a:fillRef`/
     /// `a:lnRef` on floating shapes) and the font scheme, which is why the
     /// full part is kept rather than the scheme alone. `None` when the
-    /// workbook ships no theme part (0.6% of the corpus), which makes every
-    /// `theme=` reference resolve to the consumer's default rather than to
-    /// black.
+    /// workbook ships no theme part, which makes every `theme=` reference
+    /// resolve to the consumer's default rather than to black.
     pub theme: Option<crate::model::Theme>,
     /// Serial dates count from 1904-01-01 rather than 1899-12-30.
     pub date1904: bool,
@@ -101,9 +102,8 @@ pub struct Workbook {
 /// Everything below that degrades: an unparseable sheet is skipped with a
 /// warning, a missing styles part means every cell is `General`, and a missing
 /// shared-string table means string cells resolve to nothing. A workbook is
-/// almost never wholly broken, and refusing the whole file because one sheet is
-/// malformed is the fail-closed behaviour this vendor has already had to
-/// retire repeatedly.
+/// almost never wholly broken, so one malformed sheet should not fail the
+/// whole file.
 pub fn read(data: &[u8]) -> Result<Workbook> {
     let mut pkg = walk(data)?;
 
@@ -130,13 +130,7 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
     // Pictures found while walking the sheets, resolved down to a media part
     // path. The bytes move out of the package afterwards, when the immutable
     // borrows this loop holds are gone.
-    let mut pending_pics: Vec<(
-        usize,
-        drawings::PicAnchor,
-        Option<[f64; 4]>,
-        Option<String>,
-        String,
-    )> = Vec::new();
+    let mut pending_pics: Vec<PendingPic> = Vec::new();
     for entry in &pkg.sheets {
         if !entry.is_worksheet {
             non_worksheet_sheets.push(entry.name.clone());
@@ -148,8 +142,7 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
         match sheet::parse(&entry.name, entry.visible, xml) {
             Ok(mut s) => {
                 // A hyperlink's `r:id` is scoped to the sheet part that wrote
-                // it — the same per-part rule the PPTX blip work established —
-                // so resolution has to happen here, where the entry's own
+                // it, so resolution has to happen here, where the entry's own
                 // relationships are still in hand.
                 for h in &mut s.hyperlinks {
                     h.url = h

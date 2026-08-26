@@ -14,33 +14,26 @@
 //! first, because both key off [`Placeholder`], which only exists once shapes
 //! are typed.
 //!
-//! ## What the corpus says this has to handle
+//! ## What this module has to handle
 //!
-//! Census over the 45-deck corpus, all 2,980 shape trees (slides, layouts,
-//! masters, notes slides, notes masters):
+//! The shape-tree children are `p:sp` (a text-bearing shape), `p:pic`
+//! (never carries text), `p:cxnSp` (a connector — never carries text,
+//! geometry only), `p:grpSp` (nests to arbitrary depth) and
+//! `p:graphicFrame` (table, diagram, OLE object or chart).
 //!
-//! | child | count | note |
-//! |---|---|---|
-//! | `p:sp` | 15,906 | 14,957 carry a text body |
-//! | `p:pic` | 2,418 | never carries text |
-//! | `p:cxnSp` | 845 | never carries text — connectors are geometry only |
-//! | `p:grpSp` | 695 | nests to **depth 5** |
-//! | `p:graphicFrame` | 102 | diagram 53, table 36, ole 11, chartex 3 |
-//! | `mc:AlternateContent` | 10 | see below |
+//! Two invariants this module and its cascade depend on:
 //!
-//! Two invariants worth asserting rather than assuming, both measured:
-//!
-//! - **Every shape lacking an `xfrm` carries a `p:ph`** — 2,422 `p:sp` and 3
-//!   `p:pic`, with no counterexample of any kind. So the placeholder cascade is
-//!   exactly the missing-geometry case, with no second fallback needed.
-//!   [`Shape::needs_inherited_geometry`] names it, and `pptx_shape_probe`
-//!   fails if a deck ever breaks it. Note the 3 pictures: they are why this
+//! - **Every shape lacking an `xfrm` carries a `p:ph`**, with no
+//!   counterexample of any kind — including pictures, which is why this
 //!   module models `p:pic` itself instead of reusing the DOCX `PictureXml`,
-//!   which has no slot for a placeholder — see [`PicXml`].
-//! - **`p:graphicFrame` positions itself with `<p:xfrm>`, not `<a:xfrm>` —
-//!   102 of 102.** Different namespace and a different parent element, so it
-//!   does *not* arrive through [`SpPrXml`] like every other shape's transform.
-//!   Missing this yields graphic frames silently stacked at the origin.
+//!   which has no slot for a placeholder (see [`PicXml`]). So the
+//!   placeholder cascade is exactly the missing-geometry case, with no
+//!   second fallback needed. [`Shape::needs_inherited_geometry`] names it,
+//!   and `pptx_shape_probe` fails if a deck ever breaks it.
+//! - **`p:graphicFrame` positions itself with `<p:xfrm>`, not `<a:xfrm>`.**
+//!   Different namespace and a different parent element, so it does *not*
+//!   arrive through [`SpPrXml`] like every other shape's transform. Missing
+//!   this yields graphic frames silently stacked at the origin.
 
 use serde::Deserialize;
 
@@ -99,7 +92,7 @@ pub struct Shape {
     /// the source XML.
     pub slide_rect: Option<SlideRect>,
     /// §19.3.1.46 `p:style` — the shape's references into the theme's style
-    /// matrices, when it declares one. 2,181 of the corpus's 17,024 shapes do.
+    /// matrices, when it declares one.
     ///
     /// On [`Shape`] rather than on each [`ShapeKind`] variant because all three
     /// kinds that can carry one (`p:sp`, `p:cxnSp`, `p:pic`) carry the *same*
@@ -114,9 +107,9 @@ pub struct Shape {
 /// §20.1.4.1.4 `a:CT_ShapeStyle` — the four theme-matrix references a
 /// `p:style` holds.
 ///
-/// The spec requires all four children, and the corpus agrees exactly (2,181
-/// of each), but they are modelled as `Option` because a file that omits one
-/// should lose that reference and not the whole shape.
+/// The spec requires all four children, but they are modelled as `Option`
+/// because a file that omits one should lose that reference and not the
+/// whole shape.
 ///
 /// Deliberately *not* four loose fields on [`Shape`] the way
 /// [`crate::model::WordProcessingShape`] carries them: there they arrived one
@@ -125,12 +118,12 @@ pub struct Shape {
 #[derive(Clone, Debug, Default)]
 pub struct ShapeStyle {
     /// `a:lnRef` — the theme line style. Supplies the outline's colour when
-    /// `a:ln` declares none (179 corpus shapes, today's black default) and the
-    /// **entire** outline when there is no `a:ln` at all (312).
+    /// `a:ln` declares none, and the **entire** outline when there is no
+    /// `a:ln` at all.
     pub line_ref: Option<StyleMatrixRef>,
     /// `a:fillRef` — the theme fill style, used only when `spPr` declares no
-    /// fill element of its own. 631 corpus shapes inherit through it, of which
-    /// 335 name `idx="0"` and therefore inherit *nothing*.
+    /// fill element of its own. `idx="0"` is a legal value here and means
+    /// inherit *nothing*.
     pub fill_ref: Option<StyleMatrixRef>,
     /// `a:effectRef` — the theme effect style, consulted when the direct
     /// `a:effectLst` is absent or empty.
@@ -139,9 +132,9 @@ pub struct ShapeStyle {
     /// collection.
     ///
     /// Parsed here but **not yet consumed**: it belongs to the text cascade,
-    /// not the paint walk, and wiring it into one and not the other would make
-    /// the markdown emitter and the geometry pass disagree about a run's
-    /// colour. 2,181 corpus shapes declare one.
+    /// not the paint walk, and wiring it into one and not the other would
+    /// make the markdown emitter and the geometry pass disagree about a
+    /// run's colour.
     pub font_ref: Option<FontReference>,
 }
 
@@ -160,9 +153,9 @@ impl Shape {
     /// True when this shape declares no transform of its own and therefore
     /// depends on the placeholder cascade for its position and size.
     ///
-    /// On the corpus this is true for 2,422 shapes and every one of them is a
-    /// placeholder, which is what makes the cascade a total function over this
-    /// set rather than a best-effort one.
+    /// Every shape observed with no transform is a placeholder, which is
+    /// what makes the cascade a total function over this set rather than a
+    /// best-effort one.
     pub fn needs_inherited_geometry(&self) -> bool {
         self.transform.is_none()
     }
@@ -212,12 +205,11 @@ pub enum ShapeKind {
     /// read through this module's own [`PicXml`], which adds the placeholder
     /// PresentationML allows and WordprocessingML has no concept of.
     Picture(Box<Picture>),
-    /// §19.3.1.19 `p:cxnSp` — a connector. Carries no text in any of the 845
-    /// corpus instances; kept because it is real geometry a layout pass and a
-    /// screenshot both need.
+    /// §19.3.1.19 `p:cxnSp` — a connector. Never carries text; kept because
+    /// it is real geometry a layout pass and a screenshot both need.
     Connector(Box<Connector>),
-    /// §19.3.1.22 `p:grpSp`. Boxed: `Group` is by far the largest variant
-    /// (~880 B), and there are 16.5k shapes on the corpus.
+    /// §19.3.1.22 `p:grpSp`. Boxed: `Group` is by far the largest variant,
+    /// and shape trees can hold thousands of shapes.
     Group(Box<Group>),
     /// §19.3.1.21 `p:graphicFrame`.
     GraphicFrame(Box<GraphicFrame>),
@@ -227,8 +219,8 @@ pub enum ShapeKind {
 #[derive(Clone, Debug, Default)]
 pub struct AutoShape {
     pub properties: Option<ShapeProperties>,
-    /// `p:txBody`. Absent on 949 of 15,906 corpus shapes — a shape with no
-    /// text body is not the same as one with an empty body.
+    /// `p:txBody`. Can be absent — a shape with no text body is not the
+    /// same as one with an empty body.
     pub text: Option<TextBody>,
     /// `p:cNvSpPr/@txBox` — the shape is a plain text box rather than a
     /// preset-geometry shape that happens to have text.
@@ -267,7 +259,7 @@ pub struct Group {
     pub child_offset: Option<Offset<Emu>>,
     /// `a:chExt` — the extent of the child coordinate space.
     pub child_extent: Option<Size<Emu>>,
-    /// In document order, which is z-order. Nests to depth 5 on the corpus.
+    /// In document order, which is z-order. Groups can nest.
     pub children: Vec<Shape>,
 }
 
@@ -280,24 +272,22 @@ pub struct GraphicFrame {
 /// What a graphic frame actually holds, keyed by `a:graphicData/@uri`.
 #[derive(Clone, Debug)]
 pub enum GraphicFramePayload {
-    /// A DrawingML table (`a:tbl`) — 36 of 102 corpus frames.
+    /// A DrawingML table (`a:tbl`).
     Table(Box<Table>),
-    /// SmartArt (53 corpus frames), which does not hold its own content: the
-    /// frame carries only `dgm:relIds`, and the text lives in the data part
-    /// that `@r:dm` points at (`ppt/diagrams/data*.xml`). Resolving the
-    /// relationship needs the owning [`Part`](crate::pptx::Part), which this
-    /// layer does not have, so the id is surfaced for the caller to resolve.
+    /// SmartArt, which does not hold its own content: the frame carries
+    /// only `dgm:relIds`, and the text lives in the data part that `@r:dm`
+    /// points at (`ppt/diagrams/data*.xml`). Resolving the relationship
+    /// needs the owning [`Part`](crate::pptx::Part), which this layer does
+    /// not have, so the id is surfaced for the caller to resolve.
     ///
-    /// Worth its own variant rather than `Unsupported`: on the corpus all 53
-    /// parts carry text, 12,102 characters of it, and a shape walk alone can
-    /// never see any of it.
+    /// Worth its own variant rather than `Unsupported`: diagram data parts
+    /// routinely carry real text that a shape walk alone can never see.
     Diagram { data_rel: String },
-    /// Embedded OLE (11) or a chart (2) — payloads we genuinely do not read.
+    /// Embedded OLE or a chart — payloads we genuinely do not read.
     ///
-    /// Kept as a typed variant rather than dropped so that a caller can emit a
-    /// placeholder and a probe can *count* what is being lost. Silently
-    /// discarding them would make the gap invisible, which is the failure mode
-    /// this vendor has been bitten by repeatedly.
+    /// Kept as a typed variant rather than dropped so that a caller can emit
+    /// a placeholder and a probe can *count* what is being lost. Silently
+    /// discarding them would make the gap invisible.
     Unsupported { uri: String },
 }
 
@@ -315,7 +305,7 @@ pub struct Table {
     pub grid: Vec<Dimension<Emu>>,
     pub rows: Vec<TableRow>,
     /// `a:tblPr/@firstRow` — the table style paints row 0 as a header. The
-    /// only header signal PPTX gives; 15 of 36 corpus tables set it.
+    /// only header signal PPTX gives.
     pub first_row: bool,
     pub first_col: bool,
     pub band_row: bool,
@@ -324,8 +314,8 @@ pub struct Table {
 /// §21.1.3.18 `a:tr`.
 #[derive(Clone, Debug, Default)]
 pub struct TableRow {
-    /// `@h` — declared row height. Present on 221 of 221 corpus rows, and it
-    /// is a *minimum*: the rendered row grows to fit its content.
+    /// `@h` — declared row height. A *minimum*: the rendered row grows to
+    /// fit its content.
     pub height: Option<Dimension<Emu>>,
     pub cells: Vec<TableCell>,
 }
@@ -343,7 +333,7 @@ pub struct TableCell {
     pub h_merge: bool,
     /// `@vMerge` — this cell is absorbed by a vertical merge above it.
     pub v_merge: bool,
-    /// `a:tcPr`, the text-relevant half. Declared on 603 of 608 corpus cells.
+    /// `a:tcPr`, the text-relevant half.
     pub properties: TableCellProperties,
 }
 
@@ -360,13 +350,13 @@ impl TableCell {
 ///
 /// Fills, borders (`a:lnL`/`lnR`/`lnT`/`lnB`/`lnTlToBr`/`lnBlToTr`) and
 /// `@horzOverflow` are deliberately absent: the first two are paint, and the
-/// third is declared 0 times on the corpus. `@anchorCtr` is likewise unread —
-/// it centres the text *block* horizontally, which this model has no way to
-/// express, and no corpus cell sets it.
+/// third is essentially never used in practice. `@anchorCtr` is likewise
+/// unread — it centres the text *block* horizontally, which this model has
+/// no way to express.
 ///
-/// **A cell's own `a:bodyPr` is not an alternative source.** All 603 corpus
-/// cells carry one and every one of them is bare — no attributes, no children —
-/// because §21.1.3.16 puts the insets and the anchor here instead.
+/// **A cell's own `a:bodyPr` is not an alternative source.** §21.1.3.16
+/// puts the insets and the anchor here on `a:tcPr` instead, so a cell's
+/// `a:bodyPr` is expected to be bare.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TableCellProperties {
     /// `@marL`, in EMU. `None` is the §21.1.3.17 default of 91440.
@@ -379,11 +369,11 @@ pub struct TableCellProperties {
     pub bottom_margin: Option<Dimension<Emu>>,
     /// `@anchor` — where the text sits vertically in the cell.
     ///
-    /// **Not a rare attribute**: 326 of 603 corpus cells declare a non-top
-    /// anchor (324 `ctr`, 2 `b`). Ignoring it tops every cell's text.
+    /// **Not a rare attribute**: a non-top anchor is common. Ignoring it
+    /// tops every cell's text.
     pub anchor: Option<TextAnchoringType>,
-    /// `@vert` — vertical text. Declared 0 times on the corpus, and carried
-    /// only so a consumer can tell "horizontal" from "not modelled".
+    /// `@vert` — vertical text. Rare in practice, and carried only so a
+    /// consumer can tell "horizontal" from "not modelled".
     pub vert: Option<TextVerticalType>,
 }
 
@@ -422,18 +412,17 @@ impl TableCellProperties {
 ///
 /// Both attributes are optional in the file and both have spec defaults that
 /// the cascade depends on, so they are materialized here rather than left as
-/// `Option` for every consumer to re-derive. On the corpus `@type` is absent
-/// 639 times and `@idx` 1,866 times, so neither default is hypothetical.
+/// `Option` for every consumer to re-derive. Both defaults are exercised
+/// routinely, not just hypothetical fallbacks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placeholder {
     /// `@type`, defaulting to `body` per §19.7.10.
     pub kind: PlaceholderKind,
     /// `@idx`, defaulting to 0 per §19.7.10.
     ///
-    /// **`u32`, not a narrower integer.** The corpus contains `idx` values of
-    /// exactly 4294967295 (`u32::MAX`) — 137 of them across 13 of 45 decks.
-    /// It is a legal `xsd:unsignedInt`, so anything narrower silently wraps or
-    /// hard-fails on more than a quarter of real decks.
+    /// **`u32`, not a narrower integer.** `idx="4294967295"` (`u32::MAX`) is
+    /// a legal `xsd:unsignedInt` value and appears in real decks; anything
+    /// narrower would silently wrap or hard-fail on it.
     pub idx: u32,
 }
 
@@ -441,7 +430,7 @@ pub struct Placeholder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum PlaceholderKind {
     Title,
-    /// The `@type` default, and the most common value on the corpus.
+    /// The `@type` default, and the most common value in practice.
     #[default]
     Body,
     CtrTitle,
@@ -468,7 +457,7 @@ pub enum PlaceholderKind {
 impl PlaceholderKind {
     /// The layout→master match rule, per python-pptx's 14-entry collapse map.
     ///
-    /// The three rungs of the cascade do **not** match the same way: slide →
+    /// The cascade does **not** match the same way at every level: slide →
     /// layout matches on `idx`, but layout → master matches on *type*, and
     /// only after collapsing the many body-ish types onto `body`. A master
     /// holds no `pic` or `tbl` placeholder to match against, so without this
@@ -498,18 +487,16 @@ impl PlaceholderKind {
 ///
 /// [`resolve_background_fill`]: crate::render::resolve::shape_visuals::resolve_background_fill
 ///
-/// Corpus (45 decks, 1,278 slides, counting the *effective* background after
-/// inheritance): 739 `bgPr` solid, 63 `bgPr` blip, 36 `bgPr` none, 440
-/// `bgRef`. **Zero slides resolve to no background at all.**
+/// Every slide is expected to resolve to an effective background of some
+/// kind, whether declared directly or inherited through the chain.
 #[derive(Clone, Debug)]
 pub enum Background {
     /// §19.3.1.2 `<p:bgPr>` — an explicit fill.
     ///
-    /// Its `EG_EffectProperties` sibling is **not** modelled: 579 corpus
-    /// backgrounds carry an `<a:effectLst>`, and the rasterizer renders no
-    /// effects at this tier, so keeping the field would only misreport
-    /// coverage. `a:scene3d`/`a:sp3d` and `@shadeToTitle` are dropped for the
-    /// same reason.
+    /// Its `EG_EffectProperties` sibling is **not** modelled: the rasterizer
+    /// renders no effects at this tier, so keeping the field would only
+    /// misreport coverage. `a:scene3d`/`a:sp3d` and `@shadeToTitle` are
+    /// dropped for the same reason.
     Properties(DrawingFill),
     /// §19.3.1.3 `<p:bgRef>` — an index into the theme's style matrix.
     Reference(StyleMatrixRef),
@@ -600,27 +587,28 @@ pub fn parse_single_object(data: &[u8]) -> Result<Option<Shape>> {
 ///
 /// [`parse_slide_part`] already returns this as
 /// [`SlidePart::show_inherited_shapes`], and that is what every *walk* should
-/// use. This exists for the one caller that needs the attribute **without** the
-/// shape tree: the deck-wide tally of inherited text has to know which slides
-/// really draw a rung, and it visits every slide before either walk begins.
-/// Deserializing 1,278 slide parts a second time to read one boolean measured
-/// at +7.5% on the corpus's end-to-end markdown run; this measures at nothing.
+/// use. This exists for the one caller that needs the attribute **without**
+/// the shape tree: a deck-wide tally of inherited text has to know which
+/// slides actually show an inherited layer, and visits every slide before
+/// either walk begins. Deserializing every slide part a second time just to
+/// read one boolean is measurably more expensive than this targeted read.
 ///
 /// The duplication is deliberate and is fenced by
 /// `cheap_reader_agrees_with_the_full_parse`, which asserts the two answers
 /// match on the same bytes — a second reader of an attribute is only safe while
 /// something fails when they disagree.
 ///
-/// Defaults to **true**, per the schema, and on anything it cannot read: a part
-/// whose XML is malformed is the full parse's problem to report, and answering
-/// "shows its rungs" here keeps the failure in one place.
+/// Defaults to **true**, per the schema, and on anything it cannot read: a
+/// part whose XML is malformed is the full parse's problem to report, and
+/// answering "shows its inherited shapes" here keeps the failure in one
+/// place.
 pub fn shows_inherited_shapes(data: &[u8]) -> bool {
     let mut reader = quick_xml::Reader::from_reader(data);
     let mut buf = Vec::new();
     loop {
         // The root element is the first `Start` — `Empty` cannot be it, since a
         // `p:sld` with no `p:cSld` is still not self-closing in any producer,
-        // and an empty root has no rungs to draw anyway.
+        // and an empty root has no inherited shapes to draw anyway.
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(e)) => {
                 // The true-family is `AttrBool`'s, spelled the same way on
@@ -649,10 +637,10 @@ pub fn shows_inherited_shapes(data: &[u8]) -> bool {
 pub struct SlidePart {
     pub shapes: Vec<Shape>,
     /// §19.3.1.1 `<p:bg>`, when *this* part declares one. `None` means "not
-    /// declared here", **not** "no background" — the value is inherited, and
-    /// resolving it is [`crate::pptx::cascade::resolve_background`]'s job.
-    /// Only 58 of the corpus's 1,278 slides declare their own; 1,125 inherit
-    /// from the master.
+    /// declared here", **not** "no background" — the value is inherited,
+    /// and resolving it is [`crate::pptx::cascade::resolve_background`]'s
+    /// job. Most slides inherit their background from the master rather
+    /// than declaring their own.
     pub background: Option<Background>,
     /// §19.3.1.6 `p:clrMap` (master) or §19.3.1.7 `p:clrMapOvr`'s
     /// `a:overrideClrMapping` (slide/layout), when *this* part states one.
@@ -662,16 +650,14 @@ pub struct SlidePart {
     /// that element's entire content is "inherit".
     pub color_map: Option<ColorMap>,
     /// §19.2.1.32 `p:sld/@showMasterSp` and §19.3.1.39 `p:sldLayout`'s — "draw
-    /// the shapes the rung above this one supplies". Defaults to **true**, per
-    /// both elements' schema.
+    /// the shapes the part above this one supplies". Defaults to **true**,
+    /// per both elements' schema.
     ///
     /// A `bool` rather than an `Option`, because unlike `background` and
     /// `color_map` this attribute does not cascade: it is a statement about
     /// *this* part's own rendering, and a slide that says nothing shows its
-    /// layout's shapes whatever the layout says about the master's.
-    ///
-    /// Corpus: 25 of 415 layouts and 4 of 1,278 slides opt out. A master's root
-    /// has no such attribute and always reads `true`.
+    /// layout's shapes whatever the layout says about the master's. A
+    /// master's root has no such attribute and always reads `true`.
     pub show_inherited_shapes: bool,
 }
 
@@ -719,9 +705,8 @@ pub fn parse_slide_part(data: &[u8]) -> Result<SlidePart> {
 
 // ── Schema ───────────────────────────────────────────────────────────────────
 //
-// As in `pptx::text`, coverage is driven by a census over the 45-deck corpus
-// rather than by reading §19.3 front to back: every element and attribute below
-// appears in at least one real deck.
+// As in `pptx::text`, coverage is driven by what real decks actually use
+// rather than by reading §19.3 front to back.
 
 #[derive(Deserialize)]
 struct SlidePartXml {
@@ -842,8 +827,8 @@ impl ClrMapXml {
 }
 
 /// §19.3.1.7 CT_ColorMappingOverride — a choice of `a:masterClrMapping`
-/// (inherit, and the only form the corpus's 41 overrides actually use) and
-/// `a:overrideClrMapping` (a full CT_ColorMapping stated locally).
+/// (inherit) and `a:overrideClrMapping` (a full CT_ColorMapping stated
+/// locally).
 #[derive(Deserialize)]
 struct ClrMapOvrXml {
     #[serde(rename = "overrideClrMapping", default)]
@@ -927,22 +912,23 @@ enum ShapeTreeChildXml {
 /// measurement rather than chosen up front.
 ///
 /// Strict MCE says: use a `Choice` only if you understand every namespace in
-/// its `@Requires`, else fall through to `Fallback`. We understand none of the
-/// four the corpus uses (`v`, `p14`, `cx1`, `a14`), so that rule always picks
-/// `Fallback`. It is the right rule for a *renderer* — the fallback is what an
-/// old viewer is meant to draw — and the wrong one for a text extractor,
-/// because the fallback is routinely a **rasterized picture of the content**.
+/// its `@Requires`, else fall through to `Fallback`. We understand none of
+/// the namespaces PowerPoint commonly requires (`v`, `p14`, `cx1`, `a14`),
+/// so that rule always picks `Fallback`. It is the right rule for a
+/// *renderer* — the fallback is what an old viewer is meant to draw — and
+/// the wrong one for a text extractor, because the fallback is routinely a
+/// **rasterized picture of the content**.
 ///
-/// The corpus case that caught it: a slide equation is written as
+/// The case that motivates this: a slide equation can be written as
 /// `mc:Choice Requires="a14"` holding a `p:sp` whose paragraph interleaves
-/// `<a14:m><m:oMath>` blocks with real `<a:r>` runs, beside an `mc:Fallback`
-/// holding a `p:pic` of the same equation. Preferring the fallback dropped the
-/// two `<a:t> = </a:t>` runs between the math blocks — a 2-character corpus
-/// recall miss, invisible until OMML was split out of the denominator.
+/// `<a14:m><m:oMath>` blocks with real `<a:r>` runs, beside an
+/// `mc:Fallback` holding a `p:pic` of the same equation. Preferring the
+/// fallback drops the `<a:r>` runs between the math blocks — real text a
+/// renderer doesn't need but an extractor does.
 ///
 /// Comparing text also handles the opposite case without a second rule:
-/// `mc:Choice` holding a `p:contentPart` (ink, 5 on the corpus) lowers to
-/// nothing, so its `p:pic` fallback wins on its own merits.
+/// `mc:Choice` holding a `p:contentPart` (ink) lowers to nothing, so its
+/// `p:pic` fallback wins on its own merits.
 #[derive(Deserialize, Default)]
 struct AlternateContentXml {
     #[serde(rename = "Choice", default)]
@@ -1084,15 +1070,14 @@ impl PhXml {
 
 /// §19.3.1.37 `p:pic`.
 ///
-/// Mirrors the shared `PictureXml` field for field — same `CT_Picture`, and the
-/// corpus confirms `nvPicPr` and `blipFill` are present on 2,437 of 2,437 — but
+/// Mirrors the shared `PictureXml` field for field — same `CT_Picture` — but
 /// adds the one thing PresentationML has and WordprocessingML does not: a
 /// picture can be a **placeholder**.
 ///
-/// Reusing `PictureXml` directly costs the `p:ph` on 55 corpus pictures, 3 of
-/// which declare no `xfrm` at all and therefore have no geometry from any other
-/// source. Those 3 are the entire reason the "every shape without an `xfrm` is a
-/// placeholder" invariant appeared to break when this walk first ran.
+/// Reusing `PictureXml` directly would lose the `p:ph`, and some
+/// placeholder pictures declare no `xfrm` at all and therefore have no
+/// geometry from any other source — which is why "every shape without an
+/// `xfrm` is a placeholder" only holds when pictures carry `p:ph` too.
 #[derive(Debug, Deserialize)]
 struct PicXml {
     #[serde(rename = "nvPicPr")]
@@ -1152,8 +1137,7 @@ struct NvGrpSpPrXml {
 
 /// §19.3.1.23 `p:grpSpPr` — `a:xfrm` + `EG_FillProperties` +
 /// `EG_EffectProperties` + `a:scene3d`. There is deliberately no `ln` field:
-/// the schema gives a group no outline, which is why a census of the corpus
-/// finds an `a:ln` on 0 of 695 groups. The six fill members route through
+/// the schema gives a group no outline. The six fill members route through
 /// [`pick_fill`], the same collapse `SpPrXml` and `p:bgPr` use.
 #[derive(Debug, Deserialize, Default)]
 struct GrpSpPrXml {
@@ -1637,8 +1621,8 @@ mod tests {
         parse_slide_part(xml.as_bytes()).expect("parses")
     }
 
-    /// The mapping 30 of the corpus's 70 masters state: `bg2`/`tx2` swapped,
-    /// which is the whole reason this element cannot be inferred.
+    /// A master can swap `bg2`/`tx2`, which is the whole reason this
+    /// element cannot be inferred.
     #[test]
     fn swapped_clr_map_is_read() {
         let p = part(
@@ -1655,8 +1639,8 @@ mod tests {
     }
 
     /// `a:masterClrMapping` *is* "inherit", so it must parse to `None` — a
-    /// default map here would shadow the master's real one on all 2,053
-    /// corpus slides that carry the element.
+    /// default map here would shadow the master's real one on every slide
+    /// that carries the element.
     #[test]
     fn master_clr_mapping_override_is_inherit_not_default() {
         let p = part(r#"<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>"#);
@@ -1707,10 +1691,9 @@ mod tests {
         assert!(matches!(shapes[2].kind, ShapeKind::AutoShape(_)));
     }
 
-    /// The 2422/2422 corpus invariant, in miniature: no xfrm means `None`, not
-    /// a rectangle at the origin. Inventing (0,0) here would put every
-    /// unresolved placeholder in the top-left corner and look like a layout
-    /// bug rather than a missing cascade.
+    /// No xfrm means `None`, not a rectangle at the origin. Inventing (0,0)
+    /// here would put every unresolved placeholder in the top-left corner
+    /// and look like a layout bug rather than a missing cascade.
     #[test]
     fn missing_xfrm_is_none_not_origin() {
         let shapes = tree(&sp(r#"<p:spPr/><p:txBody><a:p/></p:txBody>"#));
@@ -1730,9 +1713,9 @@ mod tests {
     }
 
     /// §19.3.1.46. All four references, with the `phClr` substitute each one
-    /// carries — the substitute is the load-bearing half, since every theme
-    /// matrix entry on the corpus is written in terms of `phClr` and resolves
-    /// to black without it.
+    /// carries — the substitute is the load-bearing half, since theme matrix
+    /// entries are routinely written in terms of `phClr` and resolve to
+    /// black without it.
     #[test]
     fn shape_style_lowers_all_four_references() {
         let shapes = tree(&sp(r#"<p:spPr/><p:style>
@@ -1746,9 +1729,8 @@ mod tests {
         assert_eq!(ln.idx, 2);
         assert!(ln.color.is_some(), "the phClr substitute must survive");
         assert_eq!(style.fill_ref.as_ref().expect("fillRef").idx, 1);
-        // §20.1.4.2.19: 0 is the no-reference sentinel and is kept as declared,
-        // not normalised away — 335 corpus `fillRef`s rely on the resolver
-        // seeing it.
+        // §20.1.4.2.19: 0 is the no-reference sentinel and is kept as
+        // declared, not normalised away — the resolver needs to see it.
         assert_eq!(style.effect_ref.as_ref().expect("effectRef").idx, 0);
         assert!(style.font_ref.is_some(), "parsed, though unused for now");
     }
@@ -1762,26 +1744,26 @@ mod tests {
         assert!(shapes[0].style.is_none());
     }
 
-    /// `p:ph@idx` reaches exactly `u32::MAX` in 13 of the 45 corpus decks.
-    /// A narrower integer wraps or hard-fails on all of them.
+    /// `p:ph@idx` can legally reach `u32::MAX`. A narrower integer would
+    /// wrap or hard-fail on it.
     #[test]
     fn placeholder_idx_holds_u32_max() {
-        let shapes = tree(&format!(
+        let shapes = tree(
             r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="s"/><p:cNvSpPr/>
-                 <p:nvPr><p:ph type="body" idx="4294967295"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>"#
-        ));
+                 <p:nvPr><p:ph type="body" idx="4294967295"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>"#,
+        );
         assert_eq!(shapes[0].placeholder.as_ref().unwrap().idx, u32::MAX);
     }
 
-    /// §19.7.10 defaults. Both are absent on thousands of corpus shapes, and
-    /// the cascade matches on them, so leaving them as `Option` would push the
+    /// §19.7.10 defaults. Both attributes are routinely absent, and the
+    /// cascade matches on them, so leaving them as `Option` would push the
     /// same defaulting into every consumer.
     #[test]
     fn placeholder_defaults_to_body_index_zero() {
-        let shapes = tree(&format!(
+        let shapes = tree(
             r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="s"/><p:cNvSpPr/>
-                 <p:nvPr><p:ph/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>"#
-        ));
+                 <p:nvPr><p:ph/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>"#,
+        );
         let ph = shapes[0].placeholder.as_ref().expect("placeholder");
         assert_eq!(ph.kind, PlaceholderKind::Body);
         assert_eq!(ph.idx, 0);
@@ -1789,13 +1771,13 @@ mod tests {
 
     /// An unrecognised `@type` must not silently become `Body`: that would make
     /// a typo indistinguishable from a real body placeholder and let it match
-    /// the wrong master rung.
+    /// the wrong master placeholder.
     #[test]
     fn unknown_placeholder_type_is_distinguishable_from_body() {
-        let shapes = tree(&format!(
+        let shapes = tree(
             r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="s"/><p:cNvSpPr/>
-                 <p:nvPr><p:ph type="bogus"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>"#
-        ));
+                 <p:nvPr><p:ph type="bogus"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>"#,
+        );
         assert_eq!(
             shapes[0].placeholder.as_ref().unwrap().kind,
             PlaceholderKind::Unknown
@@ -1817,9 +1799,9 @@ mod tests {
         }
     }
 
-    /// A graphic frame positions itself with `<p:xfrm>` as a direct child, not
-    /// through `spPr` — 102/102 on the corpus. Reading it via `SpPrXml` finds
-    /// nothing and stacks every table at the origin.
+    /// A graphic frame positions itself with `<p:xfrm>` as a direct child,
+    /// not through `spPr`. Reading it via `SpPrXml` finds nothing and
+    /// stacks every table at the origin.
     #[test]
     fn graphic_frame_transform_comes_from_p_xfrm() {
         let shapes = tree(
@@ -1869,9 +1851,8 @@ mod tests {
         assert!(table.rows[0].cells[1].is_absorbed());
     }
 
-    /// `a:tcPr` is where a cell's text placement lives, and it is not a rare
-    /// element: 603 of 608 corpus cells declare one, 375 of them with a
-    /// non-default margin and 326 with a non-top anchor.
+    /// `a:tcPr` is where a cell's text placement lives, and it is not a
+    /// rare element: non-default margins and non-top anchors are common.
     #[test]
     fn cell_properties_are_read_off_tc_pr() {
         let shapes = tree(
@@ -1937,7 +1918,7 @@ mod tests {
         assert!(bp.rotation.is_none() && bp.wrap.is_none() && bp.auto_fit.is_none());
     }
 
-    /// SmartArt/OLE/chart frames are 66 of 102 on the corpus. Typing them as
+    /// SmartArt/OLE/chart frames are unsupported payloads. Typing them as
     /// `Unsupported` rather than dropping them keeps the gap countable.
     #[test]
     fn unsupported_graphic_frame_payload_keeps_its_uri() {
@@ -1984,7 +1965,7 @@ mod tests {
     }
 
     /// §19.3.1.23 — the group's own fill, which is what a member's `a:grpFill`
-    /// inherits. 82 corpus groups declare a `solidFill` here.
+    /// inherits.
     #[test]
     fn group_fill_is_lowered() {
         let shapes = tree(&format!(
@@ -2069,10 +2050,10 @@ mod tests {
         );
     }
 
-    /// The corpus case that forced the rule: a `Requires="a14"` Choice holds
-    /// the equation's real text runs, its Fallback holds a rasterized picture
-    /// of the same equation. MCE says take the Fallback; that silently drops
-    /// the text.
+    /// The case that forced the rule: a `Requires="a14"` Choice holds the
+    /// equation's real text runs, its Fallback holds a rasterized picture
+    /// of the same equation. MCE says take the Fallback; that silently
+    /// drops the text.
     #[test]
     fn alternate_content_prefers_the_branch_with_more_text() {
         let shapes = tree(&format!(
@@ -2117,10 +2098,10 @@ mod tests {
         assert_eq!(shapes.len(), 1, "exactly one branch survives");
     }
 
-    /// A `p:pic` can be a placeholder — 55 on the corpus — and 3 of them
-    /// declare no `xfrm`, so the cascade is their only source of geometry.
-    /// Reusing the DOCX `PictureXml`, which has no `p:nvPr`, drops this
-    /// silently: the picture still parses, it just loses its position.
+    /// A `p:pic` can be a placeholder, and can declare no `xfrm` of its
+    /// own, so the cascade is its only source of geometry. Reusing the DOCX
+    /// `PictureXml`, which has no `p:nvPr`, drops this silently: the
+    /// picture still parses, it just loses its position.
     #[test]
     fn picture_placeholder_survives() {
         let shapes = tree(
@@ -2175,8 +2156,7 @@ mod tests {
         assert!(auto.is_text_box);
     }
 
-    /// A part with no `p:cSld` is empty, not an error — the fail-open posture
-    /// this vendor has settled on four times over.
+    /// A part with no `p:cSld` is empty, not an error.
     #[test]
     fn part_without_a_shape_tree_is_empty_not_an_error() {
         let xml =
@@ -2227,9 +2207,9 @@ mod tests {
     }
 
     /// `bgRef@idx` must survive as declared. 1001 is not a typo and not a
-    /// cosmetic index: it selects the theme's *background* fill matrix, and
-    /// every `bgRef` on the corpus uses it. Clamping or defaulting it here
-    /// would push the bug down into the resolver.
+    /// cosmetic index: it selects the theme's *background* fill matrix.
+    /// Clamping or defaulting it here would push the bug down into the
+    /// resolver.
     #[test]
     fn bg_ref_keeps_its_thousand_offset_index() {
         let part =
@@ -2351,7 +2331,7 @@ mod tests {
     }
 
     /// The schema default is `true`, and it is the *absence* of the attribute
-    /// that carries it — a part that says nothing inherits its rung's shapes.
+    /// that carries it — a part that says nothing inherits the shapes above it.
     #[test]
     fn show_master_sp_defaults_to_true() {
         assert!(show_inherited(""));

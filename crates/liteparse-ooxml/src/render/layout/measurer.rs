@@ -1,45 +1,28 @@
 //! Text measurer — resolves text widths through a `FontRegistry`.
 //!
-//! C′ rewrite of upstream's Skia measurer over fontdb + skrifa. The
-//! measurement arithmetic is copied verbatim from upstream (`measure_str` is a
-//! cmap → sum-of-`hmtx`-advances walk with no shaping or kerning, then
-//! §17.3.2.45 `text_scale` on the advances and §17.3.2.35 `char_spacing` per
-//! character), so it cannot diverge; the things that could — font resolution
-//! and metric quantization — were measured in spikes 6–8:
+//! A port of the upstream (dxpdf) Skia measurer over fontdb + skrifa. The
+//! measurement arithmetic matches upstream: `measure_str` is a cmap →
+//! sum-of-`hmtx`-advances walk with no shaping or kerning, then §17.3.2.45
+//! `text_scale` on the advances and §17.3.2.35 `char_spacing` per character. An
+//! unmapped codepoint contributes glyph 0's (.notdef) advance, which is what a
+//! cmap lookup yields and what Skia does.
 //!
-//! - widths agree with Skia to 99.82% exactly where both engines hold the
-//!   same face, with no quantization divergence at any size;
-//! - line metrics (`ascent`/`descent`/`leading`, so line height and therefore
-//!   pagination) are **bit-exact** against both CoreText- and FreeType-backed
-//!   Skia — every corpus face resolves its metrics through `hhea`, and skrifa
-//!   agrees with both platform scalers on all of them;
-//! - an unmapped codepoint contributes glyph 0's (.notdef) advance. The
-//!   zero-contribution alternative was tried and *disproved* (spike 6): Skia
-//!   has space-fallback handling of its own, and zeroing made parity worse.
-//!
-//! ## Sign conventions (the trap spike 7 hit)
+//! ## Sign conventions
 //!
 //! skrifa reports ascent positive-up and descent negative-down; [`TextMetrics`]
-//! stores ascent positive-up and descent positive-down, so descent is negated
-//! at this boundary. For underlines: upstream's comment claims Skia returns a
-//! negative-below value and that it negates to positive-below — **the comment
-//! has it backwards**. `SkFontMetrics::fUnderlinePosition` is positive below
-//! the baseline; upstream negates it, so `underline_metrics` actually returns
-//! a *negative-below* offset. skrifa's `post`-table `underlinePosition` is
-//! already negative-below, so matching upstream means passing it through
-//! untouched. (Diagnostic worth keeping: a 0%-exact comparison is never a font
-//! disagreement — some face would agree by chance. 0% means a sign or formula
-//! error on your own side.)
+//! stores both positive, so descent is negated at this boundary. The underline
+//! offset is stored **negative below the baseline**: skrifa's `post`-table
+//! `underlinePosition` is already negative-below and is passed through
+//! untouched. (Upstream's own comment describes the opposite of what its code
+//! does; the negative-below reading is the one that matches its output.)
 //!
 //! ## Emoji
 //!
-//! Upstream shapes emoji clusters through Skia's HarfBuzz so ZWJ sequences
-//! measure to their ligated width. No shaper is wired here yet, so
-//! [`TextMeasurer::measure_with_typeface`] takes upstream's own documented
-//! fallback path — the cmap-only advance sum — for every cluster. A
-//! multi-codepoint sequence therefore over-measures relative to upstream by
-//! (n−1) glyph advances; acceptable for now, and the seam for a harfrust
-//! shaper is this one function.
+//! Upstream shapes emoji clusters through HarfBuzz so ZWJ sequences measure to
+//! their ligated width. No shaper is wired here, so
+//! [`TextMeasurer::measure_with_typeface`] uses the cmap-only advance sum for
+//! every cluster; a multi-codepoint sequence therefore over-measures by (n−1)
+//! glyph advances. Wiring a shaper is scoped to that one function.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -115,10 +98,6 @@ impl<'r> TextMeasurer<'r> {
             warned_emoji: RefCell::new(HashSet::new()),
             emoji_advance_cache: RefCell::new(HashMap::new()),
         }
-    }
-
-    pub fn registry(&self) -> &'r FontRegistry {
-        self.registry
     }
 
     /// Slot for (family, size, bold, italic), resolving and reading the
@@ -258,9 +237,7 @@ impl<'r> TextMeasurer<'r> {
     /// Query font metrics for underline positioning.
     /// Returns (underline_position, underline_thickness) in points.
     ///
-    /// The offset is **negative below the baseline** — see the module docs;
-    /// upstream's own comment states the opposite of what its code does, and
-    /// the parity harness proved the negative-below reading bit-exact.
+    /// The offset is **negative below the baseline** — see the module docs.
     pub fn underline_metrics(&self, font_props: &FontProps) -> (Pt, Pt) {
         let idx = self.slot(
             &font_props.family,
@@ -312,8 +289,8 @@ impl<'r> TextMeasurer<'r> {
     /// which has already resolved the typeface and needs metrics at the
     /// cluster's font size.
     ///
-    /// Cmap-only — upstream's GSUB shaping fallback path, taken always here
-    /// until a harfrust shaper is wired in (see module docs).
+    /// Cmap-only — the no-shaping fallback path, taken always here until a
+    /// shaper is wired in (see module docs).
     pub fn measure_with_typeface(
         &self,
         text: &str,
@@ -456,9 +433,8 @@ mod tests {
 
     #[test]
     fn underline_position_is_negative_below_baseline() {
-        // The sign trap from spike 7: skrifa's post-table value passes
-        // through untouched, so for any real font the offset must come back
-        // negative (below the baseline).
+        // skrifa's post-table value passes through untouched, so for any real
+        // font the offset must come back negative (below the baseline).
         let registry = FontRegistry::new();
         let measurer = TextMeasurer::new(&registry);
         let (pos, thick) = measurer.underline_metrics(&fp_at_scale(1.0));

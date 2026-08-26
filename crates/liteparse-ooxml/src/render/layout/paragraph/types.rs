@@ -198,9 +198,6 @@ impl Default for ParagraphStyle {
     }
 }
 
-// Workaround for clippy: ParagraphStyle has many fields but they all map 1:1 to spec properties.
-// A builder pattern would add complexity without value here.
-
 /// Line spacing rules matching OOXML semantics.
 #[derive(Clone, Copy, Debug)]
 pub enum LineSpacingRule {

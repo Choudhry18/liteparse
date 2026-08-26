@@ -8,24 +8,24 @@
 //! measuring the text and wrapping it inside the rectangle the shape gives it.
 //!
 //! That derivation is not written here. `render::layout` already does it for
-//! DOCX text boxes, and the layout census established that the reusable part
-//! reaches further than expected: `stack_blocks` names no `w:` type, and
-//! `shape_body::layout_shape_body` — carved out of the DOCX text-box path for
-//! this — does insets, anchor and `@vertOverflow` off a plain `a:bodyPr`, which
-//! is DrawingML and identical in both formats. So this module is an **adapter**:
-//! it turns a `TextParagraph` plus its resolved text style into the
-//! `LayoutBlock`s that stack expects, and hands the resulting draw commands to
-//! the same `DrawCommand` → `TextItem` converter the DOCX path uses.
+//! DOCX text boxes, and the reusable part reaches further than expected:
+//! `stack_blocks` names no `w:` type, and `shape_body::layout_shape_body` —
+//! carved out of the DOCX text-box path for this — does insets, anchor and
+//! `@vertOverflow` off a plain `a:bodyPr`, which is DrawingML and identical in
+//! both formats. So this module is an **adapter**: it turns a `TextParagraph`
+//! plus its resolved text style into the `LayoutBlock`s that stack expects, and
+//! hands the resulting draw commands to the same `DrawCommand` → `TextItem`
+//! converter the DOCX path uses.
 //!
-//! What is genuinely new here, and what the census said each would cost:
+//! What is genuinely new here, and why each cannot be assumed:
 //!
 //! | input | why it cannot be assumed |
 //! |---|---|
-//! | theme font default | **26.3% of runs name no font.** DrawingML's answer is `+mn-lt`/`+mj-lt`; guessing the host default puts a quarter of the corpus in the wrong face *and* the wrong width |
-//! | `a:bodyPr` insets | declared on 100% of text shapes, and **47.2% differ from the spec default** |
-//! | `a:bodyPr` anchor | **27.7% are not `top`** |
-//! | `a:normAutofit` | only **3.4%** actually shrink, but the most aggressive is to **25%** — a body laid out at 4x its intended size is not a subtle error |
-//! | shape rotation | **5.3% of text shapes, 148 at a right angle.** The DOCX path hardcodes `rotation = 0.0`, which is honest for a page and is not honest here |
+//! | theme font default | many runs name no font. DrawingML's answer is `+mn-lt`/`+mj-lt`; guessing the host default gives the wrong face *and* the wrong width |
+//! | `a:bodyPr` insets | declared on every text shape, and often differ from the spec default |
+//! | `a:bodyPr` anchor | frequently not `top` |
+//! | `a:normAutofit` | rarely shrinks, but when it does it can go as low as 25% — a body laid out at 4x its intended size is not a subtle error |
+//! | shape rotation | a minority of text shapes rotate, some at a right angle. The DOCX path hardcodes `rotation = 0.0`, which is honest for a page and not here |
 //!
 //! Rotation is applied here rather than inside the shared converter because
 //! `DrawCommand::Text` carries no rotation field — it is emitted pre-shifted but
@@ -42,12 +42,12 @@
 //!
 //! Text is emitted in reading order; **fills and outlines are emitted in
 //! document order**, by [`paint_shapes`], because §19.3.1.45 makes document
-//! order z-order and the paint census measured 29.1% of the corpus pairs where
-//! that difference is observable coming out the wrong way round under reading
-//! order. The two walks share one `Deck::prepare`, so they cannot disagree
-//! about a rectangle or a cascade; what they deliberately do not share is the
-//! chrome filter, the traversal order, and the placement mechanism — a text
-//! body is bracketed, a path places itself.
+//! order z-order and reading order sequences a significant fraction of
+//! overlapping fills the wrong way round. The two walks share one
+//! `Deck::prepare`, so they cannot disagree about a rectangle or a cascade;
+//! what they deliberately do not share is the chrome filter, the traversal
+//! order, and the placement mechanism — a text body is bracketed, a path
+//! places itself.
 
 use liteparse_ooxml::model::dimension::Dimension;
 use liteparse_ooxml::model::{
@@ -151,14 +151,12 @@ pub struct SlideGeometry {
     /// parsed it also counted every outline whose colour was sitting in the
     /// theme, unread.
     pub outlines_defaulted_black: usize,
-    /// Shapes carrying a `p:style` that the paint walk consulted. 2,181 on the
-    /// corpus, of which 1,744 are on slides and the rest on layouts and
-    /// masters.
+    /// Shapes carrying a `p:style` that the paint walk consulted.
     pub shapes_with_style: usize,
     /// Shapes whose fill came from the theme's `fillStyleLst` via `a:fillRef`,
     /// because `spPr` declared no fill element at all. Counted after
-    /// resolution, so an `idx="0"` reference — 335 corpus shapes, more than
-    /// half of those that inherit — is not counted here.
+    /// resolution, so an `idx="0"` reference (the "no reference" sentinel) is
+    /// not counted here.
     pub fills_from_style_ref: usize,
     /// Shapes stroked entirely from the theme's `lnStyleLst`, having no
     /// `<a:ln>` of their own. This is ink the pass did not put down before,
@@ -170,9 +168,8 @@ pub struct SlideGeometry {
     /// than the index.
     ///
     /// The honest residue of the two counters above. Without it a theme that
-    /// resolves to an empty matrix is indistinguishable from a corpus that
-    /// never asked, and the difference is a shape PowerPoint paints and we do
-    /// not.
+    /// resolves to an empty matrix is indistinguishable from input that never
+    /// asked, and the difference is a shape PowerPoint paints and we do not.
     pub style_refs_unresolved: usize,
     /// Per page, the command index of the full-slide background
     /// [`DrawCommand::Path`], when one was emitted. Parallel to `pages`.
@@ -187,28 +184,27 @@ pub struct SlideGeometry {
     /// Slides that emitted a full-slide background [`DrawCommand::Path`].
     pub painted_backgrounds: usize,
     /// Slides whose resolved background is deliberately transparent
-    /// (`<a:noFill/>`, 36 on the corpus). Not a gap: nothing is the correct
-    /// paint, and it is separated from the next two so that "no ink" and
-    /// "could not make ink" stay different claims.
+    /// (`<a:noFill/>`). Not a gap: nothing is the correct paint, and it is
+    /// separated from the next two so that "no ink" and "could not make ink"
+    /// stay different claims.
     pub transparent_backgrounds: usize,
-    /// Slides that declare a background this pass cannot colour: `blip` (63 on
-    /// the corpus), `pattern`, or a `bgRef` into a matrix entry of one of
-    /// those kinds. Distinguished from the transparent case on the *declared*
-    /// arm, because `resolve_fill` collapses all of them to
+    /// Slides that declare a background this pass cannot colour: `blip`,
+    /// `pattern`, or a `bgRef` into a matrix entry of one of those kinds.
+    /// Distinguished from the transparent case on the *declared* arm, because
+    /// `resolve_fill` collapses all of them to
     /// [`ResolvedFill::None`] — so the resolved fill alone would report a
     /// missing photograph as a slide that correctly has no backdrop.
     pub unrenderable_backgrounds: usize,
     /// Slides where no part in the slide → layout → master chain declares a
-    /// background at all. 0 on the corpus, so any number here is a signal
-    /// about the package rather than a normal outcome.
+    /// background at all. Normally zero, so any number here is a signal about
+    /// the package rather than a normal outcome.
     pub undeclared_backgrounds: usize,
     /// Runs whose colour came from a declared `a:solidFill` on some rung of
     /// the text cascade.
     pub runs_colour_declared: usize,
     /// Runs with no colour anywhere in the cascade, painted black by §21.1.2.3
     /// default. The remaining gap here is `p:style/a:fontRef`, which supplies
-    /// a shape-level text colour this pass does not parse — 2,043 of the
-    /// corpus's 2,181 `p:style` elements carry one.
+    /// a shape-level text colour this pass does not parse.
     pub runs_colour_defaulted: usize,
     /// Shapes painted from a *layout* or *master* part rather than the slide's
     /// own tree — the panels, rules and logo strips a deck authors once and
@@ -224,53 +220,49 @@ pub struct SlideGeometry {
     /// — the same class as `unpainted_shapes`, counted separately for the same
     /// reason as above.
     pub inherited_shapes_unpainted: usize,
-    /// Occurrences of an inherited shape that **carries text at all**: 371 on
-    /// the corpus, of which 292 are a master's and 79 a layout's.
+    /// Occurrences of an inherited shape that **carries text at all**.
     ///
-    /// Not a gap, and not a target. The census behind
-    /// `bench/pptx_corpus/inherited_text_census.py` found only **43 distinct
-    /// strings** under those 371 occurrences — a layout shape is drawn on every
+    /// Not a gap, and not a target. Far fewer distinct strings sit under these
+    /// occurrences than the count suggests — a layout shape is drawn on every
     /// slide that uses the layout, so one speaker banner authored once lands on
-    /// 47 pages, and 151 of the occurrences are the literal `‹#›` of a slide
+    /// many pages, and many occurrences are the literal `‹#›` of a slide
     /// number. This counts the population; `inherited_text_laid_out` counts the
     /// part of it a reader gets.
     pub inherited_shapes_with_text: usize,
     /// Occurrences of inherited text this pass **did** lay out: the strings
-    /// that land on exactly one slide of their deck, 29 of the 371 on the
-    /// corpus. See [`PreparedSlide::inherited_text`] for the rule and what it
-    /// was measured against.
+    /// that land on exactly one slide of their deck. See
+    /// [`PreparedSlide::inherited_text`] for the rule.
     ///
     /// Counted in the text walk rather than the paint walk, so it is an
     /// occurrence of *emitted* text and not of a shape that happened to paint.
-    /// The residue — 342 — is furniture, and dropping it is the feature.
+    /// The residue is furniture, and dropping it is the feature.
     ///
     /// [`PreparedSlide::inherited_text`]: crate::office::pptx::PreparedSlide::inherited_text
     pub inherited_text_laid_out: usize,
-    /// Slides that decline an inherited rung via `@showMasterSp="0"` — 4 slides
-    /// declining their layout's shapes and, through 25 layouts, the slides that
-    /// decline their master's. Counted because "painted nothing here" and
-    /// "asked to paint nothing here" are different claims.
+    /// Slides that decline an inherited rung via `@showMasterSp="0"`. Counted
+    /// because "painted nothing here" and "asked to paint nothing here" are
+    /// different claims.
     pub slides_declining_layout: usize,
     pub slides_declining_master: usize,
     /// `p:pic` shapes the paint walk reached, on any rung.
     pub pictures_seen: usize,
     /// Pictures whose blip resolves to no image: an empty picture placeholder
-    /// (157 on the corpus, all in layouts and masters — correct, not a gap),
-    /// an external `r:link`, or media with no decoder (39 EMF/WMF references).
+    /// (all in layouts and masters — correct, not a gap), an external `r:link`,
+    /// or media with no decoder (EMF/WMF references).
     ///
     /// Pooled deliberately with the correct cases, because the *ratio* is the
     /// claim this pass can make honestly; splitting it further would need the
     /// resolver to report a reason, which is its own change.
     pub pictures_unresolved: usize,
     /// Pictures that declare no `prstGeom` and took the schema's implicit
-    /// `rect`. 41 on the corpus.
+    /// `rect`.
     pub pictures_implicit_rect: usize,
     /// Shapes painted with an image fill — pictures and `spPr` blip fills
     /// together. The number that says the emitter put photographs on slides,
     /// as opposed to merely resolving them.
     pub blips_painted: usize,
-    /// Slides whose background is an image this pass now paints. Carved out of
-    /// `unrenderable_backgrounds`, which was 63 before this step.
+    /// Slides whose background is an image this pass paints. Carved out of
+    /// `unrenderable_backgrounds`.
     pub blip_backgrounds_painted: usize,
     /// Shapes whose `spPr` fill is `a:grpFill` and which took a real fill from
     /// an enclosing group (§20.1.8.35).
@@ -299,7 +291,8 @@ pub struct ShapePlacement {
     /// Not decoration: a table cell's rectangle is *derived* (grid prefix sums,
     /// grown rows) where a shape's is *declared*, so the two have different
     /// failure modes and a check that pooled them would let a cell-only bug —
-    /// a dropped `a:tcPr` anchor, say — hide inside 4,938 correct shapes.
+    /// a dropped `a:tcPr` anchor, say — hide inside the far larger set of
+    /// correct shapes.
     pub kind: PlacementKind,
     /// The box's unrotated rectangle in slide Pt: `(x, y, width, height)`.
     pub rect: (f32, f32, f32, f32),
@@ -475,10 +468,8 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
             // only for markdown a reader actually gets, so the two walks take
             // the same traversal or the claim is not true.
             for read in pptx_emit::slide_reading_order(&prepared) {
-                // `!figure`: the same list now also carries the rungs'
-                // pictures, which this counter does not name and must not
-                // absorb — its value is the A/B anchor for the inherited-text
-                // step (29 on the corpus).
+                // `!figure`: the same list also carries the rungs' pictures,
+                // which this counter does not name and must not absorb.
                 if read.rung.is_some() && !read.figure {
                     *ctx.inherited_text_laid_out += 1;
                 }
@@ -657,9 +648,8 @@ impl ShapeCtx<'_, '_> {
 /// re-derived here: [`Deck::prepare`] resolves which of slide/layout/master
 /// wins, and [`pptx::background_fill`] is the single place that knows a
 /// `bgRef@idx` of 1001 selects `bgFillStyleLst[0]` and not `fillStyleLst`.
-/// `ctx.theme` is this slide's own master's theme, which is what makes the
-/// 31 corpus slides that resolve a `bgRef` under a second master come out in
-/// their own palette.
+/// `ctx.theme` is this slide's own master's theme, which is what makes a slide
+/// resolving a `bgRef` under a second master come out in its own palette.
 ///
 /// [`Deck::prepare`]: crate::office::pptx::Deck::prepare
 fn paint_background(
@@ -678,9 +668,9 @@ fn paint_background(
         // tell them apart: `resolve_fill` collapses blip, pattern and `grpFill`
         // to `None` alongside a genuine `<a:noFill/>`. Splitting them on the
         // *declared* arm is the difference between "this slide has no
-        // backdrop, correctly" (36 on the corpus) and "this slide's photograph
-        // backdrop is missing" (63) — reporting the second as the first is
-        // exactly the silent-wrongness this pass counts its way out of.
+        // backdrop, correctly" and "this slide's photograph backdrop is
+        // missing" — reporting the second as the first is exactly the
+        // silent-wrongness this pass counts its way out of.
         if matches!(bg, pptx::Background::Properties(DrawingFill::None)) {
             *ctx.transparent_backgrounds += 1;
         } else {
@@ -726,19 +716,17 @@ fn paint_background(
 /// **A second traversal, and it has to be.** The text walk uses
 /// [`reading_order`], which sorts shapes into bands and drops chrome; both
 /// halves are right for reading and wrong for painting. §19.3.1.45 makes
-/// document order z-order, and the paint census found that of the 1,263 corpus
-/// pairs where two fills overlap — i.e. where paint order is observable at all
-/// — reading order sequences **368 (29.1%)** the wrong way round, on 7.3% of
-/// slides. A backdrop panel authored last and read first would paint over the
-/// content it belongs under.
+/// document order z-order, and where two fills overlap reading order sequences
+/// a meaningful share of them the wrong way round. A backdrop panel authored
+/// last and read first would paint over the content it belongs under.
 ///
 /// The two walks share one `Deck::prepare`, so the rectangles and the cascade
 /// they see are the same ones by construction. What is *not* shared is the
 /// chrome filter: this walk paints chrome, the text walk still drops it, and
-/// the 347 chrome shapes that carry text are a divergence this step leaves
-/// open rather than closes (see the module-level note in the plan).
-/// `group_fill` is the fill the *enclosing* group offers its members, already
-/// resolved and already chain-collapsed — see [`group_fill_for`].
+/// chrome shapes that carry text are a divergence this step leaves open rather
+/// than closes. `group_fill` is the fill the *enclosing* group offers its
+/// members, already resolved and already chain-collapsed — see
+/// [`group_fill_for`].
 fn paint_shapes(
     shapes: &[Shape],
     from: Source<'_>,
@@ -766,8 +754,8 @@ fn paint_shapes(
 ///
 /// * the group names a fill → that, resolved in this part's colour context
 /// * the group's own fill is `a:grpFill` → whatever its parent offered,
-///   passed straight through (6 corpus groups, carrying 414 shapes between
-///   them, so the chain is load-bearing rather than theoretical)
+///   passed straight through (the chain is load-bearing: nested groups carry
+///   many shapes between them)
 /// * the group names `a:noFill`, or no fill at all → `None`. The spec's
 ///   "inherit nothing"; a member is then correctly unpainted.
 fn group_fill_for(
@@ -806,17 +794,17 @@ fn paint_shape(
         return;
     };
     // Counted before the paint decision, not after: the text is missing
-    // whether or not the shape also puts ink down, and a 237-shape gap that
-    // only reported itself on shapes that happened to have a fill would be a
-    // number that under-reports exactly where it matters.
+    // whether or not the shape also puts ink down, and a gap that only reported
+    // itself on shapes that happened to have a fill would under-report exactly
+    // where it matters.
     if from.rung == Rung::Inherited && shape_text_len(shape) > 0 {
         *ctx.inherited_shapes_with_text += 1;
     }
     // §19.3.1.46 `p:style` — the theme-matrix references this shape inherits
-    // its fill and outline from when `spPr` declares none of its own. 2,181
-    // corpus shapes carry one; `a:fontRef` is deliberately not consulted here,
-    // because a run colour resolved in the paint walk and not in the text
-    // cascade would make the two disagree.
+    // its fill and outline from when `spPr` declares none of its own.
+    // `a:fontRef` is deliberately not consulted here, because a run colour
+    // resolved in the paint walk and not in the text cascade would make the two
+    // disagree.
     let style = shape.style.as_ref();
     let mut visuals = resolve_shape_visuals(
         Some(props),
@@ -845,8 +833,7 @@ fn paint_shape(
     let fill_from_ref = props.fill.is_none() && !matches!(visuals.fill, ResolvedFill::None);
     let stroke_from_ref = props.outline.is_none() && visuals.stroke.is_some();
     // A reference that named a matrix entry and came back empty. `idx == 0` is
-    // the spec's "no reference" sentinel — 335 corpus `fillRef`s use it — and
-    // is not a miss.
+    // the spec's "no reference" sentinel and is not a miss.
     let asked = |r: Option<&StyleMatrixRef>| r.is_some_and(|r| r.idx != 0);
     let missed_fill = props.fill.is_none()
         && asked(style.and_then(|s| s.fill_ref.as_ref()))
@@ -874,8 +861,8 @@ fn paint_shape(
         let blip = resolve_blip_fill(&pic.blip_fill, Some(from.media));
         if matches!(blip, ResolvedFill::None) {
             // An empty picture placeholder, an `r:link`, or media we cannot
-            // decode (39 EMF/WMF references on the corpus). Counted rather
-            // than silently falling back to the frame's own fill.
+            // decode (EMF/WMF). Counted rather than silently falling back to
+            // the frame's own fill.
             *ctx.pictures_unresolved += 1;
         } else {
             visuals.fill = blip;
@@ -899,7 +886,7 @@ fn paint_shape(
         height: emu_to_pt(box_.size.height.raw()),
     };
     // §19.3.1.37: a picture frame with no `prstGeom` is a rectangle — the
-    // image fills its box. 41 corpus pictures declare none.
+    // image fills its box.
     //
     // This is **not** the "never approximate an unbuildable preset by its
     // bounding box" rule being relaxed. That rule is about a `cloud` we cannot
@@ -963,9 +950,8 @@ fn paint_shape(
 
 /// How much text an inherited shape carries that this pass will not lay out.
 ///
-/// Only `p:sp` bodies are counted. A `p:graphicFrame`'s table is a second gap
-/// of a different shape, and 2 of them appear in layout parts against 237
-/// `p:sp`s — folding the two would make the number harder to act on, not more
+/// Only `p:sp` bodies are counted. A `p:graphicFrame`'s table is a separate,
+/// rarer gap; folding the two would make the number harder to act on, not more
 /// complete.
 fn shape_text_len(shape: &Shape) -> usize {
     let ShapeKind::AutoShape(sp) = &shape.kind else {
@@ -1032,9 +1018,8 @@ fn layout_shape(shape: &Shape, ctx: &mut ShapeCtx<'_, '_>) {
 /// items, translated and rotated onto the slide.
 fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>) {
     // A shape with no rectangle cannot be laid out at all: there is nothing to
-    // wrap inside. The geometry pass measured 0 of these across the corpus, and
-    // the markdown emitter still emits such a shape's text — so this is a
-    // geometry gap for that shape, not a content drop.
+    // wrap inside. The markdown emitter still emits such a shape's text — so
+    // this is a geometry gap for that shape, not a content drop.
     let Some(slide_rect) = shape.slide_rect else {
         return;
     };
@@ -1048,10 +1033,9 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
     // §20.1.9.18: the shape's box is not its *text* box. Every preset carries
     // an `<a:rect>` naming where its text goes, and for anything that is not a
     // plain rectangle that rectangle is inset — a `roundRect` by the sagitta of
-    // its corner arc, a `cloud` by a third of its width in each direction. 310
-    // of the corpus's 4,969 laid-out bodies sit in one, keeping a mean 78% of
-    // the room they are given today; all 310 shrink and none grows, so this
-    // only ever wraps text sooner, never later.
+    // its corner arc, a `cloud` by a third of its width in each direction. The
+    // inset rect is always smaller than the box, so this only ever wraps text
+    // sooner, never later.
     let body_box = body_rect(shape, extent);
     let body_extent = body_box.size;
     let offset = (body_box.origin.x.raw(), body_box.origin.y.raw());
@@ -1125,16 +1109,15 @@ fn layout_text_shape(shape: &Shape, body: &TextBody, ctx: &mut ShapeCtx<'_, '_>)
 /// geometry a few lines earlier. The two cannot share: the painter builds in
 /// `slide_rect.bounding_box()`, because a rotated child's ink lives in the box
 /// group composition produced, while text is laid out in `slide_rect.rect` and
-/// turned about the frame's centre afterwards. On 187 of the corpus's
-/// laid-out bodies those two extents differ, and a shared build would give one
-/// of the two walks a rectangle scaled for the other. The build itself is
-/// ~0.5µs of guide evaluation.
+/// turned about the frame's centre afterwards. Those two extents differ for a
+/// rotated shape, and a shared build would give one of the two walks a
+/// rectangle scaled for the other. The build itself is cheap.
 ///
-/// Falls back to the full box in three cases, none of which occurs on the
-/// corpus but each of which is a silent text drop if taken literally:
+/// Falls back to the full box in three cases, each a silent text drop if taken
+/// literally:
 ///
-/// * no geometry declared (886 bodies — the schema's default is a rectangle,
-///   whose text rect *is* the box, so the fallback is also the right answer),
+/// * no geometry declared (the schema's default is a rectangle, whose text
+///   rect *is* the box, so the fallback is also the right answer),
 /// * an unbuildable preset, i.e. a name §20.1.9.18 does not define,
 /// * a degenerate rect. A body given no width lays nothing out, and dropping a
 ///   shape's text on a guide that evaluated to zero would be a worse answer
@@ -1300,17 +1283,16 @@ impl Frame {
 /// same anchor as an `a:bodyPr` — so everything below the rectangle is the
 /// shape path's code.
 ///
-/// Two corpus facts decide the derivation, and both contradict the obvious
+/// Two facts decide the derivation, and both contradict the obvious
 /// implementation:
 ///
-/// - **The frame's `@cx` is not the table's width.** It agrees with the grid on
-///   26 of 36 corpus tables; the other 10 are two decks whose producer writes a
-///   constant 236.2pt for every frame, up to 4x wrong. The grid is authoritative
-///   and the frame supplies only the origin.
-/// - **`a:tr@h` is a minimum, not a height** (§21.1.3.18). 16 corpus rows
-///   declare `h="0"`, which under a literal reading stacks every cell of the
-///   table at its top edge. So each row is grown to its tallest cell, which is
-///   why cells must be measured before any of them can be placed.
+/// - **The frame's `@cx` is not the table's width.** Some producers write a
+///   constant frame width for every table, up to 4x wrong. The grid is
+///   authoritative and the frame supplies only the origin.
+/// - **`a:tr@h` is a minimum, not a height** (§21.1.3.18). A row may declare
+///   `h="0"`, which under a literal reading stacks every cell of the table at
+///   its top edge. So each row is grown to its tallest cell, which is why cells
+///   must be measured before any of them can be placed.
 fn layout_table(shape: &Shape, table: &pptx::Table, ctx: &mut ShapeCtx<'_, '_>) {
     let text_cells = || {
         table
@@ -1450,8 +1432,8 @@ fn prefix_edges(lengths: impl Iterator<Item = Pt>) -> Vec<Pt> {
 /// §21.1.3.18: each row's declared `@h` raised to fit its tallest cell.
 ///
 /// `@h` is a **minimum**, and treating it as the height is not a rounding
-/// error: 16 corpus rows declare `h="0"`, which stacks every cell of those
-/// tables at the table's top edge.
+/// error: a row declaring `h="0"` would stack every cell of the table at its
+/// top edge.
 ///
 /// A row-spanning cell is deliberately excluded from its row's growth. Its
 /// content is shared across every row it covers, so charging the whole height
@@ -1805,9 +1787,8 @@ mod tests {
 
     #[test]
     fn theme_font_splits_title_from_body() {
-        // The rung that covers the census's 26.3% of runs naming no font.
-        // Getting the halves the wrong way round is invisible in markdown and
-        // wrong in every width.
+        // The rung that covers runs naming no font. Getting the halves the
+        // wrong way round is invisible in markdown and wrong in every width.
         let theme = theme_with("Georgia", "Verdana");
         assert_eq!(theme_family(Some(&theme), true), "Georgia");
         assert_eq!(theme_family(Some(&theme), false), "Verdana");
@@ -1881,10 +1862,9 @@ mod tests {
 
     #[test]
     fn zero_declared_height_is_grown_not_taken_literally() {
-        // 16 corpus rows declare `h="0"`. Taken literally every row edge is
-        // zero and the whole table collapses onto its top edge — text that is
-        // still inside the frame, and therefore invisible to a containment
-        // check.
+        // A row declaring `h="0"` taken literally makes every row edge zero and
+        // the whole table collapses onto its top edge — text that is still
+        // inside the frame, and therefore invisible to a containment check.
         let grown = grown_row_heights(&[Pt::ZERO, Pt::ZERO], &[cell(0, 1, 18.0), cell(1, 1, 24.0)]);
         assert_eq!(grown, vec![Pt::new(18.0), Pt::new(24.0)]);
         let edges = prefix_edges(grown.into_iter());
@@ -2043,9 +2023,9 @@ mod tests {
 
     /// §20.1.9.22: a `roundRect`'s text rect is inset by 29.289% of its corner
     /// radius — the sagitta of the 45° arc — on every side. With the default
-    /// 16.667% adjustment on a 100x100 box that is 4.88pt, and the point of the
-    /// test is that it is *neither* zero (the rect's answer) nor the full
-    /// 16.667pt radius (what the retired hand-written generator returned).
+    /// 16.667% adjustment on a 100x100 box that is 4.88pt; the point of the
+    /// test is that it is *neither* zero (a plain rect's answer) nor the full
+    /// 16.667pt radius.
     #[test]
     fn a_round_rect_lays_its_body_out_inside_its_corner_arcs() {
         let r = body_rect(
@@ -2074,7 +2054,7 @@ mod tests {
         assert_eq!((r.size.width.raw(), r.size.height.raw()), (100.0, 60.0));
     }
 
-    /// 886 corpus bodies declare no geometry at all. The schema's default is a
+    /// A body may declare no geometry at all. The schema's default is a
     /// rectangle, so the whole box is the right answer and not merely a
     /// fallback — laying such a body out in nothing would drop its text.
     #[test]

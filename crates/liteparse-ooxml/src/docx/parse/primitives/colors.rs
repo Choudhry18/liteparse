@@ -6,7 +6,7 @@
 //! - [`RgbHexU32`] — ST_HexColorRGB (§20.1.10.41): strictly a 6-digit RGB hex.
 //!   Used where the spec disallows "auto".
 //!
-//! Both fail deserialization on malformed input (strict per plan §Decisions).
+//! Both fail deserialization on malformed input rather than guessing.
 
 use serde::{Deserialize, Deserializer};
 

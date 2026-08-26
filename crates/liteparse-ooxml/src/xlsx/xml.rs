@@ -12,9 +12,9 @@
 //!   value is `" "`. The event reader does not trim, so it never has the
 //!   problem.
 //!
-//! * **Size.** Sheets are the bulk of a workbook — 50.3M cells across the
-//!   1,089-workbook finance corpus, with single sheets past 32 MB. serde
-//!   materializes an intermediate `Vec` per element; streaming does not.
+//! * **Size.** Sheets are the bulk of a workbook, with single sheets running
+//!   past 32 MB. serde materializes an intermediate `Vec` per element;
+//!   streaming does not.
 
 use quick_xml::events::{BytesCData, BytesRef, BytesStart, BytesText};
 
@@ -62,8 +62,8 @@ pub(crate) fn attr_parse<T: std::str::FromStr>(e: &BytesStart<'_>, want: &[u8]) 
     attr(e, want)?.trim().parse().ok()
 }
 
-/// Read a boolean attribute with OOXML's four spellings (§22.9.2.7:
-/// `1`/`0`/`true`/`false`).
+/// Read a boolean attribute, accepting OOXML's `1`/`0`/`true`/`false`
+/// (§22.9.2.7) plus the `on`/`off` some producers write.
 pub(crate) fn attr_bool(e: &BytesStart<'_>, want: &[u8], default: bool) -> bool {
     match attr(e, want).as_deref() {
         Some("1" | "true" | "on") => true,

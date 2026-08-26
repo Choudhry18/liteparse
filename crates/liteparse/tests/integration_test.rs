@@ -105,8 +105,8 @@ async fn test_parse_bytes_office_integration() {
     // `sample3.doc` is a renamed Word 2007+ (.docx) file, so byte input has no
     // extension to go on and the container sniff routes it down the native
     // DOCX path when that feature is on. Native pagination is host-dependent
-    // (font substitution can spill a page — see NATIVE_OFFICE_PLAN.md), so
-    // assert a page range rather than pinning LibreOffice's exact count.
+    // (font substitution can spill a page), so assert a page range rather than
+    // pinning LibreOffice's exact count.
     let fixture_path = "../../integration_tests_data/sample3.doc";
     let lit = LiteParse::new(LiteParseConfig::default());
     let data = tokio::fs::read(fixture_path)
@@ -299,8 +299,7 @@ async fn test_annotation_text_complexity_reason() {
 
 /// Native DOCX path end-to-end: real geometry per page, links as data, and
 /// doc-level markdown byte-identical to the pure structure path
-/// (`docx_to_blocks` → `render_blocks`) — the invariant that pins the
-/// docx_rules_eval corpus score.
+/// (`docx_to_blocks` → `render_blocks`).
 ///
 /// The byte-identity holds under the default `image_mode` because this
 /// fixture's only images are header decorations, which the body walk never
@@ -362,9 +361,7 @@ async fn test_parse_docx_native_integration() {
 /// The fixture's two callouts are `<wp:inline>` `wps:wsp` shapes wrapped in an
 /// `mc:AlternateContent` whose `mc:Fallback` is a VML `v:textbox` carrying
 /// **the same text** — so the walk must commit to one branch or emit the box
-/// twice. Before the text-box tap, the structure walk descended into neither
-/// and 1,213 chars of instructional prose were absent from native markdown
-/// while the LibreOffice path kept them.
+/// twice.
 #[cfg(feature = "docx-native")]
 #[tokio::test]
 #[serial]
@@ -619,10 +616,8 @@ async fn test_parse_docx_native_complexity_integration() {
 /// Native PPTX path end-to-end.
 ///
 /// The load-bearing assertion is the byte-identity between `parsed.text` and
-/// the emitter's own output: `office/pptx.rs` is what the corpus content-recall
-/// number (0.9256 vs anydoc's 0.9250) was measured on, and the wiring must not
-/// perturb it. If this fails, the recorded score no longer describes what the
-/// CLI produces.
+/// the emitter's own output: content recall is measured against
+/// `office/pptx.rs`, so the wiring must not perturb what it produces.
 ///
 /// The rest pins the contract the geometry pass added: one page per slide, real
 /// boxes on every page, and an outline built from slide titles.

@@ -386,9 +386,6 @@ mod tests {
     /// only by a §19.3.1.3 `<p:bgRef idx="1001+">`. Parsing them into one list
     /// would be worse than not parsing it: every PPTX background would resolve
     /// to a shape fill of the same index, silently and plausibly.
-    ///
-    /// All 115 themes on the PPTX corpus declare both lists, with 3 entries
-    /// each.
     #[test]
     fn bg_fill_style_lst_is_a_separate_matrix_from_fill_style_lst() {
         let xml = r#"<a:theme xmlns:a="urn:a"><a:themeElements><a:fmtScheme>

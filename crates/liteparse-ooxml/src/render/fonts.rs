@@ -1,29 +1,25 @@
 //! Font resolution with per-render ownership (`FontRegistry`) — fontdb + skrifa.
 //!
-//! Upstream this module is a 1,300-line registry built on Skia's `FontMgr`.
-//! This is the C′ rewrite: same public surface as far as the layout engine
-//! consumes it, with resolution answered by `fontdb` and metrics/advances by
-//! `skrifa` (see `layout::measurer`). It is the one production seam between
-//! dxpdf's layout engine and Skia — everything else in `render/layout/` is
-//! vendored verbatim.
+//! Same public surface as the upstream Skia-based registry, but resolution
+//! is answered by `fontdb` and metrics/advances by `skrifa` (see
+//! `layout::measurer`). It is the one seam between dxpdf's layout engine and
+//! Skia — everything else in `render/layout/` is vendored verbatim.
 //!
-//! The resolution rules and their ordering are not invented here: they were
-//! derived and measured in `bench/docx_layout_spike` (spikes 6–8, recorded in
-//! `NATIVE_OFFICE_PLAN.md`). Where both engines have the requested face,
-//! agreement with Skia is 99.8% on widths and bit-exact on line metrics; every
-//! divergence beyond that was a *resolution* difference, which is why this
-//! file is mostly resolution policy and hardly any arithmetic.
+//! Where both engines have the requested face, results agree closely on
+//! widths and are bit-exact on line metrics; divergences beyond that trace to
+//! a *resolution* difference, which is why this file is mostly resolution
+//! policy and hardly any arithmetic.
 //!
-//! ## Host-dependence (decision, 2026-08-13)
+//! ## Host-dependence
 //!
 //! Geometry from this registry is deliberately **host-dependent** for
 //! documents whose fonts the host lacks: no fonts are bundled and no checksum
-//! pinning is done. Spike 8 proved a family name does not pin a font (two
-//! "Caladea"s differ by ~7% in advances), so determinism would require
-//! shipping files — a cost the project declined. What this file guarantees
-//! instead is *visibility*: every resolution records which [`ResolveRule`]
-//! answered, and only `Embedded`, `Exact`, alias/suffix hits and
-//! `Substitution(Metric)` claim to be reproducible across hosts.
+//! pinning is done. A family name does not pin a font (two "Caladea"s can
+//! differ by several percent in advances), so determinism would require
+//! shipping font files — a cost the project declined. What this file
+//! guarantees instead is *visibility*: every resolution records which
+//! [`ResolveRule`] answered, and only `Embedded`, `Exact`, alias/suffix hits
+//! and `Substitution(Metric)` claim to be reproducible across hosts.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -79,12 +75,6 @@ impl FontStyle {
 /// Stable id for an embedded font registered in the registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EmbeddedFontId(u32);
-
-impl EmbeddedFontId {
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-}
 
 /// Identity for a resolved face — wraps the `fontdb` id. Used as a cache key
 /// by the measurer's cluster-advance memo.
@@ -155,15 +145,14 @@ pub enum RegisterError {
     },
 }
 
-// ─── Resolution rules (spike 6/8 artifacts) ─────────────────────────────────
+// ─── Resolution rules ───────────────────────────────────────────────────────
 
 /// Whether a substitute reproduces the original's *metrics* or merely its look.
 ///
-/// This distinction is the whole point of the table, not a nicety. Spike 7
-/// measured the cost of getting it wrong: Helvetica standing in for Arial is
-/// metric-compatible in **advances** (so a width test sees nothing) and off by
-/// **+14.99% in line metrics** (1.0000 em vs 1.1499 em) — a one-directional
-/// bias that compounds down every page.
+/// This distinction is the whole point of the table, not a nicety: Helvetica
+/// standing in for Arial is metric-compatible in **advances** (so a width
+/// test sees nothing) but off by **+14.99% in line metrics** (1.0000 em vs
+/// 1.1499 em) — a one-directional bias that compounds down every page.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SubstKind {
     /// Designed as a drop-in: same upem, same advances, same line metrics.
@@ -241,8 +230,7 @@ impl ResolveRule {
 ///
 /// Deliberately excludes `roman` and `book`: "Times New Roman" and "Century
 /// Schoolbook" are families whose last word *is* a style word, and stripping
-/// it sends the query somewhere that does not exist. This cost spike 6 a run —
-/// the fix looked inert because it had quietly broken its own best case.
+/// it sends the query somewhere that does not exist.
 /// `black` and `light` stay in only because stripping is attempted after an
 /// exact family match has already failed, so "Arial Black" is never reached by
 /// this path on a host that has it.
@@ -281,9 +269,9 @@ fn suffix_weight(word: &str) -> Option<u16> {
 /// A request for 600 becomes 100, the lightest weight in the file.
 ///
 /// Where several style words are stripped, the **rightmost** weight-bearing
-/// one wins. Real names put the specific word last ("Open Sans Light"), and
-/// the only corpus case with two ("Albert Sans Regular Light") is a mangled
-/// name where Light is the operative half.
+/// one wins. Real names put the specific word last ("Open Sans Light"); a
+/// mangled name with two ("Albert Sans Regular Light") treats Light as the
+/// operative half.
 fn strip_style_suffix(family: &str) -> Option<(String, Option<u16>)> {
     let mut words: Vec<&str> = family.split_whitespace().collect();
     let mut stripped = false;
@@ -313,11 +301,10 @@ fn strip_style_suffix(family: &str) -> Option<(String, Option<u16>)> {
 /// convert a visible "this host fell back to a generic" into an invisible
 /// wrong answer. Absent families must stay loud.
 ///
-/// The URW / TeX Gyre rows are all `Visual`, and that was **measured, not
-/// assumed** (spike 8): the whole set is advance-compatible with the
-/// PostScript base 35 and line-metric-incompatible (every face reports
-/// `lh = 1.200 em` against 1.000 em for the originals). Same trap as
-/// Helvetica-for-Arial, one layer down.
+/// The URW / TeX Gyre rows are all `Visual`: the whole set is
+/// advance-compatible with the PostScript base 35 but line-metric-incompatible
+/// (every face reports `lh = 1.200 em` against 1.000 em for the originals).
+/// Same trap as Helvetica-for-Arial, one layer down.
 ///
 /// Trap encoded in the table itself: `Helvetica` and `Arial` must not point at
 /// the same clones the same way round. Liberation Sans clones **Arial** (so it
@@ -620,8 +607,6 @@ fn merged_alias_weight(alias_weight: u16, requested_weight: u16) -> u16 {
 
 #[derive(Debug, Clone)]
 struct EmbeddedRecord {
-    family: String,
-    variant: EmbeddedFontVariant,
     face: Option<fontdb::ID>,
 }
 
@@ -684,19 +669,9 @@ impl FontRegistry {
         &self.db
     }
 
-    pub fn embedded_font_count(&self) -> usize {
-        self.embedded.len()
-    }
-
-    pub fn cached_typeface_count(&self) -> usize {
-        self.typefaces.borrow().len()
-    }
-
     /// Register an embedded font. Subsequent `resolve` calls for the same
-    /// family + variant return this face in preference to system resolution —
-    /// dxpdf registers embedded fonts ahead of system resolution, and spike 6
-    /// found the one embedded-font document in the corpus (Georgia) agreeing
-    /// only by luck without this ordering.
+    /// family + variant return this face in preference to system resolution,
+    /// matching dxpdf's own ordering.
     pub fn register_embedded(
         &mut self,
         family: &str,
@@ -714,21 +689,11 @@ impl FontRegistry {
             });
         }
         let id = EmbeddedFontId(self.embedded.len() as u32);
-        self.embedded.push(EmbeddedRecord {
-            family: family.to_string(),
-            variant,
-            face,
-        });
+        self.embedded.push(EmbeddedRecord { face });
         self.embedded_index
             .insert((family.to_lowercase(), variant), id);
         log::debug!("registered embedded font '{}' {:?}", family, variant);
         Ok(id)
-    }
-
-    /// Family + variant for a registered embedded font.
-    pub fn embedded_meta(&self, id: EmbeddedFontId) -> (&str, EmbeddedFontVariant) {
-        let r = &self.embedded[id.0 as usize];
-        (&r.family, r.variant)
     }
 
     /// Resolve a typeface by family + style. Embedded fonts win over system.
@@ -827,9 +792,9 @@ impl FontRegistry {
         //
         // The *query* keeps the run's own style, deliberately: feeding the
         // stripped weight into it would change which face a static family
-        // resolves to, corpus-wide, on a step whose whole warrant is variable
-        // fonts. The stripped weight goes only to the variation coordinate,
-        // where it can affect nothing that does not carry an axis.
+        // resolves to, on a step whose whole warrant is variable fonts. The
+        // stripped weight goes only to the variation coordinate, where it
+        // can affect nothing that does not carry an axis.
         if let Some((base, suffix_wght)) = strip_style_suffix(family)
             && let Some(id) = self.query(&[fontdb::Family::Name(&base)], style)
         {
@@ -938,15 +903,6 @@ impl FontRegistry {
             }
         }
     }
-
-    /// Snapshot of all cached entries.
-    pub fn cached_entries(&self) -> Vec<(TypefaceKey, TypefaceEntry)> {
-        self.typefaces
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
 }
 
 impl Default for FontRegistry {
@@ -1030,7 +986,7 @@ mod tests {
             strip_style_suffix("Open Sans Light"),
             Some(("Open Sans".to_string(), Some(300)))
         );
-        // Rightmost weight word wins: this mangled name is in the corpus.
+        // Rightmost weight word wins on a mangled multi-word name too.
         assert_eq!(
             strip_style_suffix("Albert Sans Regular Light"),
             Some(("Albert Sans".to_string(), Some(300)))

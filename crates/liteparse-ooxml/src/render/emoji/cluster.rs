@@ -362,10 +362,9 @@ mod tests {
     // ─── Default-text emoji codepoint regression tests ───────────────────────
     //
     // Per UTS #51 emoji-data.txt: digits 0-9, '#', '*' have Emoji=YES with
-    // default-text presentation. A prior version of the classifier returned
-    // them as `InlineCluster::Emoji` with `presentation: Text`, which still
-    // routed them through the color emoji rasterizer downstream — corrupting
-    // page numbers, IBANs, dates, and any other digit-bearing text.
+    // default-text presentation. Classifying them as `InlineCluster::Emoji`
+    // would route them through the color emoji rasterizer downstream,
+    // corrupting page numbers, IBANs, dates, and any other digit-bearing text.
 
     /// Standalone digit must be plain text — no rasterization.
     #[test]

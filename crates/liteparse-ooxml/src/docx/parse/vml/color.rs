@@ -4,10 +4,9 @@ use crate::docx::model::*;
 
 /// Parse a VML color value (§14.1.2.1): `#RRGGBB`, `RRGGBB` hex, or named color.
 ///
-/// Returns `None` for an unrecognized value; every call site treats a color as
-/// optional (an unparseable `fillcolor` simply means "no color"), so this
-/// mirrors the sibling `parse_style`/`parse_formula`/`parse_length` helpers
-/// rather than raising a document-fatal error.
+/// Returns `None` for an unrecognized value rather than an error: every call
+/// site treats a color as optional, so an unparseable `fillcolor` simply
+/// means "no color" (matching the sibling `parse_style`/`parse_length` helpers).
 pub(super) fn parse_color(s: &str) -> Option<VmlColor> {
     let hex = s.strip_prefix('#').unwrap_or(s);
     if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {

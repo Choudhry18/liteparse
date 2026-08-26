@@ -256,11 +256,11 @@ impl Default for LiteParseConfig {
     }
 }
 
-/// Returns the default number of OCR workers: CPU cores - 1, minimum 1.
 fn default_true() -> bool {
     true
 }
 
+/// Returns the default number of OCR workers: CPU cores - 1, minimum 1.
 fn default_num_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))

@@ -7,7 +7,6 @@ use crate::docx::error::Result;
 use crate::docx::model::*;
 use crate::docx::parse::properties::schema::paragraph::PPrXml;
 use crate::docx::parse::properties::schema::run::RPrXml;
-use crate::docx::parse::properties::schema::section::SectPrXml;
 use crate::docx::parse::properties::schema::table::{TblPrXml, TcPrXml, TrPrXml};
 use crate::docx::parse::serde_xml::from_xml;
 
@@ -213,10 +212,6 @@ struct ValString {
 }
 
 use crate::docx::parse::primitives::AttrBool;
-
-// Suppress unused warnings on schema-private fields used only via serde.
-#[allow(dead_code)]
-const _: Option<SectPrXml> = None;
 
 // ── schema → model conversion ────────────────────────────────────────────
 

@@ -117,9 +117,8 @@ pub(crate) struct RPrXml {
     bdr: Option<BorderXml>,
 }
 
-/// `<w:u w:val="..."/>` — underline. Unlike other ST-enum wrappers we can't
-/// use a bare `ValAttr<StUnderline>` because the attribute is optional; an
-/// underline element with no `@val` means "Single" per §17.3.2.40.
+/// `<w:u w:val="..."/>` — underline. `@val` is optional: an underline
+/// element with no `@val` means "Single" per §17.3.2.40.
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub(crate) struct UnderlineXml {
     #[serde(
@@ -147,13 +146,6 @@ pub(crate) struct ColorXml {
 pub(crate) struct ValString {
     #[serde(rename = "@val")]
     val: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(bound(deserialize = "T: serde::Deserialize<'de>"))]
-pub(crate) struct ValAttr<T> {
-    #[serde(rename = "@val")]
-    val: T,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -407,9 +399,8 @@ mod tests {
     }
 
     #[test]
-    /// Upstream rejected a negative font size, failing the whole document.
-    /// We treat it as unspecified so the size inherits from the style chain —
-    /// but it must still never be accepted as a real size.
+    /// A negative font size is invalid; it must be treated as unspecified so
+    /// the size inherits from the style chain rather than failing the parse.
     fn negative_decimal_font_size_is_unspecified() {
         let (rp, _) = parse(r#"<rPr><sz val="-1.5"/></rPr>"#);
         assert_eq!(rp.font_size, None);

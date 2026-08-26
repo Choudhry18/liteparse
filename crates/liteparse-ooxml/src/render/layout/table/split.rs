@@ -152,22 +152,14 @@ fn cut_for_cell(
     }
 
     let cont_top = largest_legal_cut(&entry.layout.lines, budget)?;
-    // Load-bearing for **termination**, not tidiness.
-    //
-    // `cont_top` becomes this cell's `shift`, and `split_row_at` derives
-    // `second.height = mr.height - max(shift)`. `mod.rs`'s continuation loop
-    // re-splits `second` until it fits, so a cut with `shift == 0` would hand
-    // back a continuation identical to its input and spin forever. This check
-    // is what makes "`find_row_cut` returned `Some`" imply "the row strictly
-    // shrank", which is the loop's whole termination argument.
-    //
-    // Today it is unreachable: `largest_legal_cut` returns a line's `top_y`,
-    // and the stacker emits strictly increasing tops, so offset 0 never comes
-    // back for a real cell. That makes this a backstop for an invariant owned
-    // by another module rather than by this one — keep it, and note that only
-    // `zero_offset_cut_is_rejected_so_the_shift_is_never_zero` covers it,
-    // because it builds the degenerate entry by hand. Nothing routed through
-    // `measure_table_rows` can.
+    // Load-bearing for termination. `cont_top` becomes this cell's `shift`, and
+    // `split_row_at` derives `second.height = mr.height - max(shift)`; `mod.rs`'s
+    // continuation loop re-splits `second` until it fits, so a cut with
+    // `shift == 0` would hand back an identical continuation and spin forever.
+    // This guard makes "`find_row_cut` returned `Some`" imply "the row strictly
+    // shrank". It is unreachable through real layout (the stacker emits strictly
+    // increasing line tops, so `largest_legal_cut` never returns 0), but backs an
+    // invariant this module cannot enforce itself.
     if cont_top <= Pt::ZERO {
         return None;
     }
@@ -507,8 +499,7 @@ mod tests {
     /// heights straddling the line-height and widow-control boundaries, and
     /// cell margins large enough to swallow the budget.
     ///
-    /// If this ever fails, `layout_table_paginated` hangs — the same class of
-    /// defect as the floating-table spillover loop (E4c).
+    /// If this ever fails, `layout_table_paginated` hangs.
     #[test]
     fn every_accepted_cut_strictly_shrinks_the_row() {
         for n_lines in [2usize, 3, 5, 12] {
@@ -645,7 +636,7 @@ mod tests {
         assert_eq!(slices.len(), 20, "40 lines at 2 per page");
     }
 
-    // ── Cut correctness (E5b#4) ──────────────────────────────────────────
+    // ── Cut correctness ──────────────────────────────────────────────────
     //
     // The tests above pin *termination*. These pin what the cut actually
     // produces: which lines land on each side, where the partition boundary

@@ -40,10 +40,9 @@ pub struct CellGridPosition {
 ///
 /// `wholeTable` is not positional — it applies to every cell — so it is not
 /// produced by `applicable_regions`, which answers "which *positional* regions
-/// is this cell in?". Seeding the chain with it here keeps that function honest
-/// and reuses the existing overlay machinery unchanged, so the positional
-/// precedence (including D1's banding fix) is untouched: `wholeTable` simply
-/// sits underneath.
+/// is this cell in?". Seeding the chain with it here reuses the existing
+/// overlay machinery unchanged, leaving the positional precedence untouched:
+/// `wholeTable` simply sits underneath.
 ///
 /// The table-level half — a `wholeTable` override's `tblPr` (borders, cell
 /// margins) — is folded into `ResolvedStyle::table` during style resolution,
@@ -96,6 +95,12 @@ fn applicable_regions(
     col_band_size: u32,
 ) -> Vec<TableStyleOverrideType> {
     let mut regions = Vec::new();
+
+    // A 0×N or N×0 grid has no cells; bail before the `num_rows - 1` /
+    // `num_cols - 1` arithmetic below can underflow.
+    if num_rows == 0 || num_cols == 0 {
+        return regions;
+    }
 
     // §17.4.56: tblLook flags. When absent, all regions are active.
     let first_row_active = look.and_then(|l| l.first_row).unwrap_or(true);
@@ -512,7 +517,7 @@ mod tests {
         );
     }
 
-    // ── wholeTable base layer (§17.7.6, backlog Unit 5) ──────────────
+    // ── wholeTable base layer (§17.7.6) ──────────────────────────────
 
     fn pos(row_idx: usize, col_idx: usize) -> CellGridPosition {
         CellGridPosition {
@@ -626,8 +631,8 @@ mod tests {
         );
     }
 
-    /// D1 fixed horizontal-over-vertical banding precedence (§17.7.6). Adding a
-    /// base layer beneath both must not disturb it.
+    /// §17.7.6: horizontal banding outranks vertical. Adding a base layer
+    /// beneath both must not disturb that precedence.
     #[test]
     fn whole_table_does_not_disturb_banding_precedence() {
         let overrides = vec![

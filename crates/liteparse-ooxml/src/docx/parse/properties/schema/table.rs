@@ -535,13 +535,6 @@ struct ValString {
     val: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(bound(deserialize = "T: serde::Deserialize<'de>"))]
-pub(crate) struct ValAttr<T> {
-    #[serde(rename = "@val")]
-    val: T,
-}
-
 use crate::docx::parse::primitives::AttrBool;
 
 #[cfg(test)]
@@ -575,8 +568,8 @@ mod tests {
     }
 
     #[test]
-    /// Upstream failed the whole table on a negative width; we drop the width
-    /// and keep the table.
+    /// A negative table width must not fail the whole table; the width is
+    /// dropped instead.
     fn negative_decimal_table_width_does_not_fail_the_table() {
         let parsed: TblPrXml = quick_xml::de::from_str(
             r#"<tblPr><tblW w="-1.5" type="dxa"/><jc val="center"/></tblPr>"#,

@@ -1,7 +1,6 @@
 //! Floating element layout — positioned outside the normal flow.
 
 use crate::render::dimension::Pt;
-use crate::render::geometry::PtRect;
 
 /// §17.4.56 / §20.4.2: source of a floating element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,11 +29,6 @@ impl FloatSource {
     /// between *floating tables*: "whether the current table shall allow
     /// other floating tables to overlap its extents". A table may still
     /// visually overlap a floating image, and Word lets it.
-    ///
-    /// Named rather than spelled `matches!(.., Table { .. })` at the use
-    /// site because the interesting content is the spec rule, not the
-    /// pattern — the anchor resolver reads as "skip what tblOverlap
-    /// doesn't govern".
     pub fn participates_in_table_overlap(&self) -> bool {
         matches!(self, Self::Table { .. })
     }
@@ -91,16 +85,6 @@ impl ActiveFloat {
     /// Whether a given y-position overlaps this float's vertical range.
     pub fn overlaps_y(&self, y: Pt) -> bool {
         y >= self.page_y_start && y < self.page_y_end
-    }
-
-    /// The rectangle occupied by this float.
-    pub fn rect(&self) -> PtRect {
-        PtRect::from_xywh(
-            self.page_x,
-            self.page_y_start,
-            self.width,
-            self.page_y_end - self.page_y_start,
-        )
     }
 }
 

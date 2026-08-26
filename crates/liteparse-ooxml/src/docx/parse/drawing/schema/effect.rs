@@ -3,7 +3,7 @@
 //! Flat `<a:effectLst>` with eight child effect types, preserving document
 //! order. Consumes `DrawingColorXml` and `DrawingFillXml`.
 
-#![allow(dead_code, clippy::large_enum_variant)]
+#![allow(clippy::large_enum_variant)]
 
 use serde::Deserialize;
 

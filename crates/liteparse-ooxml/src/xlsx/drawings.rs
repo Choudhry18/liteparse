@@ -4,43 +4,36 @@
 //! A worksheet references at most one drawing part (`<drawing r:id>`); the
 //! part holds a list of *anchors* (ECMA-376 §20.5), each placing one object —
 //! a picture, a shape, a chart frame, or a group — against the grid. This
-//! module reads **pictures** and **text-bearing shapes**: the corpus census
-//! (1,248 workbooks) found 2,276 `xdr:pic`, 386 chart frames, and — among
-//! ~29k `xdr:sp` — 1,637 visible shapes carrying real text (137k chars of
-//! titles, form labels, and instructions invisible to the grid). Charts have
-//! no image bytes to extract and stay out of scope.
+//! module reads **pictures** and **text-bearing shapes**. Charts have no
+//! image bytes to extract and stay out of scope.
 //!
-//! Census-driven decisions (`xlsx_shapetext_census`, see plan doc):
+//! Decisions for shapes:
 //!
-//! * **`hidden="1"` shapes are skipped.** 1,004 of the corpus's 2,641
-//!   text-bearing shapes are legacy form controls (`name="Check Box N"`,
-//!   zero-extent, stacked option labels like `YES`/`NO`/`UNKNOWN`) that
-//!   Excel itself never renders.
-//! * **`mc:Fallback` subtrees are skipped** — the PPTX shape walk's
-//!   prefer-Choice rule, third format it applies to. Neither branch is a
-//!   superset (Choice-only reads +119 shapes, −0.8% chars vs Fallback-only),
-//!   and reading *both* — what this parser did before it knew about MCE —
-//!   double-places every picture that appears in each branch.
-//! * **`cxnSp` text is not read**: zero corpus occurrences. Likewise
-//!   `a:hlinkClick`/`a:fld` resolution (7 and 4 shapes corpus-wide).
+//! * **`hidden="1"` shapes are skipped.** These are almost always legacy
+//!   form controls (`name="Check Box N"`, zero-extent, stacked option labels
+//!   like `YES`/`NO`/`UNKNOWN`) that Excel itself never renders.
+//! * **`mc:Fallback` subtrees are skipped** — the same prefer-Choice rule
+//!   used by the PPTX shape walk. Reading both branches double-places any
+//!   object that appears in each.
+//! * **`cxnSp` text and `a:hlinkClick`/`a:fld` resolution are not read** —
+//!   both are schema-legal but effectively unused in practice.
 //!
-//! Census-driven decisions for pictures:
+//! Decisions for pictures:
 //!
 //! * **All three anchor kinds are read.** `oneCellAnchor` is the majority
-//!   (19,228 against 9,157 `twoCellAnchor`), so treating the two-cell form as
-//!   canonical would misplace most of the population. `absoluteAnchor` holds
-//!   exactly 1 corpus picture but costs ~10 lines.
-//! * **A grouped picture inherits its group's anchor.** 161 of 2,276 pictures
-//!   sit inside `xdr:grpSp`, whose children carry their own EMU offsets
-//!   relative to a child coordinate space. Composing those matrices is the
-//!   PPTX group-geometry problem again; here every picture found anywhere in
-//!   an anchor's subtree is placed at the anchor's box. The bytes are exact,
-//!   the box is the group's — an approximation the geometry pass records.
-//! * **`r:embed` resolves against the drawing part's own rels** — the same
-//!   per-part scoping rule every other OOXML reader in this crate has had to
-//!   learn. When a `blip` also carries an SVG extension, `r:embed` is the
-//!   raster fallback and is what we take; an SVG-only blip has no `r:embed`
-//!   and yields nothing, matching the PPTX figure policy.
+//!   form in practice, so treating the two-cell form as canonical would
+//!   misplace most pictures. `absoluteAnchor` is rare but cheap to support.
+//! * **A grouped picture inherits its group's anchor.** A picture inside
+//!   `xdr:grpSp` carries its own EMU offset relative to a child coordinate
+//!   space. Composing those matrices is the same problem as PPTX group
+//!   geometry; every picture found anywhere in an anchor's subtree is placed
+//!   at the anchor's box by default, refined to a fraction of that box when
+//!   [`compose_grouped_pics`] can resolve the group's transform.
+//! * **`r:embed` resolves against the drawing part's own rels** — the
+//!   per-part scoping rule every OOXML reader in this crate follows. When a
+//!   `blip` also carries an SVG extension, `r:embed` is the raster fallback
+//!   and is what we take; an SVG-only blip has no `r:embed` and yields
+//!   nothing, matching the PPTX figure policy.
 
 use std::sync::Arc;
 
@@ -195,14 +188,13 @@ struct OpenShape {
 
 /// Flat text rescue for OMML equation bodies.
 ///
-/// 56 corpus shapes (6 workbooks, engineering calculators) hold their text
-/// in `a14:m` math — `m:oMath` trees whose glyphs sit in `m:t` runs the
-/// structured text model does not know, so the body lowers to empty. This
-/// collects every `t`-element's text in document order into one run per
-/// `a:p` (`m:t` and `a:t` both strip to `t` under `local_name`, which is
-/// exactly the reading the shape-text census counted). Math *structure* —
-/// fractions, sub/superscripts — flattens to its glyph sequence; recorded,
-/// not hidden. Returns `None` when no text is found at all.
+/// A shape may hold its text in `a14:m` math — `m:oMath` trees whose glyphs
+/// sit in `m:t` runs the structured text model does not know, so the body
+/// lowers to empty. This collects every `t`-element's text in document order
+/// into one run per `a:p` (`m:t` and `a:t` both strip to `t` under
+/// `local_name`). Math *structure* — fractions, sub/superscripts — flattens
+/// to its glyph sequence; recorded, not hidden. Returns `None` when no text
+/// is found at all.
 fn flat_math_body(txbody: &[u8]) -> Option<crate::pptx::text::TextBody> {
     use crate::model::{Inline, RunElement, TextRun};
     use crate::pptx::text::{TextBody, TextParagraph};
@@ -316,10 +308,9 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
                 let name = local_name(qname.as_ref());
                 let empty = matches!(event, Event::Empty(_));
                 match name {
-                    // MCE: keep the Choice branch, skip the Fallback — the
-                    // PPTX shape walk's rule. Reading both (what this parser
-                    // did before it knew about MCE) double-places any object
-                    // that appears in each branch.
+                    // MCE: keep the Choice branch, skip the Fallback.
+                    // Reading both double-places any object that appears in
+                    // each branch.
                     b"Fallback" if !empty => {
                         let end = e.to_end().into_owned();
                         reader
@@ -479,7 +470,7 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
                             if let Some(rel_id) = rel_id {
                                 out.pics.push(RawPic {
                                     anchor,
-                                    name: name.clone(),
+                                    name,
                                     rel_id,
                                     frac: None,
                                     anchor_idx: anchors.len(),
@@ -549,13 +540,12 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
 /// is exactly the anchor's ink slice. Parsing that one slice through the
 /// shared shape tree and running [`crate::pptx::apply_slide_geometry`] yields
 /// each descendant pic's box in the drawing's EMU space — the same
-/// composition, over the same root bounding box, that `AnchorMap` places the
-/// group's ink with, so pictures and their group's fills land in one frame by
-/// construction. The corpus says the chain is complete (every group declares
-/// `chOff`/`chExt`, every grouped pic an `off`/`ext`, zero rotations); the
-/// fail-open path — parse failure, count or `r:embed` sequence disagreement
-/// between this tree and the streaming walk, a degenerate root box — keeps
-/// the group-box approximation that was previously the rule.
+/// composition, over the same root bounding box, that places the group's ink,
+/// so pictures and their group's fills land in one frame by construction.
+/// The fail-open path — parse failure, a count or `r:embed` sequence
+/// disagreement between this tree and the streaming walk, a degenerate root
+/// box — falls back to the group-box approximation (the anchor's box, not a
+/// fraction of it).
 fn compose_grouped_pics(out: &mut DrawingContent) {
     let mut composed: Vec<(usize, [f64; 4])> = Vec::new();
     for ink in &out.ink {
@@ -848,7 +838,7 @@ mod tests {
         assert!((fh - 0.5).abs() < 1e-9, "fh {fh}");
     }
 
-    /// Depth 2 is the corpus majority (111 of 212): both child spaces fold.
+    /// Nested groups: both child spaces fold.
     #[test]
     fn nested_groups_compose_through_both_child_spaces() {
         let xml = format!(
@@ -938,8 +928,7 @@ mod tests {
         );
     }
 
-    /// A chart frame is not a picture and yields nothing — the census's 386
-    /// `graphicFrame`s are recorded as out of scope, not silently absorbed.
+    /// A chart frame is not a picture and yields nothing.
     #[test]
     fn a_chart_frame_yields_no_picture() {
         let xml = format!(
@@ -997,7 +986,7 @@ second line"
     }
 
     /// `hidden="1"` marks a legacy form control (checkbox option labels and
-    /// friends) that Excel never renders — 1,004 of them in the corpus.
+    /// friends) that Excel never renders.
     #[test]
     fn a_hidden_shape_is_a_form_control_and_is_skipped() {
         let xml = format!(
@@ -1011,7 +1000,7 @@ second line"
         assert!(parse_drawing(xml.as_bytes()).unwrap().shapes.is_empty());
     }
 
-    /// A whitespace-only body carries no content; the census counted 4,454.
+    /// A whitespace-only body carries no content.
     #[test]
     fn a_whitespace_only_body_is_skipped() {
         let xml = format!(
@@ -1053,8 +1042,7 @@ second line"
     }
 
     /// MCE: the Choice branch wins, the Fallback is skipped — an object in
-    /// both branches yields ONE placement, not two. This was a live bug for
-    /// pictures (~12 phantom placements corpus-wide) before shapes arrived.
+    /// both branches yields ONE placement, not two.
     #[test]
     fn mce_prefers_choice_and_never_reads_both_branches() {
         let xml = format!(
@@ -1094,8 +1082,8 @@ second line"
         assert_eq!(content.shapes[0].body.plain_text(), "𝑛=𝑑1/6");
     }
 
-    /// The census's zero: a connector's text (schema-legal, corpus-absent)
-    /// is not read, and its presence does not disturb a sibling text shape.
+    /// A connector's text is schema-legal but not read here, and its
+    /// presence does not disturb a sibling text shape.
     #[test]
     fn a_connector_yields_no_text_shape() {
         let xml = format!(
@@ -1112,9 +1100,9 @@ second line"
 
     use crate::pptx::shapes::ShapeKind;
 
-    /// A textless filled rectangle — the population the text channel
-    /// rightly drops (6,359 on the corpus) — survives on the ink channel,
-    /// fill and geometry intact, under the anchor it was placed by.
+    /// A textless filled rectangle — dropped by the text channel — survives
+    /// on the ink channel, fill and geometry intact, under the anchor it was
+    /// placed by.
     #[test]
     fn a_textless_filled_shape_reaches_ink_but_not_shapes() {
         let xml = format!(

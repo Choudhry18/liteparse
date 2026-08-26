@@ -335,10 +335,8 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         // A group taller than a whole page never fits anywhere. Advancing
         // unconditionally then abandons `current_slice` while it is still
         // empty — the caller turns that empty leading slice into a page push,
-        // so a table starting at the top of a page emitted a **blank page**
-        // and the group overflowed the next one just the same (the warning
-        // below fired either way). Same shape as the E4c floating-table
-        // spillover: acting on a condition the action cannot change.
+        // so a table starting at the top of a page would emit a blank page and
+        // overflow the next one just the same. Only advance when it gains room.
         //
         // Comparing against the *post-header* room is what makes this exact —
         // repeating headers can leave a fresh page with less usable space than
@@ -842,9 +840,7 @@ mod tests {
     ///
     /// The row declares no `gridAfter`: layout derives the right edge from
     /// `grid_before` plus the cells' spans, so the trailing gap is a
-    /// *consequence* of the cells, not a separate input. (This test previously
-    /// set a `grid_after` field that no layout code read, so it asserted the
-    /// same positions whether the field was right, wrong, or absent.)
+    /// consequence of the cells, not a separate input.
     #[test]
     fn row_shorter_than_the_grid_leaves_the_trailing_columns_empty() {
         // Shaded cells so the emitted rects expose each cell's *width* — text
@@ -911,10 +907,7 @@ mod tests {
     /// right edge as well. Distinct widths identify which border was applied —
     /// `left`/`right` are 4pt, `inside_v` is 1pt — so a single 4pt rect
     /// anywhere in the output means an outer border leaked onto an interior
-    /// edge.
-    ///
-    /// The right-edge half of this used to be spelled `grid_after: 1` on a
-    /// field no layout code read; it is the cells' spans that place that edge.
+    /// edge. The right edge is placed by the cells' spans, not a `gridAfter`.
     #[test]
     fn row_inset_from_both_edges_uses_inside_v_on_both_sides() {
         let rows = vec![TableRowInput {
@@ -1866,11 +1859,10 @@ mod tests {
 
     /// A `Restart` cell with no `Continue` row under it is an ordinary cell.
     ///
-    /// It used to fall through *both* height paths: `measure_table_rows`
-    /// skipped every merged cell (deferring to the span calculation) and
-    /// `expand_rows_for_vmerge` returned early because the "span" is one row.
-    /// The row therefore got zero height while still emitting its content, so
-    /// whatever followed the table drew on top of it.
+    /// Both height paths skip a genuine merged cell (`measure_table_rows` defers
+    /// to the span calculation, `expand_rows_for_vmerge` returns early for a
+    /// one-row "span"), so a lone restart must be sized by the normal path or it
+    /// gets zero height while still emitting content.
     ///
     /// Asserted against the unmerged control rather than a literal, so the
     /// test states the actual rule — a lone restart behaves like no merge at
@@ -1941,7 +1933,7 @@ mod tests {
     /// the section layer turns into a blank page.
     ///
     /// `available_height == page_height` models the table starting at the top
-    /// of a page, which is exactly when the old code emitted the blank.
+    /// of a page, the case where advancing would emit the blank.
     #[test]
     fn oversized_group_at_page_top_does_not_emit_an_empty_leading_slice() {
         let mut row = tall_row(20); // ≈ 280pt
@@ -2191,9 +2183,8 @@ mod tests {
     /// lost its bottom gap depending only on whether it fitted on one page.
     ///
     /// Asserted against absolute values and against the **monolithic** path,
-    /// which is a genuinely separate code path. Comparing one paginated layout
-    /// to another cannot see this: a mutation that drops the gap drops it from
-    /// both sides and the comparison still holds.
+    /// which is a genuinely separate code path — comparing one paginated layout
+    /// to another would drop the gap from both sides and miss the regression.
     ///
     /// Empty cells make the arithmetic exact — each row's whole height is its
     /// own reserved leading gap (see

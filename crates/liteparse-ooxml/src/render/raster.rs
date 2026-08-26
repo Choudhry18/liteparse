@@ -1,14 +1,13 @@
 //! Rasterize [`LayoutedPage`] draw commands to RGBA bitmaps — tiny-skia +
 //! skrifa, no Skia proper.
 //!
-//! liteparse addition (no upstream equivalent; upstream rasterizes through
-//! `painter.rs` + Skia, which the C′ vendor dropped). This module is the
-//! "rasterise from layout draw-commands directly" option from
-//! `NATIVE_OFFICE_PLAN.md`: because glyph placement re-derives pen advances
-//! from the same [`FontRegistry`]/skrifa faces the layout measured with, the
-//! raster is in the *same coordinate space* as the native `TextItem` geometry
-//! by construction — which is what makes highlight-on-screenshot safe, the
-//! thing the LibreOffice screenshot path could never guarantee.
+//! liteparse addition with no upstream equivalent (upstream rasterizes
+//! through `painter.rs` + Skia, which this vendor drops). Because glyph
+//! placement re-derives pen advances from the same [`FontRegistry`]/skrifa
+//! faces the layout measured with, the raster is in the *same coordinate
+//! space* as the native `TextItem` geometry by construction — which is what
+//! makes highlight-on-screenshot safe, something a rendered-image screenshot
+//! path could never guarantee.
 //!
 //! Fidelity tiers, mirroring the vendored painter's own tiering:
 //! - **Rendered faithfully**: text (monochrome outlines), underlines, lines,
@@ -72,15 +71,10 @@ pub struct RasterPage {
 ///
 /// A DOCX or PPTX page is bounded by its own page setup and never comes near
 /// this. A *spreadsheet* page is not: the XLSX geometry pass deliberately
-/// never splits width (an unclipped row is the native path's whole advantage
-/// over LibreOffice's column-clipping), so page width is whatever the sheet
-/// writes. The paint census measured that tail across 103,014 pages — 99.4%
-/// land under 32 MP, 594 are above it, and the worst single page is 861,149 pt
-/// wide: 2,960 MP, ≈12 GB of RGBA. Without a clamp those pages do not render
-/// slowly, they fail to allocate.
-///
-/// The bound is deliberately at the census's own 32 MP bucket boundary so the
-/// clamp is inert for 99.4% of pages rather than a routine downscale.
+/// never splits width (an unclipped row keeps the native path's advantage
+/// over column-clipped conversion), so page width is whatever the sheet
+/// writes, and an extreme sheet can reach many gigabytes of RGBA. Without a
+/// clamp those pages do not render slowly, they fail to allocate.
 pub const MAX_PAGE_PIXELS: u64 = 32_000_000;
 
 /// The scale [`rasterize_page`] will actually use for a `page_w_pt` ×
@@ -173,9 +167,8 @@ pub fn rasterize_page(
     //   < Float (images that declared themselves above the flow)
     //
     // The last layer is the exception a producer can ask for, and it exists
-    // because for one format the approximation below is not rare but the
-    // norm: an XLSX picture floats over the grid *and* its values, and a
-    // corpus census found painted glyphs on 29.2% of placements. Everything
+    // because for one format covering the flow is not rare but the norm: an
+    // XLSX picture routinely floats over the grid *and* its values. Everything
     // a DOCX layout emits stays `float: false` and keeps the flow order.
     //
     // Cost of the approximation: a deliberately in-front float that does not
@@ -1113,8 +1106,8 @@ mod tests {
     }
 
     /// The clamp must be inert for every page that already fits, or it is a
-    /// silent quality regression on 99.4% of the corpus rather than a
-    /// backstop for the 0.6%. Letter at 150 DPI is 1.6 MP.
+    /// silent quality regression on ordinary pages rather than a backstop for
+    /// extreme ones. Letter at 150 DPI is 1.6 MP.
     #[test]
     fn a_page_that_fits_keeps_the_scale_it_asked_for() {
         let requested = 150.0 / 72.0;
@@ -1124,11 +1117,11 @@ mod tests {
         assert_eq!(effective_scale(612.0, 792.0, edge), edge);
     }
 
-    /// The census's worst page: `A1:XFD131` written out, 861,149 pt wide.
-    /// At 150 DPI that is 7.3e9 px / ≈12 GB of RGBA, so the unclamped
-    /// allocation is the failure mode, not the render time.
+    /// A full-width unclipped sheet row can be extremely wide; at 150 DPI an
+    /// 861,149pt-wide page is ≈12 GB of RGBA, so the unclamped allocation is
+    /// the failure mode, not the render time.
     #[test]
-    fn the_widest_sheet_in_the_corpus_is_clamped_under_the_ceiling() {
+    fn an_extremely_wide_sheet_is_clamped_under_the_ceiling() {
         let (w, h) = (861_149.0_f32, 1_965.0_f32);
         let scale = effective_scale(w, h, 150.0 / 72.0);
         assert!(scale < 150.0 / 72.0, "a 2,960 MP page must be clamped");

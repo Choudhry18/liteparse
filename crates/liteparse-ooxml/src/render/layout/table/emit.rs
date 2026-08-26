@@ -109,10 +109,9 @@ fn emit_one_row(
     let row_top = *cursor_y + leading;
     let row_height = mr.height - leading;
     for (cell_ci, (entry, cell_input)) in mr.entries.iter().zip(row.cells.iter()).enumerate() {
-        // §17.4.85: the merged span, used below for vAlign and here for
-        // shading. Hoisted above the shading so both read the same height —
-        // shading used `row_height` while vAlign used the span, so a shaded
-        // merged cell was coloured across its first row only.
+        // §17.4.85: the merged span height, used below for both vAlign and
+        // shading — the two must read the same height or a shaded merged cell
+        // is coloured across its first row only.
         let effective_h = if cell_input.vertical_merge == Some(VerticalMergeState::Restart) {
             vmerge_ctx
                 .map(|(m, rs, row_idx)| merged_span_height(m, rs, row_idx, entry.grid_col))
@@ -138,12 +137,10 @@ fn emit_one_row(
 
         // §17.4.38: restore the top border when this row starts a slice and the
         // resolved top was removed by conflict resolution or adjacent-table
-        // collapse. An edge the author set to `nil` must NOT be restored — they
-        // asked for no border — and `CellEdge` already says which is which, so
-        // this reads the resolved edge instead of re-deriving intent from
-        // `cell_input`. That also fixes the `none` case for free: `none` now
-        // resolves to `Absent` and is restorable, where the old re-derivation
-        // lumped it in with `nil` and left a continuation slice with no top.
+        // collapse. An edge the author set to `nil` must NOT be restored (they
+        // asked for no border), so this reads the resolved `CellEdge` — which
+        // already distinguishes `Absent` (restorable, includes `none`) from
+        // `Suppressed` — instead of re-deriving intent from `cell_input`.
         let cell_top = match mr.borders[cell_ci].top {
             CellEdge::Absent => top_border_override.into(),
             resolved => resolved,
@@ -450,7 +447,7 @@ mod tests {
         );
     }
 
-    // ── Buffer layering and the nil/override interaction (E5b#3) ─────────
+    // ── Buffer layering and the nil/override interaction ─────────────────
 
     const RED: RgbColor = RgbColor { r: 255, g: 0, b: 0 };
 

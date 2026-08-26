@@ -260,10 +260,9 @@ pub fn parse(data: &[u8]) -> Result<Document> {
 ///   reference that key.
 /// * **Hyperlink rels** — `External(rId)` targets are rewritten to
 ///   `External(URL)` using *this part's* relationships, not the
-///   document's. Pre-fix the hyperlink resolution pass used
-///   `doc_rels` for every part, which silently re-targeted any
-///   header/footer/note hyperlink whose rId happened to mean
-///   something different in the document's own rels.
+///   document's — an rId in a header/footer/note means nothing in the
+///   document's own rels, so resolving against `doc_rels` would
+///   silently re-target the link.
 ///
 /// Other relationship types (font tables, OLE objects, custom XML, …)
 /// are not modeled in the block tree yet and are skipped.

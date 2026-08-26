@@ -8,7 +8,7 @@
 //! `<a:off>`/`<a:ext>` in EMU against a fixed `<p:sldSz>`. So the hard part
 //! here is not layout, it is the placeholder cascade — a shape that omits
 //! `<a:xfrm>` inherits position and size from its layout, which inherits
-//! from its master, and the match rule differs at each rung.
+//! from its master, and the match rule differs at each level of that chain.
 
 pub mod cascade;
 pub mod geometry;
@@ -20,7 +20,7 @@ pub mod textcascade;
 
 pub use cascade::{
     BackgroundSource, CascadeStats, MatchRule, PlaceholderGeometry, apply_inherited_geometry,
-    apply_slide, background_fill, resolve_background,
+    background_fill, resolve_background,
 };
 pub use geometry::{GeometryStats, SlideRect, apply_slide_geometry};
 pub use media::MediaCache;

@@ -7,65 +7,47 @@
 //!
 //! [`pptx::shapes`]: crate::pptx::shapes
 //!
-//! ## The match rule is not the same at each rung
+//! ## The match rule is not the same at each level of the chain
 //!
-//! This is the one thing to get right, and the corpus is unambiguous about it
-//! (census over all 45 decks, 1,804 shapes declaring no `xfrm`):
+//! - **Slide → layout**: match `@idx`.
+//! - **Layout → master** and **notes slide → notes master**: match a
+//!   collapsed `@type` (see [`PlaceholderKind::collapsed_for_master`]).
 //!
-//! | rung | rule | result |
-//! |---|---|---|
-//! | slide → layout | **`@idx`** | **737 / 737** matched |
-//! | layout → master | **collapsed `@type`** | 192 / 207 matched |
-//! | notes slide → notes master | **collapsed `@type`** | 800 / 860 matched |
-//!
-//! `@idx` at the first rung is not merely sufficient, it is *right where type
-//! would be wrong*: on 2 of the 737 the slide declares a bare `<p:ph idx="0"/>`
+//! `@idx` at the slide→layout level is not merely sufficient, it is *right
+//! where type would be wrong*: a slide can declare a bare `<p:ph idx="0"/>`
 //! — which materializes as `body` per §19.7.10's default — while the layout
 //! placeholder it points at is a `title`. The author's shape *is* the title;
-//! matching on type would have missed it or, worse, matched some other body
-//! placeholder. **Match on idx and do not second-guess it with type.**
+//! matching on type would miss it or match some other body placeholder
+//! instead. **Match on idx and do not second-guess it with type.**
 //!
-//! At the second and third rungs `@idx` is not usable — a master holds one
-//! `body` placeholder for every body-ish layout placeholder, and their `idx`
-//! values are unrelated — so the type is collapsed through
+//! At the master level `@idx` is not usable — a master holds one `body`
+//! placeholder for every body-ish layout placeholder, and their `idx` values
+//! are unrelated — so the type is collapsed through
 //! [`PlaceholderKind::collapsed_for_master`] first.
 //!
-//! ## The misses are properties of the documents, not of the rule
+//! An unmatched placeholder (e.g. a layout `dt`/`ftr`/`sldNum` chrome
+//! placeholder whose master declares no counterpart, or an empty notes
+//! master `spTree`) has nothing to inherit from. The cascade leaves it
+//! `None` rather than inventing a rectangle — an invented value would be
+//! silent corruption.
 //!
-//! Both were chased rather than assumed, because a match rate below 1.0 is
-//! exactly how a wrong rule would look:
+//! ## Three simplifications this module relies on
 //!
-//! - **15 layout misses** are all `p:hf`-family placeholders — `dt`, `ftr`,
-//!   `sldNum` (§19.3.1.28) — on layouts whose master declares no counterpart
-//!   at all. A master that turns those chrome elements off simply has no such
-//!   shape, so there is nothing to inherit from and no rectangle we could
-//!   invent that would not be a guess.
-//! - **60 notes misses** are all from one deck whose `notesMaster1.xml` has a
-//!   literally empty `spTree` — no shapes of any kind. Same conclusion.
-//!
-//! So the cascade is a *total* function over everything the file gives it
-//! something to resolve against, and the residue is honest `None` rather than
-//! a guessed rectangle. That is the same rule the rest of this vendor follows:
-//! an invented value is silent corruption.
-//!
-//! ## Three simplifications, each measured rather than assumed
-//!
-//! - **Transforms are never partial.** Across every layout and master
-//!   placeholder on the corpus, `<a:off>` and `<a:ext>` either both appear or
-//!   neither does — 0 counterexamples. So inheritance is whole-transform, and
-//!   the per-property walk (`left`/`top`/`width`/`height` each resolving
-//!   independently, as python-pptx does it) buys nothing here.
-//! - **No placeholder is ever nested inside a `p:grpSp`** — 0 across all 2,980
-//!   corpus shape trees, on both sides of every rung. That matters more than it
-//!   looks: a nested placeholder's transform lives in its group's child
-//!   coordinate space, so inheriting one into or out of a group would silently
-//!   mix coordinate spaces. This module therefore only ever reads and writes
-//!   top-level shapes, and a nested placeholder is left untouched rather than
-//!   resolved into the wrong space.
-//! - **Rotation must ride along.** 195 inheritable placeholder transforms carry
-//!   a non-`None` `@rot`, so dropping rotation on inheritance would silently
-//!   un-rotate them. Whole-transform inheritance gets this for free; a
-//!   hand-rolled offset/extent copy would not have.
+//! - **Transforms are never partial.** A layout or master placeholder's
+//!   `<a:off>` and `<a:ext>` either both appear or neither does. So
+//!   inheritance is whole-transform, not a per-property walk
+//!   (`left`/`top`/`width`/`height` each resolving independently, as
+//!   python-pptx does it).
+//! - **No placeholder is ever nested inside a `p:grpSp`.** A nested
+//!   placeholder's transform would live in its group's child coordinate
+//!   space, so inheriting one into or out of a group would silently mix
+//!   coordinate spaces. This module therefore only ever reads and writes
+//!   top-level shapes, and a nested placeholder (should one ever occur) is
+//!   left untouched rather than resolved into the wrong space.
+//! - **Rotation must ride along.** An inheritable placeholder transform can
+//!   carry a non-`None` `@rot`, so dropping rotation on inheritance would
+//!   silently un-rotate it. Whole-transform inheritance gets this for free;
+//!   a hand-rolled offset/extent copy would not.
 
 use std::collections::HashMap;
 
@@ -79,8 +61,7 @@ use super::shapes::{Background, Placeholder, PlaceholderKind, Shape};
 
 /// How a placeholder finds its counterpart on the part above it.
 ///
-/// The two rungs genuinely differ; see the module docs for the measurement
-/// that establishes each.
+/// The rule genuinely differs by level; see the module docs for why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchRule {
     /// Slide → layout, and notes slide → its own layout if one ever exists:
@@ -96,7 +77,7 @@ pub enum MatchRule {
 ///
 /// Build the master's first and pass it to the layout's, so that a slide
 /// placeholder pointing at a layout placeholder that itself declares no
-/// `xfrm` still resolves in one lookup. Both rungs are pre-flattened here
+/// `xfrm` still resolves in one lookup. Both levels are pre-flattened here
 /// rather than walked per shape.
 #[derive(Clone, Debug, Default)]
 pub struct PlaceholderGeometry {
@@ -106,10 +87,9 @@ pub struct PlaceholderGeometry {
 
 impl PlaceholderGeometry {
     /// Index a master or notes master — the top of the chain, with nothing
-    /// above it to inherit from.
-    ///
-    /// On the corpus **no master placeholder lacks an `xfrm`**, so the chain
-    /// always terminates in a real rectangle rather than running off the top.
+    /// above it to inherit from. A master placeholder is expected to always
+    /// declare its own `xfrm`, so the chain terminates in a real rectangle
+    /// rather than running off the top.
     pub fn from_master(shapes: &[Shape]) -> Self {
         Self::index(shapes, None, MatchRule::CollapsedKind)
     }
@@ -134,9 +114,8 @@ impl PlaceholderGeometry {
         }
     }
 
-    /// True when this part supplies no inheritable geometry at all — an empty
-    /// `spTree`, or one with no placeholders. Real: one corpus notes master is
-    /// exactly this.
+    /// True when this part supplies no inheritable geometry at all — an
+    /// empty `spTree`, or one with no placeholders.
     pub fn is_empty(&self) -> bool {
         self.by_idx.is_empty() && self.by_kind.is_empty()
     }
@@ -144,8 +123,8 @@ impl PlaceholderGeometry {
     fn index(shapes: &[Shape], parent: Option<&PlaceholderGeometry>, rule: MatchRule) -> Self {
         let mut out = Self::default();
         // Top-level only, deliberately: see the module docs on coordinate
-        // spaces. Nested placeholders do not occur on the corpus, and if one
-        // ever does, ignoring it is the safe failure.
+        // spaces. If a nested placeholder ever occurs, ignoring it is the
+        // safe failure.
         for shape in shapes {
             let Some(ph) = &shape.placeholder else {
                 continue;
@@ -156,9 +135,10 @@ impl PlaceholderGeometry {
             else {
                 continue;
             };
-            // First in document order wins. 4 corpus layouts declare the same
-            // `@idx` twice; PowerPoint's own resolution is first-wins, and more
-            // to the point a stable rule beats a HashMap-order coin flip.
+            // First in document order wins, matching PowerPoint's own
+            // resolution when a layout declares the same `@idx` twice — and
+            // more to the point, a stable rule beats a HashMap-order coin
+            // flip.
             out.by_idx.entry(ph.idx).or_insert(transform);
             out.by_kind
                 .entry(ph.kind.collapsed_for_master())
@@ -178,20 +158,10 @@ pub struct CascadeStats {
     /// Placeholders that had no `xfrm` and found no counterpart. Stays `None`
     /// rather than becoming a guessed rectangle.
     pub unresolved: usize,
-    /// Non-placeholder shapes with no `xfrm`. The shape walk measured this as
-    /// **0 on the whole corpus** and `pptx_shape_probe` fails the build if it
-    /// ever stops being 0, so a non-zero count here means that invariant broke
-    /// and the cascade is not the thing to fix.
+    /// Non-placeholder shapes with no `xfrm`. This should never happen — a
+    /// non-placeholder always carries its own geometry — so a non-zero count
+    /// here points at a bug upstream of this module, not in it.
     pub orphans: usize,
-}
-
-impl CascadeStats {
-    fn absorb(&mut self, other: CascadeStats) {
-        self.declared += other.declared;
-        self.inherited += other.inherited;
-        self.unresolved += other.unresolved;
-        self.orphans += other.orphans;
-    }
 }
 
 /// Fill in `transform` for every top-level placeholder in `shapes` that
@@ -231,28 +201,6 @@ pub fn apply_inherited_geometry(
     stats
 }
 
-/// Resolve a slide's shapes against its layout and master in one call, and its
-/// notes' shapes against the notes master.
-///
-/// The indexes are the caller's to cache: layouts and masters repeat across
-/// every slide in a deck, so rebuilding them per slide is the one obvious way
-/// to make this quadratic. Hence the primitives above are public and this is a
-/// convenience over already-built indexes rather than over raw parts.
-pub fn apply_slide(
-    slide_shapes: &mut [Shape],
-    layout: Option<&PlaceholderGeometry>,
-    notes_shapes: &mut [Shape],
-    notes_master: Option<&PlaceholderGeometry>,
-) -> CascadeStats {
-    let mut stats = apply_inherited_geometry(slide_shapes, layout, MatchRule::Idx);
-    stats.absorb(apply_inherited_geometry(
-        notes_shapes,
-        notes_master,
-        MatchRule::CollapsedKind,
-    ));
-    stats
-}
-
 // ── Background (§19.3.1.1) ───────────────────────────────────────────────────
 //
 // A second, much simpler cascade sharing the same slide → layout → master
@@ -260,11 +208,12 @@ pub fn apply_slide(
 // matched to a counterpart — there is at most one per part, so the rule is
 // "the nearest part that declares one wins" and no index is required.
 
-/// Which rung supplied a resolved background.
+/// Which level of the chain supplied a resolved background.
 ///
-/// Carried because it is the probe's gate: the corpus split is **master 1,125
-/// / layout 95 / slide 58**, and a cascade that quietly stopped consulting the
-/// master would still resolve 153 slides and look like it worked.
+/// Carried so a caller (or test) can verify which level actually resolved
+/// rather than trusting that the whole chain was consulted — a cascade that
+/// quietly stopped checking the master could still resolve most slides and
+/// look like it worked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundSource {
     Slide,
@@ -274,14 +223,13 @@ pub enum BackgroundSource {
 
 /// Resolve the background in force on a slide.
 ///
-/// First declaration down the chain wins. Returns `None` only when no part in
-/// the chain declares one — which **does not happen on the corpus** (0 of
-/// 1,278), so a `None` here is a signal worth looking at rather than a normal
-/// outcome.
+/// First declaration down the chain wins. Returns `None` only when no part
+/// in the chain declares one, which should be rare — every slide is
+/// expected to resolve a background through at least its master.
 ///
 /// Note the arguments are each part's *own* background, i.e.
 /// [`SlidePart::background`], not an already-inherited one. Unlike the
-/// geometry rungs there is nothing to pre-flatten: the chain is three
+/// geometry levels there is nothing to pre-flatten: the chain is three
 /// pointers and a slide is resolved in three comparisons.
 ///
 /// [`SlidePart::background`]: crate::pptx::SlidePart::background
@@ -304,19 +252,18 @@ pub fn resolve_background<'a>(
 /// `bgRef` ends up in [`resolve_fill`] and silently comes back `None`.
 ///
 /// `theme` must be the theme of *this slide's own master*
-/// ([`PresentationPackage::theme_for`]), not the deck's first. 31 corpus
-/// slides resolve a `bgRef` under a non-first master, and the deck-wide theme
-/// gives them a real fill from the wrong matrix.
+/// ([`PresentationPackage::theme_for`]), not the deck's first — a slide
+/// whose master is not the deck's first would otherwise resolve a `bgRef`
+/// against the wrong theme's style matrix.
 ///
 /// [`PresentationPackage::theme_for`]: crate::pptx::PresentationPackage::theme_for
 /// `color_map` is the slide's effective §19.3.1.6 map, without which a
 /// `<a:schemeClr val="bg1"/>` backdrop under a swapped master resolves to the
 /// wrong end of the theme's light/dark pair.
 /// `media` must be the [`PartMedia`] of the part the background was resolved
-/// *from* — the [`BackgroundSource`] rung, which is the slide's own on 58
-/// corpus slides, its layout's on 95 and its master's on 1,125. Passing the
-/// slide's own table for a master's photograph is the inherited-`rId1` trap:
-/// a real image, from the wrong relationship.
+/// *from* — the [`BackgroundSource`] level. Passing the slide's own table
+/// for a master's photograph is the inherited-`rId1` trap: a real image,
+/// from the wrong relationship.
 pub fn background_fill(
     bg: &Background,
     theme: Option<&Theme>,
@@ -394,9 +341,9 @@ mod tests {
         assert!(slide[0].transform_inherited);
     }
 
-    /// The 2-of-737 case: a bare `<p:ph/>` materializes as `body` idx 0 but
-    /// points at the layout's *title*. Matching on type instead of idx would
-    /// get this wrong, which is why the rule ignores type entirely.
+    /// A bare `<p:ph/>` materializes as `body` idx 0 but can point at the
+    /// layout's *title*. Matching on type instead of idx would get this
+    /// wrong, which is why the rule ignores type entirely.
     #[test]
     fn idx_match_ignores_a_disagreeing_type() {
         let layout = part(&[
@@ -420,14 +367,14 @@ mod tests {
         );
     }
 
-    /// Two rungs in one lookup: the layout placeholder itself has no `xfrm`.
+    /// Two levels in one lookup: the layout placeholder itself has no `xfrm`.
     #[test]
     fn layout_folds_the_master_in_before_the_slide_asks() {
         let master = part(&[("body", "9", Some(xfrm(700, 800, 70, 80)))]);
         let master_index = PlaceholderGeometry::from_master(&master);
 
         // Layout body placeholder: no xfrm of its own, and idx 1 — unrelated
-        // to the master's idx 9, which is why this rung matches on type.
+        // to the master's idx 9, which is why this level matches on type.
         let layout = part(&[("body", "1", None)]);
         let layout_index = PlaceholderGeometry::from_layout(&layout, Some(&master_index));
 
@@ -439,7 +386,7 @@ mod tests {
     }
 
     /// `subTitle`, `obj`, `tbl` and friends all collapse onto the master's
-    /// single `body`; without the collapse this rung finds nothing.
+    /// single `body`; without the collapse this level finds nothing.
     #[test]
     fn layout_to_master_collapses_body_ish_types() {
         let master = part(&[("body", "1", Some(xfrm(700, 800, 70, 80)))]);
@@ -457,8 +404,9 @@ mod tests {
         }
     }
 
-    /// The 15 `dt`/`ftr` layout placeholders: nothing to match, so nothing is
-    /// invented. A guessed rectangle would be silent corruption.
+    /// A `dt`/`ftr` layout placeholder with no master counterpart: nothing
+    /// to match, so nothing is invented. A guessed rectangle would be
+    /// silent corruption.
     #[test]
     fn an_unmatched_placeholder_stays_none() {
         let master = part(&[("title", "0", Some(xfrm(100, 200, 10, 20)))]);
@@ -504,8 +452,8 @@ mod tests {
         assert!(!slide[0].transform_inherited);
     }
 
-    /// 4 corpus layouts declare `@idx` twice. First in document order wins —
-    /// a stable rule, not a HashMap-iteration coin flip.
+    /// A layout can declare `@idx` twice. First in document order wins — a
+    /// stable rule, not a HashMap-iteration coin flip.
     #[test]
     fn duplicate_idx_resolves_first_in_document_order() {
         let layout = part(&[
@@ -519,8 +467,8 @@ mod tests {
         assert_eq!(offset_of(&slide[0]).unwrap().x, emu(111));
     }
 
-    /// Rotation is part of the inherited rectangle — 195 corpus placeholders
-    /// carry one, and dropping it silently un-rotates them.
+    /// Rotation is part of the inherited rectangle, and dropping it would
+    /// silently un-rotate the shape.
     #[test]
     fn rotation_rides_along_with_the_inherited_transform() {
         let shapes = parse_shape_tree(
@@ -603,23 +551,19 @@ mod tests {
         }
     }
 
-    /// The corpus has no slide without a background, so `None` is a signal
-    /// rather than a normal outcome — but it must still be `None` and not a
-    /// guessed white.
+    /// A background chain with no declaration anywhere must resolve to
+    /// `None`, not a guessed white.
     #[test]
     fn a_chain_declaring_nothing_resolves_to_none() {
         assert!(resolve_background(None, None, None).is_none());
     }
 
-    /// **The regression test for the bug this work was built around.**
-    ///
     /// §19.3.1.3: a `bgRef@idx` of 1001 selects `bgFillStyleLst[0]`, not
-    /// `fillStyleLst[1000]`. Every one of the 440 `bgRef` backgrounds on the
-    /// corpus uses exactly 1001, so routing them at the shape path's
-    /// `fillStyleLst` is not an edge case — it silently blanks 100% of them.
+    /// `fillStyleLst[1000]`. Routing a background `bgRef` at the shape
+    /// path's `fillStyleLst` is a real, common mistake, not an edge case.
     /// The two lists here hold different colours precisely so that a wrong
-    /// route returns a *wrong colour* rather than nothing, and is caught even
-    /// if `fillStyleLst` were long enough to be indexable.
+    /// route returns a *wrong colour* rather than nothing, and is caught
+    /// even if `fillStyleLst` were long enough to be indexable.
     #[test]
     fn bg_ref_1001_reads_the_background_matrix_not_the_shape_matrix() {
         let theme = Theme {
@@ -646,8 +590,8 @@ mod tests {
             0x00BB00
         );
 
-        // Below 1001 the shape matrix is correct — the spec allows both forms
-        // even though the corpus only ever writes the offset one.
+        // Below 1001 the shape matrix is correct — the spec allows both
+        // forms, even though the 1000-offset one is by far the more common.
         let bg3 = Background::Reference(StyleMatrixRef {
             idx: 2,
             color: None,

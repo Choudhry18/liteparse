@@ -33,14 +33,10 @@ pub struct RecordedFootnote {
 /// The display counter and the record of *which* notes were referenced advance
 /// at a single site (the private `record` method), so the footnote body a
 /// caller renders can never disagree with the superscript mark this walk
-/// emitted.
-///
-/// This replaced a design where the counter was advanced by this **recursive**
-/// walk (which descends into hyperlinks, non-substituted fields, MCE
-/// fallbacks, and VML text boxes) while callers re-derived the reference list
-/// from a **flat** scan of the paragraph's top-level inlines. The two walkers
-/// disagreed for any nested reference: its body was never emitted, and when it
-/// preceded a top-level reference the body's number no longer matched the mark.
+/// emitted. This matters because the walk is recursive (it descends into
+/// hyperlinks, non-substituted fields, MCE fallbacks, and VML text boxes), so a
+/// caller that re-derived the reference list from a flat scan of top-level
+/// inlines would miss nested references and misnumber the bodies.
 #[derive(Default, Debug)]
 pub struct FootnoteTracker {
     /// Display number of the most recently emitted reference.
@@ -212,14 +208,49 @@ pub struct FieldContext {
 /// §17.16.4.1: evaluate a parsed field instruction against the current context.
 /// Returns the substituted text for PAGE/NUMPAGES, or None for other fields
 /// or when no context is available.
+///
+/// Evaluation is delegated to the single canonical evaluator
+/// [`crate::field::evaluate`], so numeric-format switches Word honors on these
+/// fields (`\* ROMAN`, `\* Upper`, `\# 0`, `\* MERGEFORMAT`, …) are applied
+/// here too — the previous hand-rolled `to_string()` ignored them.
+///
+/// The match is deliberately restricted to `Page` / `NumPages`: those are the
+/// only instructions whose inputs (the current page number and total page
+/// count) are deterministically known at layout time and fully populated in the
+/// layout-side [`FieldContext`]. Every other instruction is returned as `None`
+/// so it falls back to the cached result Word stored in the document. That
+/// fallback is mandatory for correctness:
+///   * Time/environment-dependent fields (DATE, TIME, CREATEDATE, AUTHOR,
+///     FILENAME, …) must never be recomputed at parse time — output has to stay
+///     deterministic. `field::evaluate` reads these from context members we
+///     leave unset, so it would already yield `Unevaluable`; but gating by
+///     variant makes the guarantee structural rather than relying on empty
+///     context.
+///   * Stateful / self-substituting fields (HYPERLINK, SEQ, IF, SYMBOL, EQ)
+///     evaluate *unconditionally* in `field::evaluate` (they don't depend on
+///     the members we omit), so letting them through would replace their
+///     cached result with a recomputed value — a regression. The variant gate
+///     is what prevents that.
 fn evaluate_field_instruction(
     instruction: &crate::field::FieldInstruction,
     ctx: FieldContext,
 ) -> Option<String> {
     match instruction {
-        crate::field::FieldInstruction::Page { .. } => ctx.page_number.map(|n| n.to_string()),
-        crate::field::FieldInstruction::NumPages { .. } => ctx.num_pages.map(|n| n.to_string()),
-        _ => None,
+        crate::field::FieldInstruction::Page { .. }
+        | crate::field::FieldInstruction::NumPages { .. } => {}
+        _ => return None,
+    }
+    // Only the page-count members are populated; every date/author/bookmark/
+    // merge member stays at its `None`/empty default, so any field reaching a
+    // path that consults them evaluates to `Unevaluable` → cached fallback.
+    let feval_ctx = crate::field::FieldContext {
+        page_number: ctx.page_number.map(|n| n as u32),
+        total_pages: ctx.num_pages.map(|n| n as u32),
+        ..Default::default()
+    };
+    match crate::field::evaluate(instruction, &feval_ctx) {
+        crate::field::FieldValue::Text(s) => Some(s),
+        crate::field::FieldValue::Number(_) | crate::field::FieldValue::Unevaluable => None,
     }
 }
 
@@ -950,11 +981,8 @@ where
                     // primitives inline. Every primitive variant
                     // (`<v:shape>`, `<v:rect>`, `<v:roundrect>`,
                     // `<v:oval>`, …) admits a `<v:textbox>` child via
-                    // `VmlCommonAttrs.text_box`; the previous code
-                    // only walked the `Shape` variant and silently
-                    // dropped text from rect / roundrect / oval text
-                    // boxes (the case footer3.xml of the vorlage doc
-                    // exercised — the gray bar is a `<v:rect>`).
+                    // `VmlCommonAttrs.text_box`, so walk all of them, not
+                    // just `<v:shape>`.
                     //
                     // Does not handle absolute positioning — text
                     // appears inline with the surrounding paragraph.
@@ -1423,6 +1451,117 @@ mod tests {
         }
     }
 
+    // ── §17.16.4.1 field substitution via the canonical evaluator ─────────
+    //
+    // `evaluate_field_instruction` delegates to `crate::field::evaluate` for
+    // PAGE / NUMPAGES only. These cover the byte-A/B'd plain-arabic path, the
+    // format-switch path the old hand-rolled match ignored, and the
+    // deterministic cached-result fallback for time-dependent fields.
+
+    /// Plain ` PAGE ` with a context substitutes the arabic page number
+    /// verbatim (no switch → no reformatting). This is the byte-A/B'd path.
+    #[test]
+    fn simple_page_field_substitutes_plain_arabic() {
+        let inlines = vec![Inline::Field(Field {
+            instruction: crate::field::FieldInstruction::Page {
+                switches: Default::default(),
+            },
+            // Cached result differs from the live page so we can tell which won.
+            content: vec![text_run("999")],
+        })];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext {
+                page_number: Some(7),
+                num_pages: None,
+            },
+        );
+        assert_eq!(frags.len(), 1);
+        if let Fragment::Text { text, .. } = &frags[0] {
+            assert_eq!(&**text, "7", "live PAGE value must win, plain arabic");
+        } else {
+            panic!("expected Text fragment");
+        }
+    }
+
+    /// ` PAGE \* ROMAN ` applies the general-format switch — the win the old
+    /// hand-rolled `to_string()` match could not produce.
+    #[test]
+    fn simple_page_field_applies_roman_switch() {
+        let inlines = vec![Inline::Field(Field {
+            instruction: crate::field::FieldInstruction::Page {
+                switches: crate::field::CommonSwitches {
+                    format: Some("ROMAN".into()),
+                    ..Default::default()
+                },
+            },
+            content: vec![text_run("cached")],
+        })];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext {
+                page_number: Some(7),
+                num_pages: None,
+            },
+        );
+        assert_eq!(frags.len(), 1);
+        if let Fragment::Text { text, .. } = &frags[0] {
+            assert_eq!(&**text, "VII", "PAGE \\* ROMAN must format as roman");
+        } else {
+            panic!("expected Text fragment");
+        }
+    }
+
+    /// A DATE field is time-dependent: it must NOT be evaluated at parse time.
+    /// The variant gate returns None, so the cached result Word stored is what
+    /// renders — keeping output deterministic.
+    #[test]
+    fn date_field_falls_back_to_cached_result() {
+        let inlines = vec![Inline::Field(Field {
+            instruction: crate::field::FieldInstruction::Date {
+                format: None,
+                switches: Default::default(),
+            },
+            // Single unsplittable token so the cached result is one fragment.
+            content: vec![text_run("cachedDate")],
+        })];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            // Page context is present, but that must not tempt DATE evaluation.
+            FieldContext {
+                page_number: Some(3),
+                num_pages: Some(3),
+            },
+        );
+        assert_eq!(frags.len(), 1);
+        if let Fragment::Text { text, .. } = &frags[0] {
+            assert_eq!(
+                &**text, "cachedDate",
+                "DATE must render its cached result, never a recomputed date"
+            );
+        } else {
+            panic!("expected Text fragment");
+        }
+    }
+
     #[test]
     fn multi_word_text_run_splits_into_fragments() {
         let inlines = vec![text_run("hello world foo")];
@@ -1640,7 +1779,7 @@ mod tests {
 
     // ── End-to-end: empty-placeholder result run formatting ──────────────
     //
-    // Mirrors the Fotodokumentation Test header structure:
+    // Header structure:
     //   `Seite ` [Begin → InstrText("PAGE") → Separate → <w:t></w:t> bold → End]
     // The substituted page number must inherit bold from the empty
     // placeholder result run's `<w:rPr>`.

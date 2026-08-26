@@ -373,20 +373,21 @@ pub(super) fn emit_line_commands(
                 _ => Pt::ZERO,
             }
         };
+        let line_has_just_tab = line_has_justification_tab(fragments, line.start, line.end);
         let extra_per_gap = justification_extra_after(
             fragments,
             line,
             line_idx,
             line_placements.len(),
             style.alignment,
-            line_has_justification_tab(fragments, line.start, line.end),
+            line_has_just_tab,
             remaining,
         );
         let distribution_extra = distribution_extra_per_gap(
             fragments,
             line,
             style.alignment,
-            line_has_justification_tab(fragments, line.start, line.end),
+            line_has_just_tab,
             remaining,
         );
 
@@ -823,8 +824,8 @@ pub struct PTabGeometry {
 /// §17.3.1.30: outcome of resolving a position tab against the current pen.
 ///
 /// The `AdvancesToNextLine` case is why this is an ADT rather than a `Pt`: it
-/// is a *line-breaking* outcome, not a coordinate, and collapsing it to
-/// `max(desired, pen)` is exactly the clamp that drew content off the page.
+/// is a *line-breaking* outcome, not a coordinate. Collapsing it to
+/// `max(desired, pen)` clamps content off the page instead of wrapping it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PTabPlacement {
     /// The alignment point is at or ahead of the pen; content starts here.
@@ -1084,8 +1085,7 @@ fn decimal_anchor(
 /// at the tab, i.e. the `<w:rPr>` of the run carrying the `<w:tab/>` or
 /// `<w:ptab/>`. Bundling the three fields keeps them travelling together: the
 /// glyph, the font it is measured *and* drawn in, and its colour are one
-/// decision, and splitting them is how the hardcoded-Times-New-Roman default
-/// survived as long as it did.
+/// decision.
 pub(super) struct LeaderStyle<'a> {
     pub leader: crate::model::TabLeader,
     pub font: &'a super::super::fragment::FontProps,
@@ -1166,20 +1166,17 @@ pub(super) fn emit_tab_leader(
     });
 }
 
-/// §17.3.1.33: resolve the effective line height from the natural height
-/// and the line spacing rule.
+/// §17.3.1.33 line height for one line, then §20.1.2.1.18 `@lnSpcReduction`.
 ///
 /// For Auto mode, the multiplier applies only to text metrics — inline
 /// images use their natural height without scaling. The final line height
 /// is `max(text_height * multiplier, total_height)`.
-/// §17.3.1.33 line height for one line, then §20.1.2.1.18 `@lnSpcReduction`.
 ///
 /// `auto_fit` is a parameter rather than something callers apply afterwards
 /// because four separate places resolve a line height — fitting, emission,
 /// the border box and the empty-paragraph path — and they must agree to the
-/// point. Owning the reduction here is what makes forgetting it impossible;
-/// applying it *after* the match is what lets it cross the `Auto` floor below,
-/// which is the whole point of the attribute (see
+/// point. Applying the reduction here (not after the match) is what lets it
+/// cross the `Auto` floor below, which is the point of the attribute (see
 /// [`ShapeAutoFit::scale_line_height`](crate::render::layout::ShapeAutoFit::scale_line_height)).
 pub(super) fn resolve_line_height(
     natural: Pt,

@@ -16,9 +16,8 @@ use crate::render::resolve::shape_geometry::SubPath;
 ///
 /// `node_id` is assigned at **layout** time and carried here rather than
 /// recomputed at paint. The painter and the structure-tree builder both walk
-/// the same command stream, and two counters that agree only by argument is
-/// exactly the shape that produced this codebase's MCE double-render and then
-/// the missing render after it. One field, read twice.
+/// the same command stream, so a single assigned id read by both cannot drift
+/// the way two independently-recomputed counters would.
 #[derive(Debug, Clone)]
 pub struct OutlineHeading {
     /// PDF structure node ID. Unique per document and **1-based**:
@@ -163,10 +162,7 @@ pub enum DrawCommand {
         /// is what keeps a run of text over a cell-shading image readable.
         ///
         /// `true` for an XLSX floating picture, where the relation inverts:
-        /// Excel draws a picture on top of the grid *and* its values, and a
-        /// corpus census put painted glyphs on 618 of 2,114 placements
-        /// (29.2%, 245 workbooks) — a banner with the sheet's text bleeding
-        /// through it, not a rare artifact.
+        /// Excel draws a picture on top of the grid *and* its cell values.
         float: bool,
     },
     /// One emoji grapheme cluster placed at `rect`. The painter rasterizes

@@ -5,12 +5,8 @@
 //! already composed group coordinate spaces into `Shape::slide_rect`. That
 //! changes the shape of the problem: DOCX has no coordinates so its emitter
 //! walks the document in source order, while here **source order is z-order and
-//! disagrees with reading order on 48.9% of slides** (measured by
-//! `pptx_emit_census`). Ordering is therefore a decision this module makes, not
-//! one the file makes for it.
-//!
-//! The design below follows that census throughout; where a rule looks
-//! arbitrary it is usually a corpus measurement, and the comment says which.
+//! disagrees with reading order** on a large fraction of slides. Ordering is
+//! therefore a decision this module makes, not one the file makes for it.
 
 use liteparse_ooxml::model::{ColorMap, Inline, RunElement};
 use liteparse_ooxml::pptx::{
@@ -46,10 +42,9 @@ pub struct EmitOptions {
     /// Render external hyperlinks as `[text](url)`. Mirrors
     /// `LiteParseConfig::extract_links`, which the PDF path honors too.
     pub links: bool,
-    /// Emit speaker notes after each slide's body. The census measured 222k
-    /// characters of notes against 149k for all slide body text, and
-    /// LibreOffice renders none of it, so this is the single largest content
-    /// difference between the native and converted paths.
+    /// Emit speaker notes after each slide's body. Notes carry a large amount
+    /// of text that the LibreOffice conversion path renders none of, so this is
+    /// the single largest content difference between the two paths.
     pub notes: bool,
     /// Emit `Block::Figure` refs for the deck's pictures. Mirrors the PDF and
     /// DOCX gate, `image_mode != Off`.
@@ -133,9 +128,9 @@ pub fn emit_with_sources(data: &[u8], opts: EmitOptions) -> Result<NativeDeck, L
 
 /// Per-deck caches for the two cascades.
 ///
-/// Both rungs are keyed by part *path* and rebuilt once per path, never once
-/// per slide. Every previous PPTX probe records this discipline because a deck
-/// with 60 slides sharing 3 layouts otherwise reparses those layouts 60 times.
+/// Both rungs (layout, master) are keyed by part *path* and rebuilt once per
+/// path, never once per slide: many slides share a handful of layouts, which
+/// would otherwise be reparsed once per slide.
 #[doc(hidden)]
 pub struct Deck {
     master_geo: HashMap<String, PlaceholderGeometry>,
@@ -163,7 +158,7 @@ pub struct Deck {
     master_shapes: HashMap<String, Vec<Shape>>,
     layout_shapes: HashMap<String, Vec<Shape>>,
     /// §19.3.1.39 `p:sldLayout/@showMasterSp` — whether slides under this
-    /// layout draw the master's shapes. 25 of the corpus's 415 layouts say no.
+    /// layout draw the master's shapes.
     layout_shows_master: HashMap<String, bool>,
     /// Image relationships per part, over one shared pool of bytes. On the
     /// deck for the same reason the other rungs are: a layout's media table is
@@ -205,17 +200,15 @@ pub struct PreparedSlide<'d> {
     ///
     /// Still **uncoloured**: turning it into a fill needs the theme of this
     /// slide's own master, which the emitter does not load and the geometry
-    /// pass does. `None` means no part in the chain declared one, which does
-    /// not happen on the corpus (0 of 1,278) and is therefore a signal.
+    /// pass does. `None` means no part in the chain declared one.
     pub background: Option<(BackgroundSource, Background)>,
     /// §19.3.1.6 the colour map in force on this slide, resolved down the same
     /// slide → layout → master chain as `background`.
     ///
     /// `None` means no part in the chain stated one, in which case
     /// [`ColorMap::default`] — the spec's identity mapping — applies; it is
-    /// carried as `Option` rather than defaulted here so that the probe can
-    /// tell "stated" from "assumed", which is exactly the 30-of-70 masters the
-    /// census found.
+    /// carried as `Option` rather than defaulted here so a probe can tell
+    /// "stated" from "assumed".
     pub color_map: Option<ColorMap>,
     /// The master's and then the layout's own shapes, in the order they paint:
     /// **under** everything in `shapes`, master first. Empty when the rung
@@ -235,11 +228,9 @@ pub struct PreparedSlide<'d> {
     ///
     /// **This is a filtered list, and the filter is the point.** A layout shape
     /// is drawn on every slide that uses the layout, so emitting its text
-    /// per-slide reprints the deck's furniture once per page: the census found
-    /// 371 occurrences behind just 43 distinct strings, one of them a speaker
-    /// banner landing on 47 slides and another the literal `‹#›` of a slide
-    /// number. [`Deck::keeps_inherited_text`] admits only the strings that land
-    /// on exactly one slide of the deck — 29 of the 371 — which is what makes
+    /// per-slide reprints the deck's furniture (speaker banners, `‹#›` slide
+    /// numbers) once per page. [`Deck::keeps_inherited_text`] admits only the
+    /// strings that land on exactly one slide of the deck, which is what makes
     /// this a content fix rather than a letterhead regression.
     ///
     /// Both walks read it, and neither re-derives it: the markdown a reader
@@ -251,25 +242,20 @@ pub struct PreparedSlide<'d> {
     ///
     /// Unfiltered, and that is the difference from `inherited_text` beside it.
     /// The furniture rule there exists because reprinting a layout's speaker
-    /// banner on all 47 slides that use the layout is a worse markdown than
-    /// omitting it. A repeated *picture* has an answer that repeated text does
-    /// not: the dedup contract gives every placement its own `name`, points
-    /// them all at one canonical `path`, and `rewrite_duplicate_image_refs`
-    /// resolves the refs — so 3,602 corpus placements cost 1,322 files.
-    ///
-    /// The conversion path this replaces already emits them, which is what
-    /// settles it: LibreOffice flattens the master into every page, so
-    /// `--no-office-native` prints 53 refs from 4 files on `bud_cnos` where
-    /// this path printed none. Emitting them is parity, not noise.
+    /// banner on every slide that uses it is worse markdown than omitting it. A
+    /// repeated *picture* has an answer that repeated text does not: the dedup
+    /// contract gives every placement its own `name`, points them all at one
+    /// canonical `path`, and `rewrite_duplicate_image_refs` resolves the refs.
+    /// The LibreOffice conversion path this replaces flattens the master into
+    /// every page and emits these too, so emitting them is parity, not noise.
     pub inherited_figures: [Vec<&'d Shape>; 2],
     /// Whether each arm of `inherited` is empty because it was **declined**
     /// rather than because the part had nothing to give: `[master, layout]`,
     /// parallel to `inherited`.
     ///
     /// The distinction is the whole reason `@showMasterSp` is parsed. Both
-    /// cases paint nothing, so without this a deck that correctly honoured 25
-    /// opt-outs and a deck whose layout parse silently failed would report the
-    /// same numbers.
+    /// cases paint nothing, so without this a deck that correctly honoured an
+    /// opt-out and a deck whose layout parse silently failed would look alike.
     pub declined: [bool; 2],
     /// The slide's own `r:embed` table, and its master's and layout's in the
     /// same `[master, layout]` order as `inherited`.
@@ -280,11 +266,10 @@ pub struct PreparedSlide<'d> {
     /// single merged table would paint real photographs in the wrong places.
     pub media: &'d PartMedia,
     pub inherited_media: [&'d PartMedia; 2],
-    /// The table for the part the **background** came from, which is the
-    /// master's on 1,125 corpus slides and the slide's own on 58. Carried
-    /// separately rather than derived by the caller, because the rung is
-    /// already known here (`BackgroundSource`) and re-deriving it at the paint
-    /// site is how the two would drift.
+    /// The table for the part the **background** came from. Carried separately
+    /// rather than derived by the caller, because the rung is already known
+    /// here (`BackgroundSource`) and re-deriving it at the paint site is how
+    /// the two would drift.
     pub background_media: &'d PartMedia,
     layout_text: Option<&'d PlaceholderTextStyles>,
     master_text: Option<&'d PlaceholderTextStyles>,
@@ -346,8 +331,8 @@ impl Deck {
     /// [`pptx::shows_inherited_shapes`] rather than by deserializing the slide:
     /// a slide that declines a rung draws none of its text, so counting its
     /// occurrences would push a string off the "lands on one slide" rule and
-    /// silently drop content. Getting it from a second `parse_slide_part` per
-    /// slide measured at +7.5% on the corpus's markdown run, for one boolean.
+    /// silently drop content. Reading the one boolean this cheap way avoids a
+    /// second full `parse_slide_part` per slide.
     fn index_inherited_text(&mut self, pkg: &PresentationPackage) {
         for slide in &pkg.slides {
             self.prime(slide);
@@ -367,13 +352,10 @@ impl Deck {
 
     /// Whether an inherited string is content rather than furniture.
     ///
-    /// **Lands on exactly one slide of the deck.** Measured against the
-    /// alternative — "comes from a rung part that exactly one slide draws",
-    /// which needs no string keying — on the 45-deck corpus: the two keep the
-    /// same 29 occurrences, and the rung rule additionally emits 10 the text
-    /// rule rejects. All 10 are furniture, and one of them is an authoring note
-    /// to whoever edits the deck ("Glegoo is een niet-Windows-Font…"), which is
-    /// as clear a statement as the corpus can make about which axis is right.
+    /// **Content lands on exactly one slide of the deck.** Keying on the string
+    /// rather than on "comes from a part exactly one slide draws" is
+    /// deliberate: the coarser part-based rule additionally keeps template
+    /// furniture (e.g. authoring notes) that the string rule correctly rejects.
     fn keeps_inherited_text(&self, key: &str) -> bool {
         self.inherited_text_counts.get(key) == Some(&1)
     }
@@ -693,8 +675,6 @@ impl Deck {
 /// applied here rather than at paint time so that the cache holds exactly what
 /// the painter may draw. Top-level only, matching
 /// `PlaceholderGeometry::index`: a placeholder never appears inside a group.
-///
-/// Corpus: 1,567 of 4,432 layout shapes and 179 of 395 master shapes survive.
 fn inherited_shapes(shapes: &[Shape]) -> Vec<Shape> {
     let mut kept: Vec<Shape> = shapes
         .iter()
@@ -712,20 +692,16 @@ fn inherited_shapes(shapes: &[Shape]) -> Vec<Shape> {
 
 /// The blip fill a shape carries as its *picture*, if it is one.
 ///
-/// Two shapes qualify and the second is the one the census had to find:
+/// Two shapes qualify:
 ///
 /// * `p:pic` — §19.3.1.37, the picture frame, whose image is its own
 ///   `p:blipFill` sibling of `spPr` rather than an `spPr` fill.
 /// * **a `p:sp` with a blip fill and no text** — a picture in all but name.
-///   One corpus deck (`twinning_the_results_reviewed`) declares *zero* `p:pic`
-///   and puts all 37 of its images on 56 such shapes, so a `p:pic`-only rule
-///   takes that deck from the conversion path's 45 refs and 29 files to
-///   nothing at all.
+///   Some decks declare no `p:pic` at all and put every image on such shapes,
+///   so a `p:pic`-only rule would miss them entirely.
 ///
-/// The text test is what separates the two populations, and it separates them
-/// almost perfectly: 140 of 141 slide-level blip-filled `p:sp`s carry no text
-/// (pictures), while 27 of 29 layout-level ones do (a template banner *behind*
-/// a heading, which is a backdrop and not a figure).
+/// The text test separates the two populations: a textless blip-filled `p:sp`
+/// is a picture, while a blip *behind* a heading is a backdrop, not a figure.
 fn picture_fill(shape: &Shape) -> Option<&liteparse_ooxml::model::BlipFill> {
     match &shape.kind {
         ShapeKind::Picture(pic) => Some(&pic.blip_fill),
@@ -782,10 +758,9 @@ struct SlideCtx<'a> {
 /// Order a slide's top-level shapes for reading: **title first, then
 /// geometric** (top-to-bottom in 0.25 in bands, left-to-right within a band).
 ///
-/// Both halves are load-bearing and the census measured each. Source order
-/// alone puts the title somewhere other than first on 95 slides; geometric
-/// order alone still does on 41, because authors routinely place a kicker, a
-/// caption or a logo strip above the title. Together: **0**.
+/// Both halves are load-bearing. Source order alone misplaces the title when
+/// it is not authored first; geometric order alone misplaces it when a kicker,
+/// caption or logo strip sits above it. Together they put it first reliably.
 ///
 /// Chrome is dropped rather than sorted — a slide number in a corner otherwise
 /// perturbs the order without a reader ever caring.
@@ -823,7 +798,7 @@ fn reading_key(shape: &Shape) -> (bool, i64, i64) {
         // A shape with no rectangle cannot be placed. Sorting it last
         // keeps it in the output — dropping content to keep a sort total
         // is never the right trade — while leaving positioned shapes in
-        // their proper order. The census measured 0 of these.
+        // their proper order.
         None => (i64::MAX, i64::MAX),
     };
     (!is_title(shape.placeholder.as_ref()), band, x)
@@ -859,10 +834,10 @@ pub struct Reading<'a> {
 ///
 /// **One sort, not two passes.** An inherited shape is a backdrop in *paint*
 /// order — that is why the paint walk draws the rungs before the slide — but it
-/// is not a backdrop in *reading* order: `waterun`'s inherited subtitle sits
-/// under the slide's title and reads there. Appending the rungs and sorting
-/// once puts each string where it appears on the page, which is the only
-/// ordering claim this module ever makes.
+/// is not a backdrop in *reading* order: an inherited subtitle sits under the
+/// slide's title and reads there. Appending the rungs and sorting once puts
+/// each string where it appears on the page, which is the only ordering claim
+/// this module ever makes.
 ///
 /// The slide's own shapes are inserted first, so on a tie — same band, same x —
 /// the slide's text reads before the template's. `sort_by_key` is stable, so
@@ -909,9 +884,7 @@ pub fn slide_reading_order<'a>(prepared: &'a PreparedSlide<'_>) -> Vec<Reading<'
 /// shapes come out of `inherited_shapes` with their group transforms already
 /// composed — so a leaf carries its own rectangle and needs no parent.
 ///
-/// The key joins the paragraphs a reader would see, and is what
-/// `bench/pptx_corpus/inherited_text_census.py` counts, so the census's numbers
-/// and this module's are about the same strings.
+/// The key joins the paragraphs a reader would see.
 fn collect_text_shapes<'a>(shapes: &'a [Shape], out: &mut Vec<(&'a Shape, String)>) {
     for shape in shapes {
         match &shape.kind {
@@ -935,9 +908,8 @@ fn collect_text_shapes<'a>(shapes: &'a [Shape], out: &mut Vec<(&'a Shape, String
                 }
             }
             ShapeKind::Group(group) => collect_text_shapes(&group.children, out),
-            // A `p:graphicFrame`'s table is a second gap of a different shape —
-            // 2 of them in layout parts against 237 `p:sp`s — and folding the
-            // two would make neither number act on.
+            // A `p:graphicFrame`'s table is a separate, rarer gap; the
+            // inherited-text rule does not cover it.
             _ => {}
         }
     }
@@ -972,12 +944,10 @@ pub fn is_title(ph: Option<&Placeholder>) -> bool {
 
 /// The date / footer / slide-number family.
 ///
-/// Note this drops ~7k characters the census found in `dt` and `ftr`
-/// placeholders, which average 50 and 56 characters — far too long to be a
-/// date or a page number, so some authors are reusing them for real text.
-/// Dropping them wholesale is the conservative choice for now because a
-/// length test would also admit genuine repeated footer chrome on every
-/// slide of a 60-slide deck; revisit with a measurement, not a guess.
+/// This drops any real text some authors reuse `dt`/`ftr` placeholders for.
+/// Dropping wholesale is the conservative choice: a length test to rescue that
+/// text would also admit genuine repeated footer chrome on every slide.
+// TODO: distinguish reused-for-content date/footer placeholders from chrome.
 #[doc(hidden)]
 pub fn is_chrome(ph: Option<&Placeholder>) -> bool {
     matches!(
@@ -1108,9 +1078,9 @@ fn emit_text_body(
         let chunks = chunks_of(para, &resolved, ctx);
         let (text, bold, italic) = render_chunks(&chunks, true);
         if text.is_empty() {
-            // 1,114 empty paragraphs on the corpus. They are blank-line
-            // separators inside a text box, and emitting them as empty blocks
-            // would put stray blank paragraphs through `render_blocks`.
+            // Empty paragraphs are blank-line separators inside a text box;
+            // emitting them as blocks would put stray blank paragraphs through
+            // `render_blocks`.
             continue;
         }
 
@@ -1140,12 +1110,11 @@ fn emit_text_body(
 /// The bullet a paragraph resolves to, as `(ordered, marker)`, or `None` when
 /// it is not a list item at all.
 ///
-/// **68.6% of non-empty paragraphs are not list items** on the corpus — 44.7%
-/// resolve to an explicit `buNone` and 23.9% to no bullet. The `buNone` share
-/// is the reason this consults the resolved style rather than the paragraph:
-/// `buNone` exists precisely to override an inherited bullet, so an emitter
-/// reading only the master's list style would turn 3,890 plain paragraphs into
-/// list items.
+/// Most non-empty paragraphs are not list items — many resolve to an explicit
+/// `buNone`. That is the reason this consults the resolved style rather than
+/// the paragraph: `buNone` exists precisely to override an inherited bullet, so
+/// an emitter reading only the master's list style would turn plain paragraphs
+/// into list items.
 fn list_marker(
     bullet: Option<&Bullet>,
     level: u8,
@@ -1153,11 +1122,11 @@ fn list_marker(
 ) -> Option<(bool, String)> {
     match bullet? {
         Bullet::None => None,
-        // The glyph is nearly always from a symbol font — `\u{f0b7}` in
-        // Wingdings is the commonest bullet in the corpus — and is meaningless
-        // as text. `render_blocks` prints the marker verbatim, so passing the
-        // codepoint through would put a private-use character in the markdown.
-        // Every bullet character therefore normalises to `-`.
+        // The glyph is nearly always from a symbol font (e.g. `\u{f0b7}` in
+        // Wingdings) and is meaningless as text. `render_blocks` prints the
+        // marker verbatim, so passing the codepoint through would put a
+        // private-use character in the markdown. Every bullet character
+        // therefore normalises to `-`.
         Bullet::Character { .. } => Some((false, "-".into())),
         Bullet::AutoNumber { scheme, start_at } => {
             let n = counters
@@ -1171,11 +1140,8 @@ fn list_marker(
     }
 }
 
-/// Render an auto-number in its declared scheme.
-///
-/// Four schemes appear on the corpus (`ArabicPeriod` 102, `AlphaLcParenR` 8,
-/// `AlphaLcPeriod` 5, `ArabicParenR` 2) but all nine are cheap to support, and
-/// `Other` degrades to a plain number rather than guessing.
+/// Render an auto-number in its declared scheme. All nine schemes are cheap to
+/// support; `Other` degrades to a plain number rather than guessing.
 fn format_autonumber(scheme: &AutoNumberScheme, n: u32) -> String {
     use AutoNumberScheme as S;
     match scheme {
@@ -1247,9 +1213,8 @@ fn roman(n: u32) -> String {
 /// set, while `MergedTable` follows HTML and expects it to be *absent*. So
 /// absorbed cells are dropped and the origin cell carries the span.
 ///
-/// Merges are rare here — 8 colspan and 6 rowspan cells across the whole
-/// corpus, against DOCX where they were the single biggest win. The variant is
-/// reused because it costs nothing, not because PPTX needs it.
+/// Merges are rare in PPTX; the [`Block::MergedTable`] variant is reused
+/// because it costs nothing, not because PPTX needs it.
 fn emit_table(
     table: &Table,
     ctx: &mut SlideCtx<'_>,
@@ -1274,10 +1239,9 @@ fn emit_table(
     if rows.iter().all(|r| r.is_empty()) {
         return;
     }
-    // `firstRow` is PPTX's only header signal and is set on 15 of 36 corpus
-    // tables. When absent we claim no header rather than promoting row 0:
-    // `MergedTable` renders a headerless table as a pipe table with an empty
-    // header, which is what the DOCX path does for the same case.
+    // `firstRow` is PPTX's only header signal. When absent we claim no header
+    // rather than promoting row 0: `MergedTable` renders a headerless table as
+    // a pipe table with an empty header, matching the DOCX path.
     let header_rows = usize::from(table.first_row);
     out.push((Block::MergedTable { rows, header_rows }, src));
 }
@@ -1312,8 +1276,8 @@ fn cell_text(body: Option<&TextBody>, ctx: &mut SlideCtx<'_>) -> String {
 
 /// Emit a SmartArt diagram's text, in the graphic frame's place.
 ///
-/// The largest single content gap a shape-tree walk has: 53 corpus parts, all
-/// 53 carrying text, 12,102 characters that no walk of the slide can reach.
+/// A large content gap for a plain shape-tree walk: the text lives in the
+/// diagram data part and no walk of the slide's shapes can reach it.
 ///
 /// Emitted as paragraphs at the frame's position in reading order, which is
 /// the part geometry buys us — a document-order reader can only append the
@@ -1351,10 +1315,9 @@ fn emit_diagram(
 
 /// Emit a notes slide's body.
 ///
-/// Only the `body` placeholder. The census measured 222,109 characters there
-/// against 1,420 characters everywhere else on notes slides, almost all of it a
-/// slide number — so this needs no heuristic, and the `sldImg` thumbnail
-/// carries no text at all.
+/// Only the `body` placeholder. Nearly all real notes text lives there; the
+/// other placeholders carry only a slide number, and the `sldImg` thumbnail no
+/// text at all — so this needs no heuristic.
 fn emit_notes(
     shapes: &[Shape],
     ctx: &mut SlideCtx<'_>,
@@ -1409,8 +1372,7 @@ fn walk_inlines(
                     match el {
                         RunElement::Text(t) => text.push_str(t),
                         RunElement::Tab => text.push('\t'),
-                        // `a:br` is a hard break inside one text box. 250
-                        // paragraphs on the corpus have one, and `Block`'s
+                        // `a:br` is a hard break inside one text box. `Block`'s
                         // single-line `text` cannot hold it, so it becomes a
                         // space rather than being dropped or splitting the
                         // paragraph into two unrelated blocks.
@@ -1465,9 +1427,9 @@ mod tests {
 
     #[test]
     fn explicit_bu_none_is_not_a_list_item() {
-        // 44.7% of corpus paragraphs land here. `buNone` exists to override an
-        // inherited bullet, so treating "has a resolved bullet" as "is a list"
-        // would turn 3,890 plain paragraphs into list items.
+        // `buNone` exists to override an inherited bullet, so treating "has a
+        // resolved bullet" as "is a list" would turn plain paragraphs into
+        // list items.
         let mut c = HashMap::new();
         assert!(list_marker(Some(&Bullet::None), 0, &mut c).is_none());
     }
@@ -1480,8 +1442,8 @@ mod tests {
 
     #[test]
     fn symbol_font_bullet_never_reaches_the_markdown() {
-        // Wingdings' private-use codepoint is the commonest bullet in the
-        // corpus and is meaningless as text; `render_blocks` would print it.
+        // Wingdings' private-use codepoint is a common bullet and is
+        // meaningless as text; `render_blocks` would print it.
         let mut c = HashMap::new();
         let bullet = Bullet::Character {
             char: "\u{f0b7}".into(),
@@ -1552,8 +1514,8 @@ mod tests {
         }
         assert!(!is_chrome(ph(PlaceholderKind::Title).as_ref()));
         assert!(!is_chrome(ph(PlaceholderKind::Body).as_ref()));
-        // 59% of corpus slide text sits on shapes with no placeholder, so the
-        // absent case must never be chrome.
+        // Much slide text sits on shapes with no placeholder, so the absent
+        // case must never be chrome.
         assert!(!is_chrome(None));
     }
 
@@ -1601,9 +1563,7 @@ mod tests {
         )
     }
 
-    /// The key is the string the census counts: paragraphs joined by newline,
-    /// blank ones skipped. A key that drifted from the census's would make
-    /// every number in the plan's write-up about a different population.
+    /// The key is paragraphs joined by newline, blank ones skipped.
     #[test]
     fn the_key_joins_the_paragraphs_a_reader_would_see() {
         let shapes = tree(&text_shape(
@@ -1640,8 +1600,8 @@ mod tests {
     }
 
     /// A picture or a connector carries no `p:txBody`, and an empty one is not
-    /// a string — neither may enter the tally, or the counts stop matching the
-    /// census and a blank shape starts competing for a "lands on one slide".
+    /// a string — neither may enter the tally, or a blank shape would compete
+    /// for a "lands on one slide" slot.
     #[test]
     fn shapes_with_nothing_to_say_are_not_counted() {
         let shapes = tree(&format!(
@@ -1680,8 +1640,8 @@ mod tests {
     }
 
     /// Inherited text is a backdrop in *paint* order and not in *reading*
-    /// order: `waterun`'s inherited strapline sits above the slide's own first
-    /// line and reads there, which one sort over both trees gives for free.
+    /// order: an inherited strapline sits above the slide's own first line and
+    /// reads there, which one sort over both trees gives for free.
     #[test]
     fn inherited_text_reads_where_it_sits_on_the_page() {
         let defaults = DeckTextDefaults::default();
@@ -1763,8 +1723,8 @@ mod tests {
         )
     }
 
-    /// The census's rule, in the two directions it has to hold: a `p:pic` is a
-    /// picture, and so is a blip-filled shape that says nothing.
+    /// The rule in the two directions it has to hold: a `p:pic` is a picture,
+    /// and so is a blip-filled shape that says nothing.
     #[test]
     fn a_pic_and_a_textless_blip_filled_shape_are_both_pictures() {
         let shapes = tree(&format!(
@@ -1776,8 +1736,7 @@ mod tests {
     }
 
     /// The other half of the same rule, and the half that keeps it honest: a
-    /// blip behind text is a backdrop, and the text is the content. 27 of the
-    /// corpus's 29 layout-level blip-filled shapes are exactly this.
+    /// blip behind text is a backdrop, and the text is the content.
     #[test]
     fn a_blip_behind_text_is_a_backdrop_not_a_figure() {
         let shapes = tree(&blip_filled_sp(2, "rId2", &["a heading over a photo"]));
@@ -1795,10 +1754,9 @@ mod tests {
         assert!(picture_fill(&shapes[0]).is_none());
     }
 
-    /// A rung's pictures reach the reading order, and they arrive flagged as
-    /// figures — `inherited_text_laid_out` keys on that flag, so a picture
-    /// counted as inherited *text* would corrupt the metric that step's A/B
-    /// rests on.
+    /// A rung's pictures reach the reading order flagged as figures —
+    /// `inherited_text_laid_out` keys on that flag, so a picture counted as
+    /// inherited *text* would corrupt that count.
     #[test]
     fn inherited_pictures_read_as_figures() {
         let defaults = DeckTextDefaults::default();

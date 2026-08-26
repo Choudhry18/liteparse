@@ -726,8 +726,8 @@ mod tests {
 
     #[test]
     fn ptab_dispatches_as_run_child() {
-        // The whole reason for the fix: `<w:ptab>` must be a recognized run
-        // child, not an unknown-variant deserialize error.
+        // `<w:ptab>` must be a recognized run child, not an unknown-variant
+        // deserialize error.
         let r: RunXml = quick_xml::de::from_str(
             r#"<r><t>a</t><ptab relativeTo="margin" alignment="right" leader="none"/><t>b</t></r>"#,
         )

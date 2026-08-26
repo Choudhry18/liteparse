@@ -1148,9 +1148,8 @@ mod tests {
     }
 
     /// Units that need a containing box, a font size, or the attribute's own
-    /// context are `None` — never a fabricated number. Three separate
-    /// converters previously each invented their own answer here, and they
-    /// disagreed: a bare number was EMU in one and points in the others.
+    /// context are `None` — never a fabricated number, since a bare number's
+    /// meaning (EMU vs. points) depends on which attribute it came from.
     #[test]
     fn context_dependent_units_are_unresolved() {
         for unit in [

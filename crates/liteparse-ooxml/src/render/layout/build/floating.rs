@@ -50,8 +50,8 @@ pub(super) enum AnchorFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ShapeAnchorClass {
     /// Take every wsp shape regardless of its vertical anchor. Used by
-    /// body paragraphs and table cells, where the legacy single-channel
-    /// behaviour is still in effect.
+    /// body paragraphs and table cells, which route all shapes through one
+    /// channel.
     All,
     /// Only shapes whose vertical anchor is `paragraph` or `line`.
     ParagraphAnchored,
@@ -60,12 +60,11 @@ pub(super) enum ShapeAnchorClass {
     PageAnchored,
 }
 
-/// Extract floating (anchor) images from a paragraph's inlines.
-///
-/// Positions are resolved in the coordinate system implied by `frame`
-/// (see [`AnchorFrame`]).
 use crate::render::layout::{McBranch, live_mc_branch};
 
+/// Collect anchored inline images (excluding `wps:wsp` shapes, which
+/// `find_anchor_shapes` owns), recursing through hyperlinks, fields, and the
+/// live MCE branch.
 fn find_anchor_images<'a>(
     inlines: &'a [crate::model::Inline],
     out: &mut Vec<&'a crate::model::Image>,
@@ -99,6 +98,8 @@ fn find_anchor_images<'a>(
     }
 }
 
+/// Extract floating (anchor) images from a paragraph's inlines, with positions
+/// resolved in the coordinate system implied by `frame` (see [`AnchorFrame`]).
 pub(super) fn extract_floating_images(
     para: &Paragraph,
     ctx: &BuildContext,
@@ -154,10 +155,8 @@ pub(super) fn extract_floating_images(
 
 // ── Floating shape extraction ──────────────────────────────────────────────
 
-/// Extract floating (anchor) DrawingML shapes from a paragraph's inlines,
-/// resolve their geometry + visuals, and compute their positions in the
-/// coordinate frame implied by `frame`. Pure: takes immutable references to
-/// `ctx` / `state`.
+/// Collect anchored inline images whose graphic is a `wps:wsp` shape,
+/// recursing through hyperlinks, fields, and the live MCE branch.
 fn find_anchor_shapes<'a>(
     inlines: &'a [crate::model::Inline],
     out: &mut Vec<&'a crate::model::Image>,
@@ -293,7 +292,6 @@ pub(super) fn extract_floating_shapes(
             wrap_mode: crate::render::layout::section::WrapMode::from_model(&anchor.wrap),
             dist_left: Pt::from(anchor.distance.left),
             dist_right: Pt::from(anchor.distance.right),
-            behind_doc: anchor.behind_text,
             paths: shape_path.paths,
             fill: visuals.fill,
             stroke: visuals.stroke,
@@ -311,16 +309,6 @@ pub(super) fn extract_floating_shapes(
     shapes
 }
 
-/// Walk the inlines for `Inline::Pict` containers and emit a
-/// [`FloatingShape`] for every renderable VML primitive variant.
-/// Phase B handles `<v:rect>`; later phases can extend this to
-/// `RoundRect`, `Oval`, `Line`, `PolyLine`, `Image`, and grouped
-/// children.
-///
-/// Position resolution uses [`vml_absolute_position`] — currently
-/// page-relative when `position:absolute` and `margin-left`/
-/// `margin-top` are present. The vorlage gray-bar pattern fits this
-/// shape exactly.
 /// Walk inlines for VML primitives that resolve to images
 /// (`<v:image>` or a `<v:shape type="#_x0000_t75">` whose only child
 /// is `<v:imagedata>`). Both forms reach this code path through
@@ -345,11 +333,9 @@ fn extract_vml_floating_images(
                 extract_vml_floating_images(&link.content, state, frame, ctx, out)
             }
             Inline::Field(f) => extract_vml_floating_images(&f.content, state, frame, ctx, out),
-            // §M.1.2: exactly one branch is live and [`live_mc_branch`] is the
-            // only thing that decides which. This arm used to be `{}` — a
-            // third answer, given by not answering — so a Choice we could not
-            // draw plus a Fallback holding a VML image left the anchor with no
-            // geometry at all while its text still reached the page.
+            // §M.1.2: exactly one branch is live; [`live_mc_branch`] decides
+            // which. Must recurse into it — skipping the element would drop a
+            // Fallback VML image whose Choice we could not draw.
             Inline::AlternateContent(ac) => match live_mc_branch(ac) {
                 McBranch::Choices(choices) => {
                     for choice in choices {
@@ -456,13 +442,11 @@ fn extract_vml_primitive_shapes(
             }
             Inline::Field(f) => extract_vml_primitive_shapes(&f.content, state, frame, out),
             // §M.1.2: `<mc:AlternateContent>` carries the same shape twice —
-            // modern DrawingML in `<mc:Choice>`, a VML fallback in
-            // `<mc:Fallback>` — so drawing both emits one rectangle twice.
-            // Skipping the element outright avoided that and created the
-            // opposite bug: a Choice we cannot draw left the Fallback's rect
-            // unrendered, which is the "future case" the note here used to
-            // anticipate. [`live_mc_branch`] is now that Choice-fed signal,
-            // and the same one `find_anchor_shapes` asks.
+            // DrawingML in `<mc:Choice>`, VML in `<mc:Fallback>`. Draw only the
+            // live branch: drawing both would emit one rectangle twice, and
+            // skipping the element would drop a Fallback rect whose Choice we
+            // cannot draw. [`live_mc_branch`] picks the branch, the same one
+            // `find_anchor_shapes` asks.
             Inline::AlternateContent(ac) => match live_mc_branch(ac) {
                 McBranch::Choices(choices) => {
                     for choice in choices {
@@ -492,23 +476,20 @@ fn extract_vml_primitive(
                 out.push(shape);
             }
         }
-        // §14.1.2.17 `<v:roundrect>`: rounded-corner variant. The
-        // corner radius is `arcsize * min(width, height) / 2` —
-        // small radii barely distinguish from a plain rect at typical
-        // doc resolutions, so for Tier 0 we render as a plain
-        // rectangle. The `arcsize` value survives in the model for a
-        // future rounded-path build.
+        // §14.1.2.17 `<v:roundrect>`: rounded-corner variant. Small corner
+        // radii barely distinguish from a plain rect at typical doc
+        // resolutions, so render as a plain rectangle; `arcsize` survives in
+        // the model for a future rounded-path build.
         VmlPrimitive::RoundRect(r) => {
             if let Some(shape) = build_vml_rect_shape(&r.common, state, frame) {
                 out.push(shape);
             }
         }
-        // §14.1.2.9: groups carry their own coord system; we walk
-        // children so any absolute-positioned descendants reach the
-        // page. The local-coord transform (`coordsize`/`coordorigin`
-        // → page coords) for relative-positioned children is left
-        // for a future phase — most authored groups in headers and
-        // footers use absolute positioning and don't depend on it.
+        // §14.1.2.9: groups carry their own coord system; walk children so
+        // absolute-positioned descendants reach the page. The local-coord
+        // transform (`coordsize`/`coordorigin` → page coords) for
+        // relative-positioned children is not implemented — most authored
+        // groups in headers/footers use absolute positioning.
         VmlPrimitive::Group(g) => {
             for child in &g.children {
                 extract_vml_primitive(child, state, frame, out);
@@ -518,11 +499,9 @@ fn extract_vml_primitive(
         // through the parallel `extract_vml_floating_images` path
         // and emit `FloatingImage` instead.
         VmlPrimitive::Image(_) => {}
-        // Long-tail primitives modeled in Phase A but not yet
-        // emitted as shapes (oval/line/polyline/arc/curve). Phase D
-        // will dispatch them to `DrawCommand::Path` / `Line`. Their
-        // text-box content (where applicable) is still picked up by
-        // the inline fragment collector.
+        // Primitives modeled but not yet emitted as shapes
+        // (oval/line/polyline/arc/curve). Their text-box content, where
+        // applicable, is still picked up by the inline fragment collector.
         VmlPrimitive::Shape(_)
         | VmlPrimitive::Oval(_)
         | VmlPrimitive::Line(_)
@@ -550,16 +529,13 @@ fn build_vml_rect_shape(
     use crate::render::geometry::PtOffset;
     use crate::render::resolve::shape_geometry::{PathVerb, SubPath};
 
-    // Position via `position:absolute` + `margin-left/top`. VML's
-    // `margin-left` is page-relative when the shape's
-    // `mso-position-horizontal-relative` is `page` (the vorlage gray
-    // bar's case) — we don't model that style attribute yet, so
-    // assume page-relative and let phase D add the discriminator.
+    // Position via `position:absolute` + `margin-left/top`. VML's `margin-left`
+    // is page-relative when `mso-position-horizontal-relative` is `page`; that
+    // style attribute isn't modelled, so assume page-relative.
     //
-    // In `AnchorFrame::Stack` the eventual emitter shifts every
-    // command by `margins.left` to convert stack→page; we subtract
-    // it from `x` up front so the round-trip preserves the
-    // page-relative offset.
+    // In `AnchorFrame::Stack` the eventual emitter shifts every command by
+    // `margins.left` to convert stack→page; subtract it from `x` up front so
+    // the round-trip preserves the page-relative offset.
     let (page_x, y) = vml_absolute_position(&common.style)?;
     // VML has no `inside`/`outside` equivalent — `margin-left` is one number.
     let x = FloatingImageX::Absolute(match frame {
@@ -596,17 +572,11 @@ fn build_vml_rect_shape(
         stroked: matches!(common.stroked, Some(true)),
     }];
 
-    // Vertical position resolution depends on the
-    // `mso-position-vertical-relative` style attribute:
-    // * `page`/`margin` → absolute page coordinates
-    // * `text`/`paragraph` (Word's default in body and footer) →
-    //   relative to the owning paragraph
-    //
-    // Phase B only honors the latter (the vorlage gray-bar case);
-    // page-anchored vertical resolution lands in phase D when the
-    // full position resolver is wired in. Until then we treat the
-    // y offset as relative to the host paragraph — which matches
-    // Word's default and lets the footer rect render correctly.
+    // Vertical position depends on `mso-position-vertical-relative`:
+    // `page`/`margin` → absolute page coordinates, `text`/`paragraph`
+    // (Word's default in body and footer) → relative to the owning paragraph.
+    // Only the paragraph-relative case is honored; the y offset is treated as
+    // relative to the host paragraph, matching Word's default.
     let y_image = FloatingImageY::RelativeToParagraph(y);
 
     Some(FloatingShape {
@@ -621,9 +591,6 @@ fn build_vml_rect_shape(
         wrap_mode: crate::render::layout::section::WrapMode::None,
         dist_left: Pt::ZERO,
         dist_right: Pt::ZERO,
-        // §14.1.2 z-index drives layering. For Tier 0 we treat all
-        // VML primitives as non-behind-text (drawn in document order).
-        behind_doc: false,
         paths,
         fill,
         stroke: None,
@@ -935,15 +902,10 @@ fn resolve_anchor_y(
                 AnchorRelativeFrom::Paragraph | AnchorRelativeFrom::Line => {
                     FloatingImageY::RelativeToParagraph(Pt::from(*offset))
                 }
-                // §20.4.3.5 `insideMargin`/`outsideMargin`. The spec names them
-                // on the vertical axis without saying which strips they are —
-                // Word mirrors *left/right* for two-sided documents, not
-                // top/bottom — so no reading is derivable from source alone.
-                // Treated as `margin`, the long-standing fallback. Settling it
-                // needs a two-sided document with a float anchored
-                // inside/outside vertically, rendered by Word on both an odd
-                // and an even page; `FloatingImageX::PageParity` is already in
-                // place should the answer turn out to be "it mirrors".
+                // §20.4.3.5 `insideMargin`/`outsideMargin`: the spec names them
+                // on the vertical axis without saying which strips they are
+                // (Word mirrors left/right for two-sided documents, not
+                // top/bottom), so treat them as `margin`.
                 AnchorRelativeFrom::InsideMargin | AnchorRelativeFrom::OutsideMargin => {
                     FloatingImageY::Absolute(pc.margins.top + Pt::from(*offset))
                 }
@@ -1144,9 +1106,9 @@ fn resolve_vml_solid_fill(
 /// function of `paragraph_top` rather than an absolute frame. The shape-text
 /// sub-layout assumes paragraph-relative placement (the stacker ties
 /// `text_commands` to the same `(fs.x, shape_y)` it uses for the path), so
-/// page-anchored shapes get their text emitted via the legacy inline-fragment
-/// collector instead. Tier 1 follow-up: extend the sub-layout to honor
-/// page/margin frames so all wsp shapes can use the typed path.
+/// page-anchored shapes get their text emitted via the inline-fragment
+/// collector instead. TODO: extend the sub-layout to honor page/margin frames
+/// so all wsp shapes can use the typed path.
 fn anchors_to_paragraph(anchor: &crate::model::AnchorProperties) -> bool {
     use crate::model::{AnchorPosition, AnchorRelativeFrom};
     let relative_from = match &anchor.vertical_position {
@@ -2145,8 +2107,8 @@ mod tests {
 
     /// §20.4.3.4 `insideMargin`/`outsideMargin` are page-parity dependent, and
     /// the page a float lands on is not known at extraction time. The odd-page
-    /// reading — inside = left, outside = right — is the Tier-0 collapse, and
-    /// it is exact for the single-sided documents that are nearly all of them.
+    /// reading — inside = left, outside = right — is the collapse used here,
+    /// and it is exact for single-sided documents.
     #[test]
     fn parity_margins_take_their_odd_page_reading() {
         let inside = x_of(

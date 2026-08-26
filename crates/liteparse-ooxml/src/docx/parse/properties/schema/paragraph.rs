@@ -111,13 +111,6 @@ struct ValString {
     val: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(bound(deserialize = "T: serde::Deserialize<'de>"))]
-struct ValAttr<T> {
-    #[serde(rename = "@val")]
-    val: T,
-}
-
 /// `<w:ind>` — indentation. Legacy `@left`/`@right` alias `@start`/`@end`.
 /// `@firstLine` and `@hanging` are mutually exclusive; when both present,
 /// hanging wins per renderer convention (legacy parser matched this).
@@ -377,8 +370,8 @@ impl PPrXml {
             }
             None => (None, None),
         };
-        // rStyle inside pPr/rPr applies to the paragraph mark only; the
-        // legacy parser discards this style id too.
+        // rStyle inside pPr/rPr applies to the paragraph mark only and is
+        // not routed anywhere; it is intentionally discarded.
 
         let section_properties = self.sect_pr.map(Into::into);
 
@@ -592,10 +585,9 @@ mod tests {
         assert_eq!(p.auto_space_dn, Some(true));
     }
 
-    /// Upstream asserted that an unknown `@val` is a hard error, which meant a
-    /// single bad attribute anywhere took down the whole document. We
-    /// deliberately reversed that: the alignment is treated as unspecified, so
-    /// it inherits from the style chain exactly as if `<w:jc>` were absent.
+    /// An unknown `@val` must not be a hard parse error: the alignment is
+    /// treated as unspecified so it inherits from the style chain exactly
+    /// as if `<w:jc>` were absent.
     #[test]
     fn unknown_jc_is_unspecified_not_an_error() {
         let r = parse(r#"<pPr><jc val="bogus"/></pPr>"#);

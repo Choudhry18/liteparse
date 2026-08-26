@@ -17,11 +17,9 @@ pub type MeasureFn<'a> = Option<&'a dyn Fn(&str, &FontProps) -> (Pt, TextMetrics
 
 /// True for a text fragment that is both too wide and actually splittable.
 ///
-/// The character *count* is what matters: a single character cannot be split
-/// however many bytes it occupies. An earlier byte-length (`text.len() > 1`)
-/// spelling of this test disagreed with the split itself for any non-ASCII
-/// single character — it reported "needs split", then split nothing, and the
-/// caller paid for a full clone of the fragment vector.
+/// Tests the character *count*, not the byte length: a single character cannot
+/// be split however many bytes it occupies, and a byte-length test would report
+/// "needs split" for a multi-byte single character that then splits into nothing.
 fn needs_split(fragment: &Fragment, max_width: Pt) -> bool {
     matches!(
         fragment,

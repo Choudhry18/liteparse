@@ -38,11 +38,11 @@ pub struct ResolvedStyle {
 /// Deliberately excludes `TOC Heading` (the heading *above* a ToC, not an
 /// entry) and `toc` with no level, neither of which is an entry style.
 fn is_toc_entry_name(name: &str) -> bool {
-    // OOXML style names compare case-insensitively.
-    let rest = if name.len() >= 4 && name[..4].eq_ignore_ascii_case("toc ") {
-        &name[4..]
-    } else {
-        return false;
+    // OOXML style names compare case-insensitively. `get` rather than a
+    // direct slice: byte 4 may not be a char boundary in a malformed name.
+    let rest = match name.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("toc ") => &name[4..],
+        _ => return false,
     };
     matches!(rest.parse::<u8>(), Ok(1..=9))
 }
@@ -504,8 +504,9 @@ mod tests {
             "toc 10",
             "toc 1x",
             "table of contents",
-            "TOCustom", // the false positive the old styleId prefix test hit
+            "TOCustom", // a styleId-prefix match would false-positive here
             "",
+            "tocç 1", // byte 4 lands inside `ç`: must miss, not panic
         ] {
             assert!(
                 !is_toc_entry_name(name),

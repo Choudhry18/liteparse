@@ -134,6 +134,7 @@ fn run_one(path: &str) -> serde_json::Value {
                 // PPTX-only placement bracket; a DOCX layout emits none, so a
                 // non-zero count here means this probe was pointed at a slide.
                 DrawCommand::Transform(_) => census.transform += 1,
+                DrawCommand::Float(_) => {}
                 // No catch-all: the compiler confirming this match is
                 // exhaustive is how we know the census can't silently miss a
                 // command class.

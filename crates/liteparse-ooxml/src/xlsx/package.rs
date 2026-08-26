@@ -43,14 +43,14 @@ pub struct WorkbookPackage {
     pub sheets: Vec<SheetEntry>,
     pub shared_strings_xml: Option<Vec<u8>>,
     pub styles_xml: Option<Vec<u8>>,
-    /// `xl/theme/theme1.xml`, present in 99.4% of corpus workbooks. Needed
-    /// only for colour: 29.8% of the colours `styles.xml` defines are
-    /// `theme=` references, which resolve to nothing without it.
+    /// `xl/theme/theme1.xml`. Needed only for colour: a meaningful share of
+    /// the colours `styles.xml` defines are `theme=` references, which
+    /// resolve to nothing without it.
     pub theme_xml: Option<Vec<u8>>,
     /// `<workbookPr date1904="1"/>`: the epoch serial dates count from. Excel
-    /// for Mac wrote 1904-based workbooks for years and 123 of the corpus's
-    /// 1,089 workbooks come from Mac Excel, so this is not a historical
-    /// curiosity — reading it wrong shifts every date by 1,462 days.
+    /// for Mac wrote 1904-based workbooks for years, so this is not a
+    /// historical curiosity — reading it wrong shifts every date in the file
+    /// by 1,462 days.
     pub date1904: bool,
     /// The raw container, kept for drawings and media the emitter may reach.
     pub package: PackageContents,
@@ -279,8 +279,8 @@ mod tests {
         assert_eq!(parse_workbook(xml.as_bytes()).unwrap().sheets.len(), 1);
     }
 
-    /// 123 of the 1,089 corpus workbooks are Mac Excel; getting this wrong
-    /// shifts every date in them by 1,462 days.
+    /// Mac Excel workbooks use the 1904 epoch; getting this wrong shifts
+    /// every date in them by 1,462 days.
     #[test]
     fn the_1904_epoch_flag_is_read() {
         assert!(parse_workbook(WORKBOOK.as_bytes()).unwrap().date1904);

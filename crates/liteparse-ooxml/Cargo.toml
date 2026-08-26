@@ -13,24 +13,18 @@ quick-xml = { version = "0.39", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 thiserror = "2"
-# XLSX number formatting (§18.8.31). A faithful port of SheetJS's `ssf`, which
-# is what makes it worth taking as a dependency: the reference implementation is
-# JS, so a port can be diffed against its origin rather than only against a
-# spec reading. Apache-2.0, one transitive dep (`regex`).
+# XLSX number-format rendering (ECMA-376 §18.8.31); a port of SheetJS's `ssf`.
 ssf-rs = "0.1"
 log = "0.4"
 rustc-hash = "2"
-# C′ measurer stack (spikes 6–8): resolution via fontdb, metrics/advances via
-# skrifa. fontdb is pinned to the 0.22 line to match what resvg/usvg already
-# drag into the liteparse tree, so resolution behaviour matches what the spike
-# harness measured.
+# Text measurement: font resolution via fontdb, metrics/advances via skrifa.
+# fontdb is pinned to the 0.22 line resvg/usvg already bring into the tree.
 fontdb = "0.22"
 skrifa = "0.45"
 unicode-segmentation = "1.13"
 unicode-properties = "0.1"
-unicode-normalization = "0.1"
 # `raster` feature only — pinned to the tiny-skia line resvg 0.44 already
-# drags into the liteparse tree, so the feature adds ~no supply chain.
+# brings into the tree.
 tiny-skia = { version = "0.11", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = [
     "png",

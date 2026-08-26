@@ -6,14 +6,9 @@
 //! for all 187 of them and [`build_preset`] runs it through the
 //! `<a:custGeom>` evaluator.
 //!
-//! Four shapes (`rect`, `line`/`straightConnector1`, `roundRect`, `ellipse`)
-//! did have hand-written generators, from before the table existed. A
-//! differential against the table retired them: `rect`, `line` and `ellipse`
-//! produced the identical path, and `roundRect` produced the identical path
-//! with a *wrong* text rect — the hand version inset it by the full corner
-//! radius where §20.1.9.22 insets it by 29.289% of that (`il = x1 * 29289 /
-//! 100000`, the sagitta of a 45° arc). One source of truth is worth the
-//! ~0.5µs per shape the table path costs over a bespoke one.
+//! Note the §20.1.9.22 `roundRect` text rect is inset by 29.289% of the corner
+//! radius (`il = x1 * 29289 / 100000`, the sagitta of a 45° arc), not by the
+//! full radius — the table gets this right where a naive generator would not.
 //!
 //! A preset returns `None` only when §20.1.9.18 does not define the name at
 //! all, i.e. `PresetShapeType::Other`. Callers log once and skip the shape;
@@ -71,8 +66,7 @@ mod tests {
 
     #[test]
     fn table_preset_dispatches() {
-        // Star12 has no generator of its own and never will: it comes from the
-        // vendored spec table like every other shape outside the four above.
+        // Star12 comes from the vendored spec table like every other shape.
         let p = build_preset(
             &def(PresetShapeType::Star12),
             PtSize::new(Pt::new(10.0), Pt::new(20.0)),

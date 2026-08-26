@@ -129,15 +129,14 @@ pub struct TableRowProperties {
     /// §17.4.42: row-level override of the table's `tblCellSpacing`.
     pub cell_spacing: Option<TableMeasure>,
     /// §17.4.86: preferred width of the leading space before the first cell.
-    /// Note: when present and divergent from the corresponding `tblGrid` columns'
-    /// summed widths, treated as informational only — column widths are not
-    /// overridden per row in this implementation; a `warn!` is logged on mismatch.
+    /// Parsed for round-trip fidelity; layout derives column widths from
+    /// `tblGrid` and does not use this value.
     pub w_before: Option<TableMeasure>,
     /// §17.4.16: number of grid columns to skip after the last cell of the row.
     /// Default 0 when omitted from `<w:trPr>`.
     pub grid_after: u32,
     /// §17.4.85: preferred width of the trailing space after the last cell.
-    /// Same width-override caveat as `w_before`.
+    /// Same as `w_before`: parsed but not used by layout.
     pub w_after: Option<TableMeasure>,
 }
 

@@ -2,10 +2,10 @@
 //!
 //! Each schema enum mirrors an OOXML spec-defined simple type. `From<St…>`
 //! implementations convert the schema enum into the matching model type.
-//! Unknown string values fail deserialization (plan §Decisions: strict) — the
-//! one exception is `StNumberFormat`, a large extensible value space (~60 spec
-//! values) whose unsupported members must degrade rather than fail the parse
-//! (see its `#[serde(other)]` variant).
+//! Unknown string values fail deserialization (strict) — the one exception
+//! is `StNumberFormat`, a large extensible value space (~60 spec values)
+//! whose unsupported members must degrade rather than fail the parse (see
+//! its `#[serde(other)]` variant).
 //!
 //! Alphabetically ordered by schema type name. Layered as:
 //!

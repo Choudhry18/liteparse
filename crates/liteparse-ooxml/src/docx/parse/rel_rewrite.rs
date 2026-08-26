@@ -711,9 +711,9 @@ mod tests {
 
     #[test]
     fn rewrites_image_inside_alternate_content_choice() {
-        // Regression for the fix: the renderer prefers a supported <mc:Choice>
-        // over <mc:Fallback>, so image rIds inside a choice must be rewritten
-        // too — previously only the fallback was walked.
+        // The renderer prefers a supported <mc:Choice> over <mc:Fallback>, so
+        // image rIds inside a choice must be rewritten too, not just the
+        // fallback.
         let ac = AlternateContent {
             choices: vec![McChoice {
                 requires: vec![McRequires::Wps],

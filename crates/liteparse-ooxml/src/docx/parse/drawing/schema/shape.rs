@@ -561,10 +561,9 @@ pub(crate) struct WspXml {
 
 // ── wps:style (§20.1.4.1.4 CT_ShapeStyle) ─────────────────────────────────
 //
-// References into the theme's style matrices. Only `effectRef` is consumed
-// today; the other siblings (`lnRef`, `fillRef`, `fontRef`) are siblings
-// whose schema differs (`fontRef/@idx` is a string enum, not a number), so
-// they're silently skipped via serde's default unknown-element behavior.
+// References into the theme's style matrices (line, fill, effect, font).
+// `fontRef` has a different schema from the other three: `@idx` is a string
+// enum (`ST_FontCollectionIndex`), not a numeric matrix index.
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ShapeStyleXml {
@@ -1170,7 +1169,4 @@ mod tests {
         assert_eq!(fr.collection, FontCollectionIndex::Minor);
         assert!(fr.color.is_some(), "fontRef text color captured");
     }
-
-    // ── Picture spPr wiring (now that shape schema exists) ──
-    // (We don't re-wire picture.rs here; that's a follow-up edit.)
 }

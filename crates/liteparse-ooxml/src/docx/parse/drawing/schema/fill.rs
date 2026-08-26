@@ -4,8 +4,6 @@
 //! `grpFill`. Each variant has its own attribute/child grammar. Consumes
 //! `DrawingColorXml` from the color schema.
 
-#![allow(dead_code, clippy::large_enum_variant)]
-
 use serde::Deserialize;
 
 use crate::docx::dimension::{Dimension, Emu, SixtieThousandthDeg, ThousandthPercent};
@@ -34,8 +32,8 @@ pub enum DrawingFillXml {
     BlipFill(BlipFillXml),
     #[serde(rename = "pattFill")]
     PattFill(PattFillXml),
-    /// Catch-all for unmodelled OOXML elements. Vendoring divergence from
-    /// dxpdf: upstream fails the whole document on an unknown element.
+    /// Catch-all for unmodelled fill elements, so an unknown element
+    /// degrades gracefully instead of failing the whole document.
     #[serde(other)]
     Other,
 }
@@ -46,8 +44,7 @@ pub struct Empty {}
 impl From<DrawingFillXml> for DrawingFill {
     fn from(f: DrawingFillXml) -> Self {
         match f {
-            // An unmodelled fill element degrades to no fill, matching the
-            // existing treatment of an ill-formed solidFill below.
+            // An unmodelled fill element degrades to no fill.
             DrawingFillXml::Other => Self::None,
             DrawingFillXml::NoFill(_) => Self::None,
             DrawingFillXml::GrpFill(_) => Self::Group,
@@ -56,8 +53,7 @@ impl From<DrawingFillXml> for DrawingFill {
                     Some(c) => Self::Solid(c),
                     None => Self::None,
                 },
-                // Ill-formed solidFill with no color — degrade to None per
-                // legacy parser.
+                // No color present — degrade to None.
                 None => Self::None,
             },
             DrawingFillXml::GradFill(g) => Self::Gradient(g.into()),
@@ -233,8 +229,8 @@ impl From<GradFillXml> for GradientFill {
         } else if let Some(path) = x.path {
             GradientShadeProperties::Path {
                 // An omitted `@path` still denotes a path (radial-family)
-                // gradient; default to `circle`, which is what the shade
-                // currently resolves to downstream (Radial).
+                // gradient; default to `circle`, which resolves as Radial
+                // downstream.
                 path_type: path
                     .path_type
                     .map(Into::into)

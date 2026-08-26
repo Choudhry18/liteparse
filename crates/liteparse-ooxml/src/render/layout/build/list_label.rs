@@ -185,7 +185,13 @@ fn inject_text_label(
     level_def: Option<&crate::render::resolve::numbering::ResolvedNumberingLevel>,
     auto_fit: crate::render::layout::ShapeAutoFit,
 ) {
-    let num_id = model::NumId::new(merged_props.numbering.as_ref().unwrap().num_id);
+    let Some(num_id) = merged_props
+        .numbering
+        .as_ref()
+        .map(|n| model::NumId::new(n.num_id))
+    else {
+        return;
+    };
 
     let (default_family, default_size, default_color, _, paragraph_style_run) =
         resolve_paragraph_defaults(para, ctx.resolved, false, None, None);
@@ -971,8 +977,7 @@ mod tests {
         assert_eq!(bolds, vec![Some(true), Some(false)]);
     }
 
-    /// The key correctness property for the bug at hand: a level rPr
-    /// underline must surface in the resolved properties so
+    /// A level rPr underline must surface in the resolved properties so
     /// `font_props_from_run` reads it.
     #[test]
     fn cascade_resolve_materializes_underline_from_level() {
@@ -1005,13 +1010,12 @@ mod tests {
     // ── §17.9.23 — `build_label_font_props` ──────────────────────────────
     //
     // The label's `FontProps` is built by passing the cascade-resolved
-    // `RunProperties` through `font_props_from_run`. These tests pin
-    // the spec-driven invariants the previous hand-rolled construction
-    // violated (notably: dropped underline, char_spacing, text_scale).
+    // `RunProperties` through `font_props_from_run`. These tests pin the
+    // spec-driven invariants (underline, char_spacing, text_scale must flow
+    // through, not be dropped).
 
-    /// THE BUG: an underline in the level rPr (`<w:lvl><w:rPr><w:u/>`)
-    /// must surface as `font.underline = true`. Previously this code
-    /// path hardcoded `underline: false`.
+    /// An underline in the level rPr (`<w:lvl><w:rPr><w:u/>`) must surface as
+    /// `font.underline = true`.
     #[test]
     fn label_font_inherits_underline_from_level() {
         let level = rp_with_underline(UnderlineStyle::Single);
@@ -1034,8 +1038,7 @@ mod tests {
 
     /// Cascade depth: when the level layer doesn't set underline but
     /// the paragraph-mark rPr does, the label inherits the underline.
-    /// §17.3.1.29. (Previously broken: hand-rolled code never read
-    /// either layer's underline.)
+    /// §17.3.1.29.
     #[test]
     fn label_font_inherits_underline_from_mark_when_level_absent() {
         let mark = rp_with_underline(UnderlineStyle::Single);
@@ -1079,9 +1082,7 @@ mod tests {
         );
     }
 
-    /// `<w:spacing>` (char spacing) was silently dropped by the
-    /// hand-rolled construction. With cascade routing it must flow
-    /// into `FontProps::char_spacing`.
+    /// `<w:spacing>` (char spacing) must flow into `FontProps::char_spacing`.
     #[test]
     fn label_font_inherits_char_spacing_from_level() {
         let level = RunProperties {
@@ -1103,8 +1104,7 @@ mod tests {
         assert!((font.char_spacing.raw() - 2.0).abs() < 1e-4);
     }
 
-    /// `<w:w>` (text scale) was silently fixed to 1.0 in the
-    /// hand-rolled construction.
+    /// `<w:w>` (text scale) must flow into `FontProps::text_scale`.
     #[test]
     fn label_font_inherits_text_scale_from_level() {
         let level = RunProperties {

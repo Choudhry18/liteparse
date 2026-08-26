@@ -71,9 +71,8 @@ impl Part {
 ///
 /// `layout` and `master` are `Option` because the cascade must degrade
 /// rather than fail: a slide with no reachable layout still has its own
-/// directly-applied text and geometry, and refusing to parse it would be
-/// the fail-closed behaviour this vendor has already had to retire four
-/// times (see `ATTRIBUTION.md`).
+/// directly-applied text and geometry, and refusing to parse it would
+/// throw away content that is otherwise recoverable.
 #[derive(Clone, Debug)]
 pub struct SlideParts {
     pub slide: Part,
@@ -83,34 +82,33 @@ pub struct SlideParts {
     /// Package path of the theme reached through *this slide's own* master,
     /// for [`PresentationPackage::themes`].
     ///
-    /// A path rather than bytes because a theme is shared by every slide under
-    /// its master; cloning the XML per slide would copy it ~28 times on the
-    /// corpus's largest deck.
+    /// A path rather than bytes because a theme is shared by every slide
+    /// under its master; cloning the XML per slide would duplicate it once
+    /// per slide instead of once per master.
     pub theme_path: Option<String>,
 }
 
 /// The whole deck, walked but not yet understood.
 ///
 /// Deliberately neither `Clone` nor `Debug`: it owns every media part, so a
-/// clone copies the whole deck's images (390 MB across the corpus) and a
-/// debug-print dumps them.
+/// clone would copy the whole deck's images and a debug-print would dump
+/// them.
 pub struct PresentationPackage {
     pub info: PresentationInfo,
-    /// `ppt/presentation.xml` itself, kept because it is the outermost rung of
-    /// the **text** cascade: `p:defaultTextStyle` lives here and is the only
-    /// source a non-placeholder shape can reach. 2,144 of the corpus runs that
-    /// declare no size resolve against it.
+    /// `ppt/presentation.xml` itself, kept because it is the outermost level
+    /// of the **text** cascade: `p:defaultTextStyle` lives here and is the
+    /// only source a non-placeholder shape can reach when it declares no
+    /// size of its own.
     pub presentation: Part,
     /// Slides in **presentation order** — `<p:sldIdLst>`, not part order.
     pub slides: Vec<SlideParts>,
     /// `ppt/theme/themeN.xml` for the **first** master, when present.
     ///
     /// Adequate for font resolution, which is what it was added for. **Not
-    /// adequate for colour**: 12 of the 45 corpus decks reach more than one
-    /// theme from their slides, covering 138 slides, and 31 of those resolve a
-    /// `<p:bgRef>` background out of the theme's style matrix — which would
-    /// come from the wrong theme, and therefore silently the wrong colour.
-    /// Use [`Self::theme_for`] wherever the answer is a colour.
+    /// adequate for colour**: a deck can reach more than one theme from its
+    /// slides, and a `<p:bgRef>` background resolved out of the theme's
+    /// style matrix would come from the wrong theme — silently the wrong
+    /// colour. Use [`Self::theme_for`] wherever the answer is a colour.
     pub theme: Option<Vec<u8>>,
     /// Every theme in the package, keyed by normalized part path. Indexed by
     /// [`SlideParts::theme_path`].
@@ -127,8 +125,8 @@ pub fn walk(data: &[u8]) -> Result<PresentationPackage> {
 
     // The presentation part is reached through the package root rels rather
     // than assumed to be `ppt/presentation.xml`. The path is conventional,
-    // not mandated, and the 9 docProps-less decks in the corpus are already
-    // proof that "every producer follows convention" is a bad bet.
+    // not mandated by the spec, so producers that deviate would otherwise
+    // break parsing.
     let root_rels = load_rels(&package, "");
     let pres_path = root_rels
         .find_by_type(&RelationshipType::OfficeDocument)
@@ -189,8 +187,8 @@ pub fn walk(data: &[u8]) -> Result<PresentationPackage> {
             .and_then(|p| load_part(&package, &p));
 
         // The theme hangs off the master, so it is per-slide in exactly the
-        // way the master is. Resolved here rather than once for the deck: 12
-        // corpus decks reach more than one.
+        // way the master is — a deck can reach more than one theme, so it
+        // must not be resolved once for the whole deck.
         let theme_path = master
             .as_ref()
             .and_then(|m| m.resolve_rel_of_type(&RelationshipType::Theme));
@@ -214,8 +212,9 @@ pub fn walk(data: &[u8]) -> Result<PresentationPackage> {
         }
     }
 
-    // Retained for font resolution, which does not vary by master in any way
-    // the corpus shows. See the field docs for why colour must not use it.
+    // Retained for font resolution, which is stable enough across masters
+    // to use a single theme for. See the field docs for why colour must not
+    // use it.
     let theme = slides
         .iter()
         .find_map(|s| s.theme_path.as_deref())
@@ -284,26 +283,21 @@ fn load_rels(package: &PackageContents, part_path: &str) -> Relationships {
 }
 
 // ---------------------------------------------------------------------------
-// The presentation part is parsed by hand, NOT with serde. This is the one
-// place in the vendor that departs from the serde-schema convention, and the
-// reason is a hard limitation rather than taste:
+// The presentation part is parsed by hand, NOT with serde.
 //
 // quick-xml's serde layer matches attributes on their **local name with the
-// namespace prefix dropped** (the same property `serde_xml.rs` documents for
-// *elements*). `<p:sldId id="322" r:id="rId2"/>` therefore presents two
-// attributes both named `id`, and deserializing it fails with
-// `duplicate field @id` — which is exactly what the corpus reported, 45/45.
+// namespace prefix dropped**. `<p:sldId id="322" r:id="rId2"/>` therefore
+// presents two attributes both named `id`, and deserializing it fails with
+// `duplicate field @id`.
 //
 // There is no serde spelling that distinguishes them: `#[serde(rename =
 // "@r:id")]` never matches because the prefix is already gone, and
-// `alias = "@id"` would bind the *numeric slide id* to the relationship id —
-// silent corruption, the class `ATTRIBUTION.md` records as this vendor's
-// recurring trap. (`blip@r:embed` gets away with its alias only because no
-// competing `@embed` exists on that element.)
+// `alias = "@id"` would bind the *numeric slide id* to the relationship id,
+// silently corrupting it. (`blip@r:embed` gets away with its alias only
+// because no competing `@embed` exists on that element.)
 //
 // So the r:id-bearing lists are read with a namespace-aware reader that
-// compares the *qualified* name. The presentation part is small and flat, so
-// the cost is ~50 lines and it stays confined to this module.
+// compares the *qualified* name, confined to this module.
 //
 // The same collision exists on `p:sldMasterId` and `p:sldLayoutId`; anything
 // added later that reads those must come through here, not through serde.
@@ -397,8 +391,8 @@ mod tests {
 
     /// The regression this module exists for. `p:sldId` carries both `@id`
     /// and `@r:id`; quick-xml's serde layer drops namespace prefixes on
-    /// attributes, so a serde schema sees `duplicate field @id` and the
-    /// whole deck fails to parse (observed: 45/45 of the corpus).
+    /// attributes, so a serde schema would see `duplicate field @id` and
+    /// fail to parse.
     ///
     /// Two things must hold, and the second is the one that matters: the
     /// r:id must be read, AND the numeric `@id` must never stand in for it.

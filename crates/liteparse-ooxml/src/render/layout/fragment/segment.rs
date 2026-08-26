@@ -59,9 +59,7 @@ pub(super) struct JoinedTextSegment<'a> {
 }
 
 impl<'a> JoinedTextSegment<'a> {
-    /// Joined-and-stripped text. Used by tests to verify provenance and
-    /// by future paragraph-level diagnostics — kept as part of the public
-    /// API of this module.
+    /// Joined-and-stripped text. Used by tests to verify provenance.
     #[allow(dead_code)]
     pub(super) fn text(&self) -> &str {
         &self.text
@@ -247,7 +245,7 @@ impl<'a> SegmentBuilder<'a> {
     }
 }
 
-// ─── Tests (Phase α.0 + α.1) ─────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -520,7 +518,6 @@ mod tests {
     }
 
     /// B3 — keycap split as ["1", VS-16, U+20E3] → one Emoji piece.
-    /// **Direct fix for the user-visible keycap bug.**
     #[test]
     fn b3_cross_run_keycap_reassembles() {
         let inlines = vec![text_run("1"), text_run("\u{FE0F}"), text_run("\u{20E3}")];

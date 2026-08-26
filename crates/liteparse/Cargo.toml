@@ -74,9 +74,9 @@ oar-ocr-webgpu = ["oar-ocr", "oar-ocr/webgpu"]
 oar-ocr-openvino = ["oar-ocr", "oar-ocr/openvino"]
 tesseract = ["dep:tesseract-rs"]
 # Native office structure reading (no LibreOffice, no projection).
-# `office-native` is an internal marker enabled by every native-office reader, so code shared
-# between them (office::inline, the `apply_link` re-export) has one cfg to
-# name instead of an `any(...)` list that grows with each format.
+# `office-native` is an internal marker enabled by every native-office reader,
+# so code shared between them (the `apply_link` re-export, native complexity)
+# has one cfg to name instead of an `any(...)` list that grows per format.
 office-native = []
 docx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
 pptx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
@@ -118,7 +118,7 @@ regex = "1"
 # `office::xlsx` tests build minimal workbooks in memory, same pin as
 # liteparse-ooxml's own reader tests.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# `bold_census` only. Same pins as liteparse-ooxml's C′ measurer stack, so the
-# example inspects faces through exactly the types the render path resolves to.
+# `bold_census` example only. Same pins as liteparse-ooxml's font-measurement
+# stack, so the example inspects faces through the types the render path uses.
 fontdb = "0.22"
 skrifa = "0.45"

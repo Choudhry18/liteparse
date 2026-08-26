@@ -561,8 +561,8 @@ mod tests {
 
     #[test]
     fn bordered_paragraph_splits_across_pages() {
-        // §17.3.1.24: a bordered paragraph now splits (Phase C) instead of moving
-        // whole — the eight lines span two pages, and each page carries border
+        // §17.3.1.24: a bordered paragraph splits instead of moving whole —
+        // the eight lines span two pages, and each page carries border
         // draw commands (Line) for its segment of the box.
         let mut block = multiline_para(8, false, true);
         if let LayoutBlock::Paragraph { style, .. } = &mut block {
@@ -2970,15 +2970,10 @@ mod tests {
         let mut row_positions: Vec<(usize, f32, f32, String)> = Vec::new();
         for (pi, page) in pages.iter().enumerate() {
             for cmd in &page.commands {
-                if let DrawCommand::Text { text, position, .. } = cmd {
-                    if text.starts_with('r') {
-                        row_positions.push((
-                            pi,
-                            position.x.raw(),
-                            position.y.raw(),
-                            text.to_string(),
-                        ));
-                    }
+                if let DrawCommand::Text { text, position, .. } = cmd
+                    && text.starts_with('r')
+                {
+                    row_positions.push((pi, position.x.raw(), position.y.raw(), text.to_string()));
                 }
             }
         }

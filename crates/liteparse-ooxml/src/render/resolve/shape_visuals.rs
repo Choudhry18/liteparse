@@ -57,8 +57,8 @@ pub struct ResolvedVisuals {
 /// `None` for a shape at the top of a tree, and for every DOCX caller. It
 /// arrives resolved rather than as a `DrawingFill` for two reasons: the
 /// group's fill resolves in the group's own colour context, which is the one
-/// place it is correct to resolve it, and a group with 776 children resolves
-/// once instead of 776 times.
+/// place it is correct to resolve it, and a large group resolves its fill once
+/// instead of once per child.
 pub fn resolve_shape_visuals(
     props: Option<&ShapeProperties>,
     style_line_ref: Option<&StyleMatrixRef>,
@@ -85,9 +85,8 @@ pub fn resolve_shape_visuals(
     // §20.1.4.1.13: a direct spPr fill wins; otherwise fall back to the theme
     // fill style referenced by `<a:fillRef>` (recolored by its phClr).
     // A `grpFill` is a *declared* fill, so it wins over a `fillRef` even when
-    // the group hands back nothing: 269 corpus shapes declare both, and
-    // falling through to the theme on an unanswered group would paint them a
-    // colour the file never asks for.
+    // the group hands back nothing: falling through to the theme on an
+    // unanswered group would paint a colour the file never asks for.
     let fill = match props.fill.as_ref() {
         Some(f) => resolve_fill(f, ctx, media, group_fill),
         None => resolve_theme_fill(style_fill_ref, theme, ctx, media),
@@ -105,9 +104,8 @@ pub fn resolve_shape_visuals(
     let stroke = match props.outline.as_ref() {
         Some(o) => resolve_outline(o, theme_ln, ctx, &ln_ctx),
         // No `<a:ln>` at all: the `lnRef` is the whole outline, not just its
-        // defaults. 312 corpus shapes are in this case and PowerPoint strokes
-        // every one of them, so declining here is a missing outline rather
-        // than a conservative one.
+        // defaults. PowerPoint strokes these, so declining here would be a
+        // missing outline rather than a conservative one.
         None => theme_ln.and_then(|t| resolve_outline(t, None, &ln_ctx, &ln_ctx)),
     };
 
@@ -169,12 +167,10 @@ fn resolve_theme_fill(
 /// **Deliberately not [`resolve_theme_fill`].** A `bgRef` indexes a different
 /// matrix under a different convention: `idx` 1..=999 selects
 /// `fillStyleLst[idx - 1]`, while **1001 and above select
-/// `bgFillStyleLst[idx - 1001]`**. Routing a `bgRef` through the shape path
-/// would look up index 1000 of a 3-entry list, miss, and return
-/// [`ResolvedFill::None`] — a slide with no background rather than an error.
-/// Every one of the 440 `bgRef` backgrounds on the PPTX corpus uses
-/// `idx="1001"`, so that miss would have been the *only* outcome, on 100% of
-/// them.
+/// `bgFillStyleLst[idx - 1001]`**. Backgrounds routinely use `idx="1001"`;
+/// routing a `bgRef` through the shape path would look up index 1000 of a
+/// 3-entry list, miss, and return [`ResolvedFill::None`] — a slide with no
+/// background rather than an error.
 ///
 /// Kept as a separate entry point rather than a branch inside
 /// `resolve_theme_fill` so that a shape's `<a:fillRef>` — which has no
@@ -318,9 +314,8 @@ pub fn resolve_fill(
 /// caller can act on:
 ///
 /// * **no `a:blip` child** — an empty picture placeholder ("click to add
-///   picture"). 157 on the PPTX corpus, every one of them in a layout or
-///   master, and painting anything for them would stamp a phantom frame on
-///   every slide under that rung.
+///   picture"), typically in a layout or master; painting anything would stamp
+///   a phantom frame on every slide that inherits it.
 /// * **`r:link`** — the image lives outside the package; there are no bytes to
 ///   draw and never will be from this file alone.
 /// * **an `r:embed` the part does not declare**, or one whose target is
@@ -328,8 +323,7 @@ pub fn resolve_fill(
 /// * **`a:tile`** — the image repeats rather than stretching. Returned as
 ///   `None` on purpose: painting a tile stretched is a *wrong* slide in
 ///   exactly the way an unbuildable preset drawn as its bounding box would be,
-///   and the corpus has **zero** of them, so strictness here costs nothing and
-///   keeps the first real one from rendering silently wrong.
+///   so strictness here keeps the first real one from rendering silently wrong.
 ///
 /// The crop goes through [`relative_rect_to_fraction`], shared with the
 /// picture path, so a cropped fill and a cropped picture cannot diverge.
@@ -804,7 +798,7 @@ mod tests {
     }
 
     /// A theme line style whose colour is the `phClr` placeholder, which is how
-    /// every one of the corpus's `lnStyleLst` entries is written.
+    /// `lnStyleLst` entries are normally written.
     fn theme_with_phclr_line(width_emu: i64) -> Theme {
         use crate::model::DrawingColor;
         Theme {
@@ -821,8 +815,8 @@ mod tests {
     }
 
     /// §20.1.4.1.22: an `<a:ln>` that names no colour takes the theme line
-    /// style's, recoloured by the `lnRef`'s own `phClr` substitute — 179 corpus
-    /// shapes, every one of which used to be painted black.
+    /// style's, recoloured by the `lnRef`'s own `phClr` substitute — otherwise
+    /// it would be painted black.
     #[test]
     fn colourless_outline_takes_its_colour_from_the_line_ref() {
         use crate::model::DrawingColor;
@@ -858,8 +852,8 @@ mod tests {
         assert!(!v.stroke_color_defaulted);
     }
 
-    /// No `<a:ln>` at all: the `lnRef` is the whole outline. 312 corpus shapes,
-    /// which PowerPoint strokes and this resolver used to leave bare.
+    /// No `<a:ln>` at all: the `lnRef` is the whole outline, which PowerPoint
+    /// strokes.
     #[test]
     fn line_ref_supplies_the_whole_outline_when_there_is_no_ln() {
         use crate::model::DrawingColor;
@@ -1143,9 +1137,8 @@ mod tests {
     }
 
     /// With no group to inherit from, a `grpFill` is still a *declared* fill:
-    /// it resolves to nothing rather than falling through to the `fillRef`.
-    /// 269 corpus shapes declare both, and the fall-through would paint every
-    /// one of them a colour the file never asks for.
+    /// it resolves to nothing rather than falling through to the `fillRef`,
+    /// which would paint a colour the file never asks for.
     #[test]
     fn unanswered_grp_fill_does_not_fall_through_to_fill_ref() {
         let theme = ph_theme();
@@ -1267,9 +1260,9 @@ mod tests {
 
     #[test]
     fn blip_embed_absent_from_this_parts_table_is_not_painted() {
-        // The inherited-`rId1` trap, as a unit test: a layout picture's id
-        // looked up in the *slide's* table must resolve to nothing rather than
-        // to whatever that table happens to hold under the same id.
+        // A layout picture's rId looked up in the *slide's* media table must
+        // resolve to nothing rather than to whatever that table happens to
+        // hold under the same id.
         let media = media_with("rId1");
         let fill = blip_fill(Some("rId9"), BlipFillKind::Unspecified);
         assert!(matches!(
@@ -1280,8 +1273,8 @@ mod tests {
 
     #[test]
     fn blip_fill_with_no_blip_child_is_an_empty_placeholder() {
-        // 157 on the PPTX corpus, all in layouts and masters: "click to add
-        // picture". Correctly paints nothing.
+        // "Click to add picture" placeholder (layouts and masters): correctly
+        // paints nothing.
         let fill = blip_fill(None, BlipFillKind::Unspecified);
         assert!(matches!(
             resolve_blip_fill(&fill, Some(&media_with("rId1"))),

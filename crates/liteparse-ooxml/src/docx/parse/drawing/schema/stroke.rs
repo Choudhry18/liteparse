@@ -4,8 +4,6 @@
 //! optional children for fill, dash, join, and head/tail arrows. Consumes
 //! `DrawingFillXml` from the fill schema.
 
-#![allow(dead_code, clippy::large_enum_variant)]
-
 use serde::Deserialize;
 
 use crate::docx::dimension::{Dimension, Emu, ThousandthPercent};
@@ -320,7 +318,6 @@ impl From<OutlineXml> for Outline {
                 | LnChildXml::GradFill(_)
                 | LnChildXml::BlipFill(_)
                 | LnChildXml::PattFill(_) => {
-                    // Wrap the raw variant into a DrawingFillXml for conversion.
                     let f = match child {
                         LnChildXml::NoFill(e) => DrawingFillXml::NoFill(e),
                         LnChildXml::GrpFill(e) => DrawingFillXml::GrpFill(e),

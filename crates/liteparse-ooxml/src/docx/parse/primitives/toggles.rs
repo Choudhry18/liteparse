@@ -4,9 +4,9 @@
 //! presence alone asserts the property. With `@val`, the spec lists
 //! `true`/`1`/`on` and `false`/`0`/`off` as the valid values.
 //!
-//! Per plan §Decisions, `OnOff` is the single spec-driven exception to
-//! strict enum handling: unknown `@val` values resolve to `true` rather than
-//! failing deserialization, matching legacy Word's tolerant toggle behavior.
+//! `OnOff` is deliberately lenient: unknown `@val` values resolve to `true`
+//! rather than failing deserialization, matching Word's tolerant toggle
+//! behavior.
 //!
 //! [`AttrBool`] is the attribute-level counterpart: a plain boolean
 //! attribute like `@rotWithShape="1"` that reads as a string and maps

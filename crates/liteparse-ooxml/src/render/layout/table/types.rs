@@ -29,23 +29,18 @@ pub struct TableRowInput {
     /// cell's leftmost grid column is `grid_before`, not 0.
     ///
     /// There is deliberately no `grid_after` counterpart. §17.4.16 `gridAfter`
-    /// is *derivable* — the row's right edge is `grid_before` plus the sum of
-    /// its cells' `grid_span`s — and every consumer here works from that
-    /// running grid column already, including the border resolution that
-    /// decides whether the last cell sits at the table edge (`insideV`) or not.
-    /// The model keeps `gridAfter` as parsed (`model::TableRowProperties`);
-    /// carrying it into layout added a field nothing read.
+    /// is derivable — the row's right edge is `grid_before` plus the sum of its
+    /// cells' `grid_span`s — and every consumer here works from that running
+    /// grid column already, including the border resolution that decides whether
+    /// the last cell sits at the table edge (`insideV`) or not.
     pub grid_before: u32,
-    /// §17.4.61 `<w:tblPrEx><w:tblBorders/></w:tblPrEx>` — per-row
-    /// override of the table-level `tblBorders`. When set, each side
-    /// independently replaces the corresponding side of the table's
-    /// `TableBorderConfig` for this row only; sides absent from the
-    /// override fall through to the table's value.
+    /// §17.4.61 `<w:tblPrEx><w:tblBorders/></w:tblPrEx>` — per-row override of
+    /// the table-level `tblBorders`. When set, each side independently replaces
+    /// the corresponding side of the table's `TableBorderConfig` for this row
+    /// only; sides absent from the override fall through to the table's value.
     ///
-    /// Note that an override side of `None` means "explicitly no
-    /// border" (Word's `<w:top w:val="none"/>`) — the parser converts
-    /// `val="none"` to `None` here, matching the layout's invariant
-    /// that `None` is "draw nothing" everywhere else in this module.
+    /// An override side of `None` means "explicitly no border" (`val="none"`),
+    /// matching this module's invariant that `None` is "draw nothing".
     pub border_overrides: Option<TableBorderConfig>,
 }
 

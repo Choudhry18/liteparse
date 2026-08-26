@@ -386,7 +386,7 @@ mod tests {
         }
     }
 
-    /// A table style like `Tabellenraster`: every side plus insideH/insideV.
+    /// A table style with every side plus insideH/insideV.
     fn all_single() -> TableBorderConfig {
         let s = single(0.5);
         TableBorderConfig {
@@ -431,30 +431,25 @@ mod tests {
         }
     }
 
-    /// [MS-OI29500] §17.4.66 regression: a `gridSpan` upper cell facing several
-    /// lower cells must not drop the later cells' top borders (previously only
-    /// the first lower cell was resolved and the rest nulled), and the whole
-    /// shared edge must be drawn from a single side so the line does not split
-    /// across two y positions. Mirrors the real doc's
-    /// `[spacer | Function: | Qualitätssicherung]` row under a `gridSpan` header.
+    /// [MS-OI29500] §17.4.66: a `gridSpan` upper cell facing several lower cells
+    /// must not drop the later cells' top borders, and the whole shared edge
+    /// must be drawn from a single side so the line does not split across two y
+    /// positions.
     ///
-    /// Non-uniformity comes from a **heavier border on one column**, not from a
-    /// `nil`. It used to come from a nil, which worked only while nil resolved
-    /// to "absent": now that nil suppresses (§17.4.66), a nil under the wide
-    /// cell makes its run uniformly suppressed and the upper row owns the edge —
-    /// the opposite branch, so the configuration no longer reaches the bug this
-    /// test exists for. Suppression is covered separately by
-    /// `nil_suppresses_across_a_gridspan_mismatch`.
+    /// Non-uniformity here comes from a **heavier border on one column**, not
+    /// from a `nil` (a `nil` under the wide cell would make its run uniformly
+    /// suppressed and hand the edge to the upper row — the opposite branch,
+    /// covered by `nil_suppresses_across_a_gridspan_mismatch`).
     #[test]
     fn wide_upper_cell_draws_whole_edge_from_lower_row() {
         let s = single(0.5);
         let heavy = single(2.0);
         let rows = vec![
-            // Row 0: gridSpan=2 header over spacer+Function, then two single
-            // cells over the Qualitätssicherung span. All bottoms inherit.
+            // Row 0: gridSpan=2 header over cols 0-1, then two single cells over
+            // cols 2-3. All bottoms inherit.
             row(vec![cell(2, None), cell(1, None), cell(1, None)]),
-            // Row 1: [spacer | Function (heavy top) | Q (gridSpan=2)]. The heavy
-            // top on column 1 alone makes the wide upper cell's run non-uniform.
+            // Row 1: [spacer | heavy top | gridSpan=2]. The heavy top on column
+            // 1 alone makes the wide upper cell's run non-uniform.
             row(vec![
                 cell(1, None),
                 cell(1, Some(cb(Some(CellBorderOverride::Border(heavy)), None))),
@@ -473,7 +468,7 @@ mod tests {
         );
 
         // Whole edge drawn from the lower row → every upper bottom cleared,
-        // so Function and Qualitätssicherung tops share one y position.
+        // so columns 1 and 2 tops share one y position.
         for b in &m.rows[0].borders {
             assert_eq!(
                 b.bottom,
@@ -489,24 +484,21 @@ mod tests {
         assert_eq!(
             m.rows[1].borders[1].top.line(),
             Some(heavy),
-            "Function keeps its heavier top border across the gridSpan mismatch"
+            "column 1 keeps its heavier top border across the gridSpan mismatch"
         );
         assert_eq!(
             m.rows[1].borders[2].top.line(),
             Some(s),
-            "Qualitätssicherung top drawn from the same (lower) side as Function"
+            "column 2 top drawn from the same (lower) side as column 1"
         );
     }
 
     /// §17.4.66 step 0 across a `gridSpan` mismatch: a `nil` bottom on a wide
     /// upper cell suppresses the columns it spans that fall back to the table —
     /// but **not** the column where the lower cell has a border of its own,
-    /// which survives and is drawn from below. One nil bottom therefore resolves to two different
-    /// answers along its own width, which is exactly the case that forces the
-    /// per-column resolution this pass does.
-    ///
-    /// This is the configuration `wide_upper_cell_draws_whole_edge_from_lower_row`
-    /// used to carry, kept here for what it now demonstrates.
+    /// which survives and is drawn from below. One nil bottom therefore resolves
+    /// to two different answers along its own width, which is exactly the case
+    /// that forces the per-column resolution this pass does.
     #[test]
     fn nil_suppresses_across_a_gridspan_mismatch() {
         let s = single(0.5);
@@ -534,8 +526,8 @@ mod tests {
         );
 
         // The nil bottom spans columns 0-1 and resolves differently on each:
-        // column 0 faces another nil and stays suppressed, column 1 faces
-        // Function's *declared* top and loses to it. A cell paints one border
+        // column 0 faces another nil and stays suppressed, column 1 faces the
+        // lower cell's *declared* top and loses to it. A cell paints one border
         // across its width, so that split hands the whole edge to the lower row.
         for b in &m.rows[0].borders {
             assert_eq!(
@@ -552,7 +544,7 @@ mod tests {
         assert_eq!(
             m.rows[1].borders[1].top.line(),
             Some(s),
-            "column 1: Function has a top of its own, so the nil above does not erase it"
+            "column 1: the lower cell has a top of its own, so the nil above does not erase it"
         );
         // Columns outside the nil span keep the inherited insideH, drawn from
         // the same (lower) side so the line sits at one y.
@@ -624,14 +616,10 @@ mod tests {
     /// `insideH` for its whole width and paints one border across it; a
     /// neighbour's `nil` empties only that neighbour's own edge.
     ///
-    /// This is `IP 05 Trenches`' `Date/Time:` cell with the sides swapped — the
-    /// real document has the wide spacer cell *below*, its `nil` aimed at the
-    /// narrow spacer column, and the label cell above still draws the bottom it
-    /// inherited. The assertion here was inverted twice: once when `nil`
-    /// wrongly collapsed to "absent" (so it also wrongly *inherited*), and once
-    /// when `nil` was made to win the conflict outright. Declining inheritance
-    /// and overruling the neighbour are different powers; `nil` has only the
-    /// first.
+    /// Declining inheritance and overruling the neighbour are different powers;
+    /// `nil` has only the first. A `nil` that wrongly collapsed to `Absent`
+    /// would also wrongly inherit; a `nil` made to win the conflict outright
+    /// would erase the facing border. Neither is correct.
     #[test]
     fn nil_spacer_cannot_punch_a_gap_through_a_wide_facing_cell() {
         let s = single(0.5);
@@ -669,11 +657,10 @@ mod tests {
         assert_eq!(m.rows[1].borders[0].top.line(), None);
     }
 
-    /// [MS-OI29500] §17.4.66 regression: an upper `gridSpan` cell that leaves the last
-    /// column uncovered (its gridAfter gap) must not "own" the edge, or a
-    /// lower cell straddling that boundary would draw its own top over the
-    /// upper bottom → a doubled line. Mirrors the real doc's `gridSpan=9`
-    /// section row above the `Observations` (`gridSpan=2`) header.
+    /// [MS-OI29500] §17.4.66: an upper `gridSpan` cell that leaves the last
+    /// column uncovered (its gridAfter gap) must not "own" the edge, or a lower
+    /// cell straddling that boundary would draw its own top over the upper
+    /// bottom → a doubled line.
     #[test]
     fn upper_grid_after_gap_yields_edge_to_lower_row() {
         let s = single(0.5);

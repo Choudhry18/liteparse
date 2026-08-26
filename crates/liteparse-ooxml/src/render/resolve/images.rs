@@ -22,14 +22,12 @@ pub struct MediaEntry {
 /// The media one package part can reach, keyed by the `r:embed` ids **that
 /// part itself declares**.
 ///
-/// Per part, not per package, and that is the load-bearing half rather than a
-/// caching detail. A slide, its layout and its master each carry their own
-/// `.rels`, and `rId1` in all three routinely names three different images —
-/// so an inherited picture resolved against the *slide's* table returns a real
-/// photograph from the wrong relationship. That is the same failure class as
-/// `bgRef@idx` reading `fillStyleLst` and as a deck-wide theme colouring a
-/// second master's slides: a well-typed answer that is wrong, and invisible to
-/// any gate that only asks whether resolution succeeded.
+/// Per part, not per package. A slide, its layout and its master each carry
+/// their own `.rels`, and `rId1` in all three routinely names three different
+/// images — so an inherited picture resolved against the *slide's* table would
+/// return a real photograph from the wrong relationship: a well-typed answer
+/// that is wrong, and invisible to any check that only asks whether resolution
+/// succeeded.
 ///
 /// A missing key means "this part declares no such relationship, or it points
 /// outside the package" (`r:link`), which the caller reports rather than
@@ -270,8 +268,8 @@ mod tests {
 
     #[test]
     fn src_rect_converts_thousandth_percent_crop() {
-        // Real values from the IP-05 header logo: top/right/bottom crop, no
-        // left. Thousandths of a percent → fractions of the natural extent.
+        // Top/right/bottom crop, no left. Thousandths of a percent → fractions
+        // of the natural extent.
         let mut img = make_image_with_blip("rId1");
         if let Some(GraphicContent::Picture(pic)) = img.graphic.as_mut() {
             pic.blip_fill.src_rect = Some(RelativeRect {

@@ -2,18 +2,13 @@
 
 /// Errors that can occur during rendering.
 ///
-/// There is exactly one, and it is the only condition the pipeline cannot
-/// render its way out of. Emptiness is deliberately *not* one: a document with
-/// no content produces a single blank page (`render::layout_document`), which
-/// is what Word does — so the `EmptyDocument` variant this type used to carry
-/// was not merely unconstructed, it contradicted the behaviour the pipeline
-/// had chosen.
+/// An empty document is not an error: it produces a single blank page
+/// (`render::layout_document`), matching Word's behavior.
 #[derive(Debug)]
 pub enum RenderError {
     /// The host font system exposes no typeface at all, so there is nothing to
     /// fall back to when a requested family cannot be resolved. Seen on
-    /// container images built without any fonts installed, and with a
-    /// deliberately empty `FontMgr`.
+    /// container images built without any fonts installed.
     NoFontsAvailable,
 }
 

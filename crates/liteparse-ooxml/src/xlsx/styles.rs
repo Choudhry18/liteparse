@@ -19,16 +19,15 @@
 //!
 //! Fills, borders and font colours are read for the raster (a bbox consumer
 //! never asks what colour a cell is). Every one of them names its colour
-//! through the same four-way `CT_Color` indirection, and the corpus shares
-//! them out unevenly enough that skipping any one of the four is visible —
-//! `xlsx_paint_census` over 1,248 workbooks: `indexed=` 49.5% of definitions,
-//! `theme=` 29.8%, `rgb=` 16.5%, `auto=` 4.2%.
+//! through the same four-way `CT_Color` indirection (`rgb=`, `theme=`,
+//! `indexed=`, `auto=`), and skipping any one of the four is visible in real
+//! workbooks.
 //!
-//! Two things about that table are load-bearing:
+//! Two things about that indirection are load-bearing:
 //!
-//! * **`indexed=` is mostly not the palette.** 93.2% of its uses are 64/65/8
-//!   — "the default colour" — so [`INDEXED_PALETTE`] is a vendored constant
-//!   for a 6.8% tail rather than a subsystem. It cannot be *skipped*: 4.6% of
+//! * **`indexed=` is mostly not the palette.** Most uses are 64/65/8 —
+//!   "the default colour" — so [`INDEXED_PALETTE`] is a vendored constant
+//!   for the rest rather than a subsystem. It cannot be *skipped*: some
 //!   workbooks override it with their own `<indexedColors>`.
 //! * **`theme=` indices are not `clrScheme` order.** SpreadsheetML swaps
 //!   0↔1 and 2↔3 (0 = lt1/background, 1 = dk1/text). Getting it backwards
@@ -46,10 +45,6 @@ use crate::xlsx::xml::{attr, attr_bool, attr_parse, local_name};
 
 /// The format code applied when a cell names no style at all.
 pub const GENERAL: &str = "General";
-
-/// Custom format ids start here (§18.8.30); anything below with no builtin
-/// entry is reserved and Excel does not write it.
-pub const FIRST_CUSTOM_FORMAT_ID: u32 = 164;
 
 /// ECMA-376 §18.8.30 builtin number formats.
 ///
@@ -221,8 +216,10 @@ impl ColorRef {
 /// and every corpus value writes `FF`.
 fn parse_argb(hex: &str) -> Option<[u8; 3]> {
     let hex = hex.trim();
+    // `get` rather than a direct slice: byte 2 may not be a char boundary
+    // when a multi-byte character happens to give an 8-byte value.
     let body = match hex.len() {
-        8 => &hex[2..],
+        8 => hex.get(2..)?,
         6 => hex,
         _ => return None,
     };
@@ -239,11 +236,8 @@ fn parse_argb(hex: &str) -> Option<[u8; 3]> {
 /// and for single-direction stripes (one line in four is light, one in two is
 /// dark). It is an approximation for the crosshatches, where the two stroke
 /// directions overlap: `lightGrid` is taken as two light stripes less their
-/// intersection, and the trellises as their dark counterparts. That
-/// approximation reaches **no corpus cell** — every one of the 323 hatched
-/// cells across 1,248 workbooks is `gray0625` (210), `lightHorizontal` (63),
-/// `lightGray` (39), `gray125` (6), `darkGray` (3) or `lightUp` (2), all of
-/// which have exact fractions.
+/// intersection, and the trellises as their dark counterparts. Crosshatches
+/// are rare in practice, so the approximation is seldom exercised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HatchPattern {
     Gray0625,
@@ -303,9 +297,8 @@ impl HatchPattern {
 
 /// §18.18.55 `ST_PatternType`, collapsed to what a painter does about it.
 ///
-/// The collapse is measured rather than lazy: of 2,386,621 filled cells in
-/// the corpus, **2,386,298 (100.0%) are `solid`** — every other pattern type
-/// put together is 323 cells. Those 323 do not get a pattern engine; they get
+/// The overwhelming majority of filled cells use `solid`; every other
+/// pattern type is rare. Those do not get a pattern engine; they get
 /// [`HatchPattern::coverage`], which is one blend rather than a tiled bitmap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PatternType {
@@ -350,9 +343,8 @@ impl Fill {
 /// §18.18.3 `ST_BorderStyle`.
 ///
 /// The full enum is kept — reading `dashDot` as `none` would erase an edge —
-/// but the corpus makes clear what has to be *right*: thin 91.6%, hair 4.3%,
-/// medium 3.9% are 99.8% of 42,885,045 declared edges, and everything
-/// dashed/dotted together is under 0.05%.
+/// but `thin`, `hair` and `medium` dominate real workbooks; dashed and dotted
+/// styles are rare.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BorderStyle {
     #[default]
@@ -420,8 +412,8 @@ impl BorderStyle {
     /// which Excel draws as two strokes with a stroke-wide gap between them —
     /// three pen widths of cell, not one. A painter that reserved only
     /// `width_pt` for it would overlap the neighbouring edge's inset, and one
-    /// that drew a single stroke would render 27,300 corpus edges (0.1%, and
-    /// more than every dashed style put together) as a plain thin line.
+    /// that drew a single stroke would render every `double` edge as a plain
+    /// thin line.
     pub fn extent_pt(self) -> f32 {
         match self {
             BorderStyle::Double => self.width_pt() * 3.0,
@@ -612,8 +604,8 @@ pub struct Styles {
     fonts: Vec<Font>,
     fills: Vec<Fill>,
     borders: Vec<Border>,
-    /// `<indexedColors>` when the file replaces the legacy palette — 4.6% of
-    /// corpus workbooks do. `None` means [`INDEXED_PALETTE`] stands.
+    /// `<indexedColors>` when the file replaces the legacy palette. `None`
+    /// means [`INDEXED_PALETTE`] stands.
     indexed_colors: Option<Vec<[u8; 3]>>,
 }
 
@@ -950,8 +942,7 @@ impl Styles {
     /// — `auto="1"`, `indexed=64`/`65`, an unresolvable theme index — because
     /// the default differs by consumer: automatic text is black, an automatic
     /// background is white, and collapsing them here would paint white text
-    /// on white cells. The census makes that concrete: 35.1% of colour-
-    /// carrying cells name an automatic colour.
+    /// on white cells. Automatic colours are common enough that this matters.
     ///
     /// The theme mapping is the one that is easy to get wrong.
     /// SpreadsheetML's indices are **not** `<a:clrScheme>` document order:
@@ -998,9 +989,9 @@ impl Styles {
     /// `<indexedColors>` when it declares one, else [`INDEXED_PALETTE`].
     ///
     /// 64 and 65 (system foreground/background) and anything past the table
-    /// are `None`: they are automatic, not stored colours. That pair is
-    /// 89.4% of every `indexed=` in the corpus, which is why the palette
-    /// itself is a small tail rather than the main path.
+    /// are `None`: they are automatic, not stored colours. That pair is most
+    /// `indexed=` uses in practice, which is why the palette itself is a
+    /// small tail rather than the main path.
     pub fn indexed_color(&self, index: u32) -> Option<[u8; 3]> {
         let i = index as usize;
         match self.indexed_colors.as_deref() {
@@ -1015,7 +1006,7 @@ impl Styles {
         }
     }
 
-    /// Does the file replace the legacy palette? 4.6% of corpus workbooks do.
+    /// Does the file replace the legacy palette?
     pub fn overrides_indexed_palette(&self) -> bool {
         self.indexed_colors.is_some()
     }
@@ -1052,9 +1043,9 @@ impl Styles {
 /// black (negative), leaving hue and saturation alone.
 ///
 /// The HSL round-trip matters rather than a straight RGB lerp: a themed
-/// accent tinted in RGB drifts toward grey as it lightens, and the corpus
-/// tints accents constantly — banded table styles are a single accent at four
-/// tints, and drift makes the bands read as different colours.
+/// accent tinted in RGB drifts toward grey as it lightens. Banded table
+/// styles are a single accent at several tints, and drift would make the
+/// bands read as different colours.
 fn apply_tint(base: [u8; 3], tint: f64) -> [u8; 3] {
     if tint == 0.0 || !tint.is_finite() {
         return base;
@@ -1124,6 +1115,16 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_argb_rejects_malformed_input_without_panicking() {
+        assert_eq!(parse_argb("FF12AB34"), Some([0x12, 0xAB, 0x34]));
+        assert_eq!(parse_argb("12AB34"), Some([0x12, 0xAB, 0x34]));
+        // 8 bytes but byte 2 lands inside `é`: must return None, not panic.
+        assert_eq!(parse_argb("aé12345"), None);
+        assert_eq!(parse_argb("nothex!!"), None);
+        assert_eq!(parse_argb(""), None);
+    }
 
     const STYLES: &str = r#"<?xml version="1.0"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -1396,8 +1397,8 @@ mod tests {
     }
 
     /// Without the theme part, a themed colour is *automatic* rather than
-    /// black — resolving it to black would paint white-on-black cells in the
-    /// 0.6% of workbooks that ship no theme.
+    /// black — resolving it to black would paint white-on-black cells in a
+    /// workbook that ships no theme.
     #[test]
     fn a_themed_colour_with_no_theme_is_automatic() {
         assert_eq!(
@@ -1412,9 +1413,9 @@ mod tests {
         );
     }
 
-    /// "Accent1, Lighter 40%" — the single most common tint in the corpus,
-    /// since it is what every banded table style is built from. Excel
-    /// renders `4472C4` at `tint=0.4` as `8EA9DB`.
+    /// "Accent1, Lighter 40%" — a very common tint, since it is what every
+    /// banded table style is built from. Excel renders `4472C4` at
+    /// `tint=0.4` as `8EA9DB`.
     ///
     /// Matched to ±1 per channel rather than exactly: Excel converts through
     /// an *integer* HLS space (luminance in 0..240 steps), so its answer is
@@ -1448,9 +1449,10 @@ mod tests {
         assert_eq!(tinted(0.0), [0x44, 0x72, 0xC4]);
     }
 
-    /// 93.2% of `indexed=` is 64/65/8 — the automatic sentinels and black.
-    /// Resolving 64 to palette-position-64 (which does not exist) or to
-    /// black would repaint a third of the corpus's colour-carrying cells.
+    /// `indexed=` is overwhelmingly 64/65/8 in practice — the automatic
+    /// sentinels and black. Resolving 64 to palette-position-64 (which does
+    /// not exist) or to black would repaint most colour-carrying cells
+    /// wrong.
     #[test]
     fn the_automatic_indexed_sentinels_resolve_to_nothing() {
         let s = styles();
@@ -1482,8 +1484,8 @@ mod tests {
         assert_eq!(parse_argb("nope"), None);
     }
 
-    /// The three styles that are 99.8% of the corpus's edges must differ in
-    /// width, or every table reads as one weight.
+    /// The three most common border styles must differ in width, or every
+    /// table reads as one weight.
     #[test]
     fn border_widths_separate_the_three_common_styles() {
         assert!(BorderStyle::Hair.width_pt() < BorderStyle::Thin.width_pt());

@@ -10,7 +10,7 @@
 use crate::model::Block;
 
 use crate::render::dimension::Pt;
-use crate::render::resolve::header_footer::{HeaderFooterKind, HeaderFooterSet};
+use crate::render::resolve::header_footer::HeaderFooterSet;
 
 use super::build::{BuildContext, BuildState, HeaderFooterContent, build_header_footer_content};
 use super::draw_command::{DrawCommand, LayoutedPage};
@@ -53,25 +53,6 @@ pub fn select_slot<T>(
         return set.even.as_ref();
     }
     set.default.as_ref()
-}
-
-/// Variant of [`select_slot`] that also tells the caller which kind of
-/// slot was chosen. Useful for diagnostics and for callers that need
-/// to bookkeep per-kind layout state (e.g. header-area heights).
-pub fn select_slot_with_kind<T>(
-    set: &HeaderFooterSet<T>,
-    first_in_section: bool,
-    logical_page_number: usize,
-    title_pg: bool,
-    even_and_odd: bool,
-) -> Option<(HeaderFooterKind, &T)> {
-    if title_pg && first_in_section {
-        return set.first.as_ref().map(|t| (HeaderFooterKind::First, t));
-    }
-    if even_and_odd && logical_page_number.is_multiple_of(2) {
-        return set.even.as_ref().map(|t| (HeaderFooterKind::Even, t));
-    }
-    set.default.as_ref().map(|t| (HeaderFooterKind::Default, t))
 }
 
 /// Vertical body boundaries for one physical page.
@@ -1007,25 +988,6 @@ mod tests {
                 chap_sep: None,
             };
             assert_eq!(next_logical_page_base(4, Some(&pnt)), 4);
-        }
-
-        // Variant returning the kind --------------------------------
-
-        #[test]
-        fn select_slot_with_kind_reports_the_chosen_slot() {
-            let set = full_set();
-            assert_eq!(
-                select_slot_with_kind(&set, true, 1, true, false),
-                Some((HeaderFooterKind::First, &"F")),
-            );
-            assert_eq!(
-                select_slot_with_kind(&set, false, 2, false, true),
-                Some((HeaderFooterKind::Even, &"E")),
-            );
-            assert_eq!(
-                select_slot_with_kind(&set, false, 3, false, true),
-                Some((HeaderFooterKind::Default, &"D")),
-            );
         }
     }
 }

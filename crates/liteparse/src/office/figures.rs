@@ -1,20 +1,16 @@
 //! The figure/image sink shared by the native office paths.
 //!
 //! Assigns figure ids and accumulates the bytes behind them, document-wide.
-//! Grown in `office/pptx.rs` and moved here unchanged when the XLSX path
-//! needed the same dedup; the id *scope* is the one generalization — PPTX
-//! passes `p{page}` (a slide is a page), XLSX passes `s{sheet}` (a sheet's
-//! pictures stay numbered together however its rows paginate).
+//! The id *scope* is the one thing callers vary: PPTX passes `p{page}` (a slide
+//! is a page), XLSX passes `s{sheet}` (a sheet's pictures stay numbered
+//! together however its rows paginate).
 //!
-//! Ids follow the platform extractor's `{scope}_{n}` naming, 1-based, so
-//! `img_{id}.{ext}` file names line up with the PDF and DOCX paths'.
+//! Ids are `{scope}_{n}`, 1-based, so `img_{id}.{ext}` file names line up with
+//! the PDF and DOCX paths'.
 //!
-//! **`n` counts in reading order, not draw order.** Draw order is available —
-//! it is source order — but using it would mean a second walk purely to
-//! number things, and reading order is the order the `![](…)` refs appear in
-//! the markdown, so a reader scanning down the page sees `_1` before `_2`.
-//! The platform's caveat about index drift (its extractor increments even for
-//! images it skips) already means these indices are names, not positions.
+//! `n` counts in reading order (the order the `![](…)` refs appear in the
+//! markdown), so a reader scanning down the page sees `_1` before `_2`. These
+//! indices are names, not positions.
 
 use std::collections::HashMap;
 
@@ -26,10 +22,9 @@ use crate::types::{ExtractedImage, Rect};
 pub(crate) struct FigureSink {
     pub(crate) images: Vec<ExtractedImage>,
     /// Same source allocation ⇒ same bytes. Free dedup for the repeated-logo
-    /// case — on the PPTX corpus, 3,602 placements behind 1,322 distinct
-    /// images — because both readers pool media bytes per package path, so a
-    /// part referenced twice shares one buffer and hits here rather than in
-    /// the hash map below.
+    /// case: both readers pool media bytes per package path, so a part
+    /// referenced twice shares one buffer and hits here rather than in the hash
+    /// map below.
     by_ptr: HashMap<usize, usize>,
     /// Distinct rels can still hold identical bytes; hash → candidate
     /// canonical indices, confirmed by full compare like the DOCX path's.
@@ -94,13 +89,10 @@ impl FigureSink {
             }
             None => {
                 let bytes = std::sync::Arc::new(data.to_vec());
-                // The *natural* size of the image, not the placed box —
-                // `bbox` already carries the placement. A crop is not applied
-                // to either: `src_rect` describes a visible sub-rectangle the
-                // bytes still contain, and 44% of PPTX corpus pictures
-                // declare one, so re-encoding to honour it would re-encode
-                // nearly half the corpus to change a number no consumer
-                // reads.
+                // The natural size of the image, not the placed box — `bbox`
+                // already carries the placement. An `src_rect` crop is not
+                // applied: it describes a visible sub-rectangle the bytes still
+                // contain, and no consumer reads the cropped dimensions.
                 let (width, height) =
                     image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
                         .with_guessed_format()
