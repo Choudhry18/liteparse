@@ -130,7 +130,13 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
     // Pictures found while walking the sheets, resolved down to a media part
     // path. The bytes move out of the package afterwards, when the immutable
     // borrows this loop holds are gone.
-    let mut pending_pics: Vec<(usize, drawings::PicAnchor, Option<String>, String)> = Vec::new();
+    let mut pending_pics: Vec<(
+        usize,
+        drawings::PicAnchor,
+        Option<[f64; 4]>,
+        Option<String>,
+        String,
+    )> = Vec::new();
     for entry in &pkg.sheets {
         if !entry.is_worksheet {
             non_worksheet_sheets.push(entry.name.clone());
@@ -177,6 +183,7 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
                                         pending_pics.push((
                                             sheets.len(),
                                             raw.anchor,
+                                            raw.frac,
                                             raw.name,
                                             resolve_target(&ddir, &r.target),
                                         ));
@@ -205,7 +212,7 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
     // downstream dedup keys on.
     let mut media: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>> =
         std::collections::HashMap::new();
-    for (si, anchor, name, media_path) in pending_pics {
+    for (si, anchor, frac, name, media_path) in pending_pics {
         let bytes = match media.get(&media_path) {
             Some(b) => b.clone(),
             None => match pkg.package.take_part(&media_path) {
@@ -223,6 +230,7 @@ pub fn read(data: &[u8]) -> Result<Workbook> {
         let format = crate::model::ImageFormat::detect(&media_path, &bytes);
         sheets[si].pics.push(drawings::SheetPic {
             anchor,
+            frac,
             name,
             media_path,
             format,

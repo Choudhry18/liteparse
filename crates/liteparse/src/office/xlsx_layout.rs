@@ -354,6 +354,7 @@ pub fn workbook_to_pages(
                     page_width,
                     &canvas,
                     &ink.anchor,
+                    None,
                 );
                 ink_commands(
                     ink,
@@ -371,6 +372,7 @@ pub fn workbook_to_pages(
                 page_width,
                 &canvas,
                 &shape.anchor,
+                None,
             );
             shape_rects.push((page_local, rect.clone()));
             shape_text_items(shape, &rect, &mut shape_items_per_page[page_local]);
@@ -414,6 +416,7 @@ pub fn workbook_to_pages(
                 page_width,
                 &canvas,
                 &pic.anchor,
+                pic.frac,
             );
             rects_per_page[page_local].push(rect.clone());
             if opts.paint {
@@ -778,8 +781,8 @@ impl AnchorMap {
 /// What it deliberately shares with the PPTX painter's approximations: all
 /// of one page's fills paint before any of its shape text, so an overlapping
 /// shape's fill does not cover a neighbour's words; a picture *inside a
-/// group* is not painted here (it already paints at the anchor box via the
-/// float pass, which is the landed approximation for grouped pics); an
+/// group* is not painted here (it paints via the float pass, at the composed
+/// box the reader derived from this same tree — see [`SheetPic::frac`]); an
 /// unbuildable preset is skipped, never approximated by its bounding box.
 fn ink_commands(
     ink: &liteparse_ooxml::xlsx::SheetInk,
@@ -2178,6 +2181,7 @@ impl SheetGeometry {
         page_width: f32,
         canvas: &CanvasGrid<'_>,
         anchor: &PicAnchor,
+        frac: Option<[f64; 4]>,
     ) -> (usize, Rect) {
         let (gx, gy, gw, gh) = match *anchor {
             PicAnchor::OneCell { from, ext_emu } => {
@@ -2199,6 +2203,19 @@ impl SheetGeometry {
                 emu_pt(ext_emu.0).max(1.0),
                 emu_pt(ext_emu.1).max(1.0),
             ),
+        };
+        // A grouped picture's anchor covers its whole group; its own box is
+        // the reader's composed fraction of that rect ([`SheetPic::frac`]),
+        // applied before page assignment so a pic at the bottom of a tall
+        // group lands on the page its top edge is actually on.
+        let (gx, gy, gw, gh) = match frac {
+            Some([fx, fy, fw, fh]) => (
+                gx + fx * gw,
+                gy + fy * gh,
+                (gw * fw).max(1.0),
+                (gh * fh).max(1.0),
+            ),
+            None => (gx, gy, gw, gh),
         };
         let mut page = 0;
         for (i, r) in ranges.iter().enumerate() {

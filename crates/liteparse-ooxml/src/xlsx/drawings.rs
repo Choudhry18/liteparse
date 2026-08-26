@@ -94,6 +94,16 @@ impl PicAnchor {
 #[derive(Clone, Debug)]
 pub struct SheetPic {
     pub anchor: PicAnchor,
+    /// For a picture inside a `xdr:grpSp`: its composed box as fractions
+    /// `[x, y, w, h]` of the anchor's own box. The anchor places the whole
+    /// group; the fraction is the pic's `a:xfrm` folded through every
+    /// enclosing group's child space by the shared geometry pass — the same
+    /// composition, over the same root bounding box, that places the group's
+    /// ink, so the two cannot drift apart. `None` for a top-level picture
+    /// (the anchor box *is* its box) and for the fail-open cases — a tree the
+    /// shared model cannot parse, a degenerate root box — which keep the
+    /// group-box approximation this field replaced.
+    pub frac: Option<[f64; 4]>,
     /// `xdr:cNvPr@name`, when the producer wrote one.
     pub name: Option<String>,
     /// Package path of the media part — the dedup key across placements.
@@ -108,6 +118,13 @@ pub(crate) struct RawPic {
     pub(crate) anchor: PicAnchor,
     pub(crate) name: Option<String>,
     pub(crate) rel_id: String,
+    /// See [`SheetPic::frac`]. Filled by [`compose_grouped_pics`].
+    pub(crate) frac: Option<[f64; 4]>,
+    /// Index into the part's anchors, the join key to the ink slice the
+    /// composed box is derived from.
+    anchor_idx: usize,
+    /// The pic sat inside at least one `xdr:grpSp`.
+    grouped: bool,
 }
 
 /// One visible text-bearing shape placed on a sheet. Unlike a picture there
@@ -133,6 +150,10 @@ pub struct SheetShape {
 #[derive(Clone, Debug)]
 pub struct SheetInk {
     pub anchor: PicAnchor,
+    /// Index into the part's anchors — how [`compose_grouped_pics`] joins a
+    /// grouped picture back to the slice its group's transforms live in
+    /// (anchors can repeat a box, so the anchor value itself is not a key).
+    anchor_idx: usize,
     /// The `sp`/`grpSp`/`cxnSp` element, sliced verbatim out of the part.
     xml: Vec<u8>,
 }
@@ -259,10 +280,14 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
     let mut pos: Option<(i64, i64)> = None;
     let mut object_depth: u32 = 0;
     let mut pic_depth: u32 = 0;
+    // Open `xdr:grpSp` elements above the cursor. A pic that opens while this
+    // is non-zero is a *grouped* pic: its box is a fraction of the anchor's,
+    // composed later by `compose_grouped_pics`.
+    let mut group_depth: u32 = 0;
     // Every anchor's resolved placement, in document order — the join key the
     // ink pass uses to place its object slices.
     let mut anchors: Vec<PicAnchor> = Vec::new();
-    let mut pending: Vec<(Option<String>, Option<String>)> = Vec::new(); // (name, rel_id)
+    let mut pending: Vec<(Option<String>, Option<String>, bool)> = Vec::new(); // (name, rel_id, grouped)
 
     // The sp currently open, if any. `xdr:sp` cannot nest (only groups
     // nest), so one slot suffices; like `pending`, its result waits for the
@@ -314,6 +339,7 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
                         pos = None;
                         object_depth = 0;
                         pic_depth = 0;
+                        group_depth = 0;
                         pending.clear();
                         pending_shapes.clear();
                         cur_sp = None;
@@ -322,13 +348,16 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
                         if anchor_kind.is_some() =>
                     {
                         if name == b"pic" {
-                            pending.push((None, None));
+                            pending.push((None, None, group_depth > 0));
                             if !empty {
                                 pic_depth += 1;
                             }
                         }
                         if name == b"sp" && !empty {
                             cur_sp = Some(OpenShape::default());
+                        }
+                        if name == b"grpSp" && !empty {
+                            group_depth += 1;
                         }
                         if !empty {
                             object_depth += 1;
@@ -446,12 +475,15 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
                                 ext_emu: ext.unwrap_or((0, 0)),
                             },
                         };
-                        for (name, rel_id) in pending.drain(..) {
+                        for (name, rel_id, grouped) in pending.drain(..) {
                             if let Some(rel_id) = rel_id {
                                 out.pics.push(RawPic {
                                     anchor,
                                     name: name.clone(),
                                     rel_id,
+                                    frac: None,
+                                    anchor_idx: anchors.len(),
+                                    grouped,
                                 });
                             }
                         }
@@ -479,7 +511,11 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
                         }
                     }
                 }
-                b"grpSp" | b"graphicFrame" | b"cxnSp" => {
+                b"grpSp" => {
+                    object_depth = object_depth.saturating_sub(1);
+                    group_depth = group_depth.saturating_sub(1);
+                }
+                b"graphicFrame" | b"cxnSp" => {
                     object_depth = object_depth.saturating_sub(1);
                 }
                 b"from" | b"to" => corner = None,
@@ -502,7 +538,101 @@ pub(crate) fn parse_drawing(data: &[u8]) -> Result<DrawingContent> {
         buf.clear();
     }
     out.ink = extract_ink(data, &anchors);
+    compose_grouped_pics(&mut out);
     Ok(out)
+}
+
+/// Fill [`RawPic::frac`] for every grouped picture whose composed box the
+/// shared geometry pass can produce.
+///
+/// A grouped pic's outermost group is a top-level object, so its verbatim XML
+/// is exactly the anchor's ink slice. Parsing that one slice through the
+/// shared shape tree and running [`crate::pptx::apply_slide_geometry`] yields
+/// each descendant pic's box in the drawing's EMU space — the same
+/// composition, over the same root bounding box, that `AnchorMap` places the
+/// group's ink with, so pictures and their group's fills land in one frame by
+/// construction. The corpus says the chain is complete (every group declares
+/// `chOff`/`chExt`, every grouped pic an `off`/`ext`, zero rotations); the
+/// fail-open path — parse failure, count or `r:embed` sequence disagreement
+/// between this tree and the streaming walk, a degenerate root box — keeps
+/// the group-box approximation that was previously the rule.
+fn compose_grouped_pics(out: &mut DrawingContent) {
+    let mut composed: Vec<(usize, [f64; 4])> = Vec::new();
+    for ink in &out.ink {
+        let targets: Vec<usize> = out
+            .pics
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.anchor_idx == ink.anchor_idx && p.grouped)
+            .map(|(i, _)| i)
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let Some(mut root) = ink.shape() else {
+            continue;
+        };
+        crate::pptx::apply_slide_geometry(std::slice::from_mut(&mut root));
+        let Some(base) = root.slide_rect.as_ref().map(|sr| sr.bounding_box()) else {
+            continue;
+        };
+        let (bx, by) = (base.origin.x.raw() as f64, base.origin.y.raw() as f64);
+        let (bw, bh) = (base.size.width.raw() as f64, base.size.height.raw() as f64);
+        if bw <= 0.0 || bh <= 0.0 {
+            continue;
+        }
+        // Document order on both sides, filtered by the same rule (a pic
+        // without `r:embed` never became a `RawPic`), verified by the rel
+        // sequence itself.
+        let mut found: Vec<(String, Option<[f64; 4]>)> = Vec::new();
+        collect_tree_pics(&root, &mut found);
+        if found.len() != targets.len()
+            || found
+                .iter()
+                .zip(&targets)
+                .any(|((rel, _), &pi)| rel != &out.pics[pi].rel_id)
+        {
+            continue;
+        }
+        for ((_, bb), pi) in found.into_iter().zip(targets) {
+            let Some([x, y, w, h]) = bb else { continue };
+            composed.push((pi, [(x - bx) / bw, (y - by) / bh, w / bw, h / bh]));
+        }
+    }
+    for (pi, frac) in composed {
+        out.pics[pi].frac = Some(frac);
+    }
+}
+
+/// Every pic in the tree that carries an `r:embed`, pre-order, with its
+/// composed bounding box (`None` when the geometry pass left it unplaced).
+fn collect_tree_pics(
+    shape: &crate::pptx::shapes::Shape,
+    out: &mut Vec<(String, Option<[f64; 4]>)>,
+) {
+    use crate::pptx::shapes::ShapeKind;
+    match &shape.kind {
+        ShapeKind::Picture(p) => {
+            if let Some(rel) = p.blip_fill.blip.as_ref().and_then(|b| b.embed.as_ref()) {
+                let bb = shape.slide_rect.as_ref().map(|sr| {
+                    let r = sr.bounding_box();
+                    [
+                        r.origin.x.raw() as f64,
+                        r.origin.y.raw() as f64,
+                        r.size.width.raw() as f64,
+                        r.size.height.raw() as f64,
+                    ]
+                });
+                out.push((rel.as_str().to_string(), bb));
+            }
+        }
+        ShapeKind::Group(g) => {
+            for ch in &g.children {
+                collect_tree_pics(ch, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The paint channel: slice every top-level `sp`/`grpSp`/`cxnSp` out of the
@@ -549,6 +679,7 @@ fn extract_ink(data: &[u8], anchors: &[PicAnchor]) -> Vec<SheetInk> {
                     if let Some(anchor) = anchors.get(anchor_idx) {
                         out.push(SheetInk {
                             anchor: *anchor,
+                            anchor_idx,
                             xml: data[tag_start..tag_end].to_vec(),
                         });
                     }
@@ -675,6 +806,102 @@ mod tests {
         };
         assert_eq!(pics[0].anchor, expect);
         assert_eq!(pics[1].anchor, expect);
+        // This group declares no `grpSpPr` xfrm, so the composer cannot map
+        // its child space and fails open: the anchor box stays the pics' box.
+        assert_eq!(pics[0].frac, None);
+        assert_eq!(pics[1].frac, None);
+    }
+
+    /// A grouped pic with a specific `a:xfrm`, for composition tests.
+    fn pic_at(rel: &str, off: (i64, i64), ext: (i64, i64)) -> String {
+        format!(
+            r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
+               <xdr:blipFill><a:blip r:embed="{rel}"/></xdr:blipFill>
+               <xdr:spPr><a:xfrm><a:off x="{}" y="{}"/><a:ext cx="{}" cy="{}"/></a:xfrm></xdr:spPr></xdr:pic>"#,
+            off.0, off.1, ext.0, ext.1
+        )
+    }
+
+    /// The whole point of `compose_grouped_pics`: a pic's `a:xfrm`, folded
+    /// through its group's child space, lands as a fraction of the anchor box
+    /// instead of filling it.
+    #[test]
+    fn a_grouped_pic_composes_to_a_fraction_of_the_anchor() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+                 <xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="1" name="G"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+                   <xdr:grpSpPr><a:xfrm><a:off x="1000" y="2000"/><a:ext cx="4000" cy="6000"/>
+                     <a:chOff x="0" y="0"/><a:chExt cx="2000" cy="3000"/></a:xfrm></xdr:grpSpPr>
+                   {}
+                 </xdr:grpSp>
+               <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#,
+            pic_at("rId1", (500, 750), (1000, 1500))
+        );
+        let pics = parse_drawing(xml.as_bytes()).unwrap().pics;
+        assert_eq!(pics.len(), 1);
+        let [fx, fy, fw, fh] = pics[0].frac.expect("composed");
+        assert!((fx - 0.25).abs() < 1e-9, "fx {fx}");
+        assert!((fy - 0.25).abs() < 1e-9, "fy {fy}");
+        assert!((fw - 0.5).abs() < 1e-9, "fw {fw}");
+        assert!((fh - 0.5).abs() < 1e-9, "fh {fh}");
+    }
+
+    /// Depth 2 is the corpus majority (111 of 212): both child spaces fold.
+    #[test]
+    fn nested_groups_compose_through_both_child_spaces() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:oneCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:ext cx="914400" cy="914400"/>
+                 <xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="1" name="Outer"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+                   <xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/>
+                     <a:chOff x="0" y="0"/><a:chExt cx="100" cy="100"/></a:xfrm></xdr:grpSpPr>
+                   <xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="2" name="Inner"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+                     <xdr:grpSpPr><a:xfrm><a:off x="10" y="10"/><a:ext cx="50" cy="50"/>
+                       <a:chOff x="0" y="0"/><a:chExt cx="25" cy="25"/></a:xfrm></xdr:grpSpPr>
+                     {}
+                   </xdr:grpSp>
+                 </xdr:grpSp>
+               <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#,
+            pic_at("rId1", (5, 5), (10, 10))
+        );
+        let pics = parse_drawing(xml.as_bytes()).unwrap().pics;
+        assert_eq!(pics.len(), 1);
+        let [fx, fy, fw, fh] = pics[0].frac.expect("composed");
+        for (got, want) in [(fx, 0.2), (fy, 0.2), (fw, 0.2), (fh, 0.2)] {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+    }
+
+    /// A pic with no `r:embed` never becomes a `RawPic`; the tree walk
+    /// filters by the same rule, so the sibling that does embed still aligns
+    /// with its composed box.
+    #[test]
+    fn a_relless_sibling_does_not_break_the_alignment() {
+        let no_rel = r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="9" name="Svg"/><xdr:cNvPicPr/></xdr:nvPicPr>
+               <xdr:blipFill><a:blip/></xdr:blipFill>
+               <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2000" cy="3000"/></a:xfrm></xdr:spPr></xdr:pic>"#;
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor>
+                 <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                 <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+                 <xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="1" name="G"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+                   <xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="4000" cy="6000"/>
+                     <a:chOff x="0" y="0"/><a:chExt cx="2000" cy="3000"/></a:xfrm></xdr:grpSpPr>
+                   {no_rel}
+                   {}
+                 </xdr:grpSp>
+               <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#,
+            pic_at("rId1", (1000, 1500), (1000, 1500))
+        );
+        let pics = parse_drawing(xml.as_bytes()).unwrap().pics;
+        assert_eq!(pics.len(), 1, "the rel-less pic is not a RawPic");
+        let [fx, fy, fw, fh] = pics[0].frac.expect("composed");
+        for (got, want) in [(fx, 0.5), (fy, 0.5), (fw, 0.5), (fh, 0.5)] {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
     }
 
     /// A shape's `a:blip` background fill is not a picture.
