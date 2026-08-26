@@ -14,54 +14,6 @@ name = "liteparse"
 name = "lit"
 path = "src/main.rs"
 
-[[example]]
-name = "bold_census"
-required-features = ["docx-native", "pptx-native"]
-
-[[example]]
-name = "docx_blocks"
-required-features = ["docx-native"]
-
-[[example]]
-name = "pptx_blocks"
-required-features = ["pptx-native"]
-
-[[example]]
-name = "pptx_layout_probe"
-required-features = ["pptx-native"]
-
-[[example]]
-name = "pptx_paint_census"
-required-features = ["pptx-native"]
-
-[[example]]
-name = "pptx_raster_dump"
-required-features = ["pptx-native"]
-
-[[example]]
-name = "xlsx_emit"
-required-features = ["xlsx-native"]
-
-[[example]]
-name = "xlsx_pics_check"
-required-features = ["xlsx-native"]
-
-[[example]]
-name = "xlsx_layout_check"
-required-features = ["xlsx-native"]
-
-[[example]]
-name = "xlsx_ink_recall"
-required-features = ["xlsx-native"]
-
-[[example]]
-name = "xlsx_raster_dump"
-required-features = ["xlsx-native"]
-
-[[example]]
-name = "xlsx_paint_recall"
-required-features = ["xlsx-native"]
-
 [features]
 default = ["tesseract", "docx-native", "pptx-native", "xlsx-native"]
 oar-ocr = ["dep:oar-ocr"]
