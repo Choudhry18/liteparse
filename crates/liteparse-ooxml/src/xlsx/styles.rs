@@ -230,12 +230,83 @@ fn parse_argb(hex: &str) -> Option<[u8; 3]> {
     Some([(v >> 16) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8])
 }
 
+/// §18.18.55's seventeen hatch patterns, carried as the one number a painter
+/// without a pattern engine needs: what fraction of the cell the pattern's
+/// strokes cover.
+///
+/// Excel draws each of these as an 8×8 bitmap tiled across the cell, so the
+/// coverage is exact for the named greys (`gray125` is one pixel in eight)
+/// and for single-direction stripes (one line in four is light, one in two is
+/// dark). It is an approximation for the crosshatches, where the two stroke
+/// directions overlap: `lightGrid` is taken as two light stripes less their
+/// intersection, and the trellises as their dark counterparts. That
+/// approximation reaches **no corpus cell** — every one of the 323 hatched
+/// cells across 1,248 workbooks is `gray0625` (210), `lightHorizontal` (63),
+/// `lightGray` (39), `gray125` (6), `darkGray` (3) or `lightUp` (2), all of
+/// which have exact fractions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HatchPattern {
+    Gray0625,
+    Gray125,
+    LightGray,
+    MediumGray,
+    DarkGray,
+    /// One stroke direction, one line in four.
+    LightStripe,
+    /// One stroke direction, one line in two.
+    DarkStripe,
+    /// Two stroke directions at one line in four each.
+    LightCrosshatch,
+    /// Two stroke directions at one line in two each.
+    DarkCrosshatch,
+    /// A `patternType` this build does not know. Painted at the mid grey a
+    /// declared-but-unnamed hatch is closest to, rather than dropped: the file
+    /// asked for ink.
+    Unknown,
+}
+
+impl HatchPattern {
+    fn parse(s: &str) -> Self {
+        match s {
+            "gray0625" => HatchPattern::Gray0625,
+            "gray125" => HatchPattern::Gray125,
+            "lightGray" => HatchPattern::LightGray,
+            "mediumGray" => HatchPattern::MediumGray,
+            "darkGray" => HatchPattern::DarkGray,
+            "lightHorizontal" | "lightVertical" | "lightDown" | "lightUp" => {
+                HatchPattern::LightStripe
+            }
+            "darkHorizontal" | "darkVertical" | "darkDown" | "darkUp" => HatchPattern::DarkStripe,
+            "lightGrid" | "lightTrellis" => HatchPattern::LightCrosshatch,
+            "darkGrid" | "darkTrellis" => HatchPattern::DarkCrosshatch,
+            _ => HatchPattern::Unknown,
+        }
+    }
+
+    /// The share of the cell the pattern's strokes cover, in `[0, 1]`.
+    ///
+    /// A painter with no pattern engine blends `fg` over `bg` by this much and
+    /// fills the cell with the result, which is what the tiled bitmap averages
+    /// to at any resolution where its 8-pixel period is not resolvable — and
+    /// at 150 DPI an 8×8 Excel pattern tile is under 4 px across.
+    pub fn coverage(self) -> f32 {
+        match self {
+            HatchPattern::Gray0625 => 0.0625,
+            HatchPattern::Gray125 => 0.125,
+            HatchPattern::LightGray | HatchPattern::LightStripe => 0.25,
+            HatchPattern::LightCrosshatch => 0.4375,
+            HatchPattern::MediumGray | HatchPattern::DarkStripe | HatchPattern::Unknown => 0.5,
+            HatchPattern::DarkGray | HatchPattern::DarkCrosshatch => 0.75,
+        }
+    }
+}
+
 /// §18.18.55 `ST_PatternType`, collapsed to what a painter does about it.
 ///
 /// The collapse is measured rather than lazy: of 2,386,621 filled cells in
 /// the corpus, **2,386,298 (100.0%) are `solid`** — every other pattern type
-/// put together is 323 cells. Keeping eighteen hatch variants distinct would
-/// be a pattern engine for three ten-thousandths of a percent of the ink.
+/// put together is 323 cells. Those 323 do not get a pattern engine; they get
+/// [`HatchPattern::coverage`], which is one blend rather than a tiled bitmap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PatternType {
     /// `none`, or no `<patternFill>` at all — the cell shows the sheet
@@ -246,10 +317,13 @@ pub enum PatternType {
     /// consumers do not have to know it: a solid fill's colour is `fgColor`,
     /// not `bgColor`.)
     Solid,
-    /// A declared hatch (`gray125`, `darkUp`, …). A painter with no pattern
-    /// engine approximates; slot 1 of every file is `gray125` and is Excel's
-    /// "no fill" placeholder rather than a request for hatching.
-    Hatch,
+    /// A declared hatch (`gray125`, `darkUp`, …), carrying the coverage a
+    /// painter blends by. Slot 1 of every file is `gray125` — Excel's "no
+    /// fill" placeholder rather than a request for hatching — and blending is
+    /// what makes it safe to paint at all: at 12.5% coverage the placeholder's
+    /// usual black `fg` lands as the light grey Excel itself shows, where a
+    /// solid reading would black out the cell.
+    Hatch(HatchPattern),
     /// `<gradientFill>`: a fill with no `patternType` at all. Recorded so a
     /// consumer can tell "gradient we do not paint" from "no fill"; the stops
     /// are not read.
@@ -269,7 +343,7 @@ pub struct Fill {
 impl Fill {
     /// Does this fill put ink down?
     pub fn paints(&self) -> bool {
-        matches!(self.pattern, PatternType::Solid | PatternType::Hatch)
+        matches!(self.pattern, PatternType::Solid | PatternType::Hatch(_))
     }
 }
 
@@ -340,8 +414,46 @@ impl BorderStyle {
         }
     }
 
-    /// Is this a broken line? A painter with no dash support draws it solid,
-    /// which is the right approximation for 0.05% of edges.
+    /// How thick the edge is *including* what it draws around itself.
+    ///
+    /// The same as [`BorderStyle::width_pt`] for every style but `double`,
+    /// which Excel draws as two strokes with a stroke-wide gap between them —
+    /// three pen widths of cell, not one. A painter that reserved only
+    /// `width_pt` for it would overlap the neighbouring edge's inset, and one
+    /// that drew a single stroke would render 27,300 corpus edges (0.1%, and
+    /// more than every dashed style put together) as a plain thin line.
+    pub fn extent_pt(self) -> f32 {
+        match self {
+            BorderStyle::Double => self.width_pt() * 3.0,
+            _ => self.width_pt(),
+        }
+    }
+
+    /// The on/off run lengths of a broken edge, in multiples of its own pen
+    /// width, or `None` when the edge is continuous.
+    ///
+    /// Relative to the pen rather than absolute so the `medium*` spellings
+    /// come out coarser than the thin ones without a second table, which is
+    /// what Excel draws. `slantDashDot`'s slant is not expressible in an
+    /// axis-aligned rect and is drawn as its unslanted counterpart — 6 corpus
+    /// edges.
+    pub fn dash_pattern(self) -> Option<&'static [f32]> {
+        match self {
+            BorderStyle::Dotted => Some(&[1.0, 1.0]),
+            BorderStyle::Dashed | BorderStyle::MediumDashed => Some(&[3.0, 2.0]),
+            BorderStyle::DashDot | BorderStyle::MediumDashDot | BorderStyle::SlantDashDot => {
+                Some(&[4.0, 2.0, 1.0, 2.0])
+            }
+            BorderStyle::DashDotDot | BorderStyle::MediumDashDotDot => {
+                Some(&[4.0, 2.0, 1.0, 2.0, 1.0, 2.0])
+            }
+            _ => None,
+        }
+    }
+
+    /// Is this a broken line? Equivalent to [`BorderStyle::dash_pattern`]
+    /// being `Some`, kept as a predicate for callers that only ask the
+    /// question.
     pub fn is_dashed(self) -> bool {
         matches!(
             self,
@@ -684,7 +796,7 @@ impl Styles {
                             // No `patternType` on a `<patternFill>` means
                             // `none` (§18.8.32), not "unknown".
                             None | Some("none") => PatternType::None,
-                            Some(_) => PatternType::Hatch,
+                            Some(s) => PatternType::Hatch(HatchPattern::parse(s)),
                         };
                     }
                     in_pattern = !empty;

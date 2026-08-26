@@ -371,6 +371,40 @@ mod tests {
         .unwrap()
     }
 
+    /// The Accounting shape: the format asks for a repeat between the
+    /// currency symbol and the number, and the offset comes back pointing at
+    /// the gap — into the string `display_text` returns, padding and all.
+    #[test]
+    fn a_fill_token_reports_where_the_repeat_was() {
+        let styles = r#"<styleSheet>
+  <numFmts><numFmt numFmtId="164" formatCode="_(&quot;$&quot;* #,##0.00_);_(@_)"/></numFmts>
+  <cellXfs count="2"><xf numFmtId="0" fontId="0"/><xf numFmtId="164" fontId="0"/></cellXfs>
+</styleSheet>"#;
+        let wb = read(&build(&[
+            ("[Content_Types].xml", "<Types/>"),
+            ("_rels/.rels", ROOT_RELS),
+            ("xl/workbook.xml", WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", WB_RELS),
+            ("xl/sharedStrings.xml", SST),
+            ("xl/styles.xml", styles),
+            ("xl/worksheets/sheet1.xml", SHEET1),
+        ]))
+        .unwrap();
+        let cell = &wb.sheets[0].rows[1].cells[1];
+        let text = wb.display_text(cell).unwrap();
+        assert_eq!(text, " $0.16 ");
+        let at = wb.fill_split(cell).unwrap();
+        assert_eq!((&text[..at], &text[at..]), (" $", "0.16 "));
+    }
+
+    /// A code with no `*` costs nothing and answers nothing, which is the
+    /// overwhelming majority of cells.
+    #[test]
+    fn a_code_without_a_fill_has_no_split() {
+        let wb = workbook();
+        assert_eq!(wb.fill_split(&wb.sheets[0].rows[1].cells[1]), None);
+    }
+
     #[test]
     fn a_workbook_joins_its_parts() {
         let wb = workbook();

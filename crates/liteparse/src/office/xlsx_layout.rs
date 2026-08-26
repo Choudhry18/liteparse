@@ -43,7 +43,7 @@ use std::rc::Rc;
 
 use liteparse_ooxml::render::dimension::Pt;
 use liteparse_ooxml::render::fonts::FontRegistry;
-use liteparse_ooxml::render::geometry::{PtOffset, PtRect, PtSize};
+use liteparse_ooxml::render::geometry::{PtLineSegment, PtOffset, PtRect, PtSize};
 use liteparse_ooxml::render::layout::draw_command::{DrawCommand, LayoutedPage};
 use liteparse_ooxml::render::layout::fragment::FontProps;
 use liteparse_ooxml::render::layout::measurer::TextMeasurer;
@@ -52,8 +52,8 @@ use liteparse_ooxml::render::resolve::drawing_color::{DrawingColorContext, resol
 use liteparse_ooxml::render::resolve::fonts::resolve_font_set_themes;
 use liteparse_ooxml::render::resolve::images::MediaEntry;
 use liteparse_ooxml::xlsx::{
-    Alignment, Border, BorderEdge, CellAnchor, CellValue, HorizontalAlign, PatternType, PicAnchor,
-    Row, Sheet, SheetShape, VerticalAlign, Workbook,
+    Alignment, Border, BorderEdge, BorderStyle, CellAnchor, CellValue, HorizontalAlign,
+    PatternType, PicAnchor, Row, Sheet, SheetShape, VerticalAlign, Workbook,
 };
 
 use super::figures::FigureSink;
@@ -1115,6 +1115,58 @@ fn rgb_of([r, g, b]: [u8; 3]) -> RgbColor {
     RgbColor { r, g, b }
 }
 
+/// [`Workbook::fill_split`] rebased onto the trimmed string the painter draws.
+///
+/// The format's own padding — `_(`'s skip-widths — is part of `display_text`
+/// and is trimmed off before painting, which moves the split by however much
+/// came off the front. A split that the trim swallowed entirely (the repeat
+/// was in the padding) is no split at all.
+fn fill_split_of(
+    wb: &Workbook,
+    cell: &liteparse_ooxml::xlsx::Cell,
+    trimmed: &str,
+) -> Option<usize> {
+    let at = wb.fill_split(cell)?;
+    let full = wb.display_text(cell)?;
+    let lead = full.len() - full.trim_start().len();
+    let at = at.checked_sub(lead)?;
+    (at > 0 && at < trimmed.len()).then_some(at)
+}
+
+/// The one colour a cell's fill paints, or `None` when it paints nothing.
+///
+/// A solid fill is its `fgColor`. A hatch has no pattern engine behind it and
+/// does not need one: at 150 DPI an 8×8 Excel pattern tile is under 4 px
+/// across, so the tile averages to `fg` blended over `bg` by the pattern's
+/// coverage, and that blend is what gets painted. `bg` defaults to the page
+/// the cell sits on, which is white.
+///
+/// Blending is also what makes a hatch safe to paint at all: slot 1 of every
+/// styles part is `gray125` with a black `fg` — Excel's "no fill" placeholder
+/// — and at 12.5% coverage it lands as the light grey Excel shows rather than
+/// the black a solid reading would give it. 323 corpus cells are hatched, 210
+/// of them `gray0625`.
+fn fill_color(wb: &Workbook, fill: &liteparse_ooxml::xlsx::Fill) -> Option<RgbColor> {
+    let fg = fill.fg.and_then(|c| wb.resolve_color(c))?;
+    match fill.pattern {
+        PatternType::Solid => Some(rgb_of(fg)),
+        PatternType::Hatch(h) => {
+            let bg = fill
+                .bg
+                .and_then(|c| wb.resolve_color(c))
+                .unwrap_or([0xff, 0xff, 0xff]);
+            let k = h.coverage();
+            let mix = |f: u8, b: u8| (f32::from(f) * k + f32::from(b) * (1.0 - k)).round() as u8;
+            Some(RgbColor {
+                r: mix(fg[0], bg[0]),
+                g: mix(fg[1], bg[1]),
+                b: mix(fg[2], bg[2]),
+            })
+        }
+        PatternType::None | PatternType::Gradient => None,
+    }
+}
+
 /// The effective style of every retained column of one row, written into
 /// `out` (reused across rows: a wide sheet would otherwise allocate one vector
 /// per row per page).
@@ -1176,25 +1228,33 @@ fn push_border(
             .and_then(|c| wb.resolve_color(c))
             .map_or(RgbColor::BLACK, rgb_of)
     };
-    let width = |e: &BorderEdge| {
+    // The pen, and the band the edge occupies. They differ only for `double`,
+    // which lays two pens and a gap inside its band.
+    let pen = |e: &BorderEdge| {
         f64::from(e.style.width_pt())
             .min(h.max(0.0))
             .min(w.max(0.0))
     };
-    let (top_w, bot_w) = (width(&border.top), width(&border.bottom));
+    let band = |e: &BorderEdge| {
+        f64::from(e.style.extent_pt())
+            .min(h.max(0.0))
+            .min(w.max(0.0))
+    };
+    let (top_b, bot_b) = (band(&border.top), band(&border.bottom));
     if border.top.style.paints() {
-        out.push(rect_cmd(x, y, w, top_w, color(&border.top)));
+        push_edge(out, &border.top, x, y, w, pen(&border.top), true, &color);
     }
     if border.bottom.style.paints() {
-        out.push(rect_cmd(x, y + h - bot_w, w, bot_w, color(&border.bottom)));
+        let p = pen(&border.bottom);
+        push_edge(out, &border.bottom, x, y + h - bot_b, w, p, true, &color);
     }
     let top_inset = if border.top.style.paints() {
-        top_w
+        top_b
     } else {
         0.0
     };
     let bot_inset = if border.bottom.style.paints() {
-        bot_w
+        bot_b
     } else {
         0.0
     };
@@ -1203,18 +1263,142 @@ fn push_border(
         return;
     }
     if border.left.style.paints() {
-        let lw = width(&border.left);
-        out.push(rect_cmd(x, y + top_inset, lw, v_h, color(&border.left)));
+        let p = pen(&border.left);
+        push_edge(out, &border.left, x, y + top_inset, v_h, p, false, &color);
     }
     if border.right.style.paints() {
-        let rw = width(&border.right);
-        out.push(rect_cmd(
-            x + w - rw,
+        let (p, b) = (pen(&border.right), band(&border.right));
+        push_edge(
+            out,
+            &border.right,
+            x + w - b,
             y + top_inset,
-            rw,
             v_h,
-            color(&border.right),
-        ));
+            p,
+            false,
+            &color,
+        );
+    }
+}
+
+/// One edge, expanded into the rects its style asks for.
+///
+/// `(x, y)` is the band's top-left corner, `len` its length along the edge and
+/// `pen` one stroke's thickness; `horizontal` says which way the edge runs.
+/// Three shapes come out of here:
+///
+/// * a continuous edge is one rect — the shape every edge had before;
+/// * a `double` edge is two pens with a pen-wide gap, filling the band
+///   [`BorderStyle::extent_pt`] reserves for it. 27,300 corpus edges, more
+///   than every broken style put together;
+/// * a broken edge is one rect per "on" run of
+///   [`BorderStyle::dash_pattern`], the last clipped to the cell rather than
+///   allowed to overhang it. 14,094 corpus edges.
+///
+/// The dash phase restarts at each cell, so a row of dashed cells shows a
+/// stroke at every boundary rather than one pattern running across it. Excel
+/// phases per cell too.
+#[allow(clippy::too_many_arguments)]
+fn push_edge(
+    out: &mut Vec<DrawCommand>,
+    edge: &BorderEdge,
+    x: f64,
+    y: f64,
+    len: f64,
+    pen: f64,
+    horizontal: bool,
+    color: &impl Fn(&BorderEdge) -> RgbColor,
+) {
+    let c = color(edge);
+    // One stroke: `at` runs along the edge, `off` across it.
+    //
+    // A zero-*length* run still paints, and the corpus insists on it: a hidden
+    // column is a retained column of zero width, and its cells' horizontal
+    // edges were zero-area rects before this walk existed. Dropping them looks
+    // like a tidy-up and is a silent 1,230-rect change on one corpus sheet.
+    // Only a negative run — which the dash walk cannot produce — is skipped.
+    let mut stroke = |at: f64, run: f64, off: f64| {
+        if run < 0.0 {
+            return;
+        }
+        if horizontal {
+            out.push(rect_cmd(x + at, y + off, run, pen, c));
+        } else {
+            out.push(rect_cmd(x + off, y + at, pen, run, c));
+        }
+    };
+    let offsets: &[f64] = if edge.style == BorderStyle::Double {
+        &[0.0, 2.0]
+    } else {
+        &[0.0]
+    };
+    for &o in offsets {
+        let off = o * pen;
+        match edge.style.dash_pattern() {
+            None => stroke(0.0, len, off),
+            Some(pattern) => {
+                // A zero pen would never advance the walk. The table writes no
+                // zero-length run, but the loop must not depend on that.
+                let step = pen.max(0.01);
+                let (mut at, mut i) = (0.0, 0usize);
+                while at < len {
+                    let run = f64::from(pattern[i % pattern.len()]) * step;
+                    if i % 2 == 0 {
+                        stroke(at, run.min(len - at), off);
+                    }
+                    at += run;
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The cell's diagonal, as one stroked line per declared direction.
+///
+/// A `Line` rather than a `Rect` because a rect cannot express a diagonal —
+/// and the recorded objection to `Line`, that it "paints in the Ink pass, over
+/// everything", is only half right. It does paint over the fills and borders,
+/// which is where a diagonal belongs; and it paints *under* the cell's text so
+/// long as it is emitted before it, which the paint walk does. The whole class
+/// is **2 corpus edges in 1 workbook**, and it is here because the note
+/// explaining its absence was longer than the code.
+fn push_diagonal(
+    out: &mut Vec<DrawCommand>,
+    wb: &Workbook,
+    border: &Border,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) {
+    if !border.diagonal.style.paints() || !(border.diagonal_up || border.diagonal_down) {
+        return;
+    }
+    let color = border
+        .diagonal
+        .color
+        .and_then(|c| wb.resolve_color(c))
+        .map_or(RgbColor::BLACK, rgb_of);
+    let width = Pt::new(border.diagonal.style.width_pt());
+    let pt = |px: f64, py: f64| PtOffset {
+        x: Pt::new(MARGIN + px as f32),
+        y: Pt::new(MARGIN + py as f32),
+    };
+    let mut line = |start, end| {
+        out.push(DrawCommand::Line {
+            line: PtLineSegment { start, end },
+            color,
+            width,
+        });
+    };
+    // `diagonalUp` runs bottom-left to top-right, `diagonalDown` the other
+    // way; both flags at once is Excel's cross and draws both.
+    if border.diagonal_up {
+        line(pt(x, y + h), pt(x + w, y));
+    }
+    if border.diagonal_down {
+        line(pt(x, y), pt(x + w, y + h));
     }
 }
 
@@ -1256,6 +1440,9 @@ pub struct TextPaintStats {
     pub clipped: u64,
     /// Numeric cells replaced by `#######`.
     pub hashed: u64,
+    /// Cells painted in two pieces because their format asked for a `*` fill
+    /// between them — Excel's Accounting shape.
+    pub filled: u64,
 }
 
 impl TextPaintStats {
@@ -1268,6 +1455,7 @@ impl TextPaintStats {
         self.spill_lost_to_packing += o.spill_lost_to_packing;
         self.clipped += o.clipped;
         self.hashed += o.hashed;
+        self.filled += o.filled;
     }
 }
 
@@ -1406,6 +1594,25 @@ fn occupied_columns(
 /// stream has no clip bracket, and adding one to paint half a glyph would put
 /// a variant in front of every consumer that matches on `DrawCommand`.
 #[allow(clippy::too_many_arguments)]
+/// One line of a cell's text, placed on its baseline in page coordinates.
+fn text_cmd(line: &str, fp: &FontProps, color: RgbColor, x: f64, baseline: f64) -> DrawCommand {
+    DrawCommand::Text {
+        position: PtOffset {
+            x: Pt::new(MARGIN + x as f32),
+            y: Pt::new(MARGIN + baseline as f32),
+        },
+        text: Rc::from(line),
+        font_family: Rc::clone(&fp.family),
+        char_spacing: Pt::ZERO,
+        font_size: fp.size,
+        bold: fp.bold,
+        italic: fp.italic,
+        color,
+        text_scale: 1.0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_cell_text(
     out: &mut Vec<DrawCommand>,
     m: &TextMeasurer,
@@ -1418,6 +1625,7 @@ fn paint_cell_text(
     y: f64,
     room: (f64, f64),
     declared_neighbour_free: bool,
+    fill_split: Option<usize>,
 ) -> TextPaintStats {
     let mut stats = TextPaintStats::default();
     if align.wrap_text {
@@ -1496,6 +1704,32 @@ fn paint_cell_text(
         _ => y + b.h - inset_v - descent - (n - 1.0) * line_h,
     };
 
+    // §18.8.31's `*c` fill, honoured now that there is a box to fill: the part
+    // before the repeat goes against the cell's left edge and the part after
+    // it against the right, which is how Excel's Accounting format puts the
+    // currency symbol in one corner and the number in the other. Only for a
+    // single line that fits — a wrapped, hashed or clipped cell has already
+    // been fitted by the rules above, and re-splitting it would undo them.
+    if let (Some(at), 1) = (fill_split, lines.len())
+        && width_of(m, &fp, &lines[0]) <= avail
+        && at < lines[0].len()
+    {
+        let (left, right) = lines[0].split_at(at);
+        let (lw, rw) = (width_of(m, &fp, left), width_of(m, &fp, right));
+        if lw + rw <= avail {
+            let mut push = |s: &str, x: f64| {
+                if !s.is_empty() {
+                    out.push(text_cmd(s, &fp, color, x, first_baseline));
+                }
+            };
+            push(left, x0);
+            push(right, x0 + avail - rw);
+            stats.filled += 1;
+            stats.cells += 1;
+            return stats;
+        }
+    }
+
     for (li, line) in lines.iter().enumerate() {
         if line.is_empty() {
             continue;
@@ -1507,20 +1741,13 @@ fn paint_cell_text(
             HorizontalAlign::General if numeric => x0 + avail - lw,
             _ => x0,
         };
-        out.push(DrawCommand::Text {
-            position: PtOffset {
-                x: Pt::new(MARGIN + x as f32),
-                y: Pt::new(MARGIN + (first_baseline + li as f64 * line_h) as f32),
-            },
-            text: Rc::from(line.as_str()),
-            font_family: Rc::clone(&fp.family),
-            char_spacing: Pt::ZERO,
-            font_size: fp.size,
-            bold: fp.bold,
-            italic: fp.italic,
+        out.push(text_cmd(
+            line,
+            &fp,
             color,
-            text_scale: 1.0,
-        });
+            x,
+            first_baseline + li as f64 * line_h,
+        ));
     }
     if lines.iter().all(String::is_empty) {
         stats.blank += 1;
@@ -1759,6 +1986,10 @@ impl SheetGeometry {
         // 2 & 3. Fills, then borders — collected in one walk and concatenated
         // so every fill is under every border, including its neighbour's.
         let mut borders = Vec::new();
+        // Diagonals are `Line`s and so paint in the Ink pass, not the Shading
+        // one; they are collected apart only so they land before the text the
+        // same pass draws over them.
+        let mut diagonals = Vec::new();
         let mut styles: Vec<Option<u32>> = Vec::new();
         for i in range.clone() {
             let (row, cells) = &plan.rows[i];
@@ -1769,22 +2000,22 @@ impl SheetGeometry {
                 let Some(style) = *style else { continue };
                 let (x, w) = (self.x_off[ci], self.x_off[ci + 1] - self.x_off[ci]);
                 let fill = wb.styles.fill(Some(style));
-                if fill.pattern == PatternType::Solid {
-                    // An automatic `fg` is not white — it is "the consumer's
-                    // default background", which is the page this is painted
-                    // on. Painting it would cover the gridlines with the
-                    // colour they are already on.
-                    if let Some(rgb) = fill.fg.and_then(|c| wb.resolve_color(c)) {
-                        cmds.push(rect_cmd(x, y, w, h, rgb_of(rgb)));
-                    }
+                // An automatic `fg` is not white — it is "the consumer's
+                // default background", which is the page this is painted on.
+                // Painting it would cover the gridlines with the colour they
+                // are already on.
+                if let Some(rgb) = fill_color(wb, &fill) {
+                    cmds.push(rect_cmd(x, y, w, h, rgb));
                 }
                 let border = wb.styles.border(Some(style));
                 if border.paints() {
                     push_border(&mut borders, wb, &border, x, y, w, h);
+                    push_diagonal(&mut diagonals, wb, &border, x, y, w, h);
                 }
             }
         }
         cmds.append(&mut borders);
+        cmds.append(&mut diagonals);
 
         // 4. Cell text, over every rect: the raster's Ink pass paints `Text`
         // after `Rect` whatever the emission order, so this is placement, not
@@ -1831,6 +2062,11 @@ impl SheetGeometry {
                             n.at.col == cell.at.col + 1
                                 && wb.display_text(n).is_some_and(|t| !t.trim().is_empty())
                         }),
+                        // Against the trimmed string the painter draws, not
+                        // the padded one the format produced: `display_text`
+                        // keeps `_(`'s spaces and `trim` takes them off both
+                        // ends, which moves the split.
+                        fill_split_of(wb, cell, &text),
                     ));
                 }
             }
@@ -2299,17 +2535,31 @@ mod tests {
         assert!((left.3 - (20.0 - 1.5)).abs() < 1e-4);
     }
 
-    /// `gray125` is slot 1 of every styles part and means "no fill". Painting
-    /// its `fg` solid would black out sheets that asked for nothing.
+    /// `gray125` is slot 1 of every styles part, and its `fg` is usually
+    /// black. Painting it *solid* would black out sheets that asked for
+    /// nothing; painting it at the pattern's 12.5% coverage gives the light
+    /// grey Excel shows, which is why the blend is what makes a hatch safe to
+    /// paint at all.
     #[test]
-    fn the_gray125_placeholder_paints_nothing() {
+    fn the_gray125_placeholder_paints_a_light_grey_not_black() {
         let nx = painted(
             r#"<worksheet><sheetViews><sheetView showGridLines="0"/></sheetViews><sheetData>
                 <row r="1"><c r="A1" s="4"><v>1</v></c><c r="B1"><v>2</v></c></row>
                 <row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row>
             </sheetData></worksheet>"#,
         );
-        assert!(nx.layouts[0].commands.is_empty());
+        let r = rects(&nx.layouts[0]);
+        assert_eq!(r.len(), 1, "{r:?}");
+        // Black over the page's white at one part in eight.
+        let grey = (255.0 * 0.875_f32).round() as u8;
+        assert_eq!(
+            r[0].4,
+            RgbColor {
+                r: grey,
+                g: grey,
+                b: grey
+            }
+        );
     }
 
     /// The census's classes B, D and E — the 15.9% of declared paint that a
@@ -2328,14 +2578,137 @@ mod tests {
         );
         let r = rects(&nx.layouts[0]);
         // Row 1: A1 takes the column's blue (class E), B1's own style wins and
-        // is the no-paint placeholder (class B). Row 2: the row's yellow on
-        // both columns (class D), with B2's own blue overriding it.
-        assert_eq!(r.len(), 3, "{r:?}");
+        // is the `gray125` placeholder, which blends rather than covering
+        // (class B). Row 2: the row's yellow on both columns (class D), with
+        // B2's own blue overriding it.
+        assert_eq!(r.len(), 4, "{r:?}");
         assert_eq!((r[0].1, r[0].4), (MARGIN, BLUE));
         assert!((r[0].2 - 56.25).abs() < 1e-4, "the column's own width");
-        assert_eq!((r[1].1, r[1].4), (MARGIN + 20.0, YELLOW));
-        assert_eq!((r[2].1, r[2].4), (MARGIN + 20.0, BLUE));
-        assert!((r[2].0 - (MARGIN + 56.25)).abs() < 1e-4, "column B");
+        assert_eq!(r[1].1, MARGIN, "the placeholder blend, on row 1");
+        assert!(r[1].4.r > 0xD0 && r[1].4.r == r[1].4.b);
+        assert_eq!((r[2].1, r[2].4), (MARGIN + 20.0, YELLOW));
+        assert_eq!((r[3].1, r[3].4), (MARGIN + 20.0, BLUE));
+        assert!((r[3].0 - (MARGIN + 56.25)).abs() < 1e-4, "column B");
+    }
+
+    /// The paint tail's border styles, each of which a single rect cannot
+    /// express: `dashed` becomes one rect per "on" run, `double` two strokes
+    /// with a gap, and the diagonal a `Line` — the one command the grid
+    /// painter emits that is not a `Rect`.
+    const TAIL_STYLES: &str = r#"<styleSheet>
+      <fonts count="1"><font/></fonts>
+      <fills count="3">
+        <fill><patternFill patternType="none"/></fill>
+        <fill><patternFill patternType="gray125"/></fill>
+        <fill><patternFill patternType="lightGray"><fgColor rgb="FF000000"/><bgColor rgb="FFFFFFFF"/></patternFill></fill>
+      </fills>
+      <borders count="4">
+        <border><left/><right/><top/><bottom/></border>
+        <border><top style="dashed"/></border>
+        <border><top style="double"/></border>
+        <border diagonalUp="1"><diagonal style="thin"/></border>
+      </borders>
+      <cellXfs count="5">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="1"/>
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="2"/>
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="3"/>
+        <xf numFmtId="0" fontId="0" fillId="2" borderId="0"/>
+      </cellXfs>
+    </styleSheet>"#;
+
+    fn tail_painted(sheet_xml: &str) -> NativeXlsx {
+        let wb = workbook_from(sheet_xml, &[("xl/styles.xml", TAIL_STYLES)]);
+        workbook_to_pages(
+            &wb,
+            EmitOptions {
+                paint: true,
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    fn one_cell(style: u32) -> NativeXlsx {
+        tail_painted(&format!(
+            r#"<worksheet><sheetViews><sheetView showGridLines="0"/></sheetViews>
+            <cols><col min="1" max="1" width="10" customWidth="1"/></cols>
+            <sheetData><row r="1" ht="20"><c r="A1" s="{style}"><v>1</v></c></row>
+            </sheetData></worksheet>"#
+        ))
+    }
+
+    /// A broken edge is a run of rects along the cell's top, each one pen-wide
+    /// and none of them past the cell.
+    #[test]
+    fn a_dashed_edge_paints_one_rect_per_run() {
+        let nx = one_cell(1);
+        let r = rects(&nx.layouts[0]);
+        assert!(r.len() > 3, "one rect per dash, got {}", r.len());
+        let cell_w = 56.25;
+        for (x, y, w, h, _) in &r {
+            assert_eq!(*y, MARGIN, "every dash sits on the cell's top edge");
+            assert!((*h - 0.75).abs() < 1e-4, "one pen thick");
+            assert!(
+                *x >= MARGIN && x + w <= MARGIN + cell_w + 1e-4,
+                "inside the cell"
+            );
+        }
+        // The dashes leave gaps: they cover less than the whole edge.
+        let inked: f32 = r.iter().map(|(_, _, w, _, _)| *w).sum();
+        assert!(inked < cell_w * 0.8, "a dashed edge is mostly gap: {inked}");
+    }
+
+    /// `double` is two strokes and a gap, filling the three-pen band
+    /// `extent_pt` reserves — not one thin line, which is what 27,300 corpus
+    /// edges were painted as before.
+    #[test]
+    fn a_double_edge_paints_two_strokes_with_a_gap() {
+        let nx = one_cell(2);
+        let r = rects(&nx.layouts[0]);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(r[0].1, MARGIN);
+        assert!((r[1].1 - (MARGIN + 1.5)).abs() < 1e-4, "one pen of gap");
+        assert!(r.iter().all(|e| (e.3 - 0.75).abs() < 1e-4));
+    }
+
+    /// The diagonal is the grid painter's one non-`Rect`, and it runs corner
+    /// to corner of the cell it is declared on.
+    #[test]
+    fn a_diagonal_paints_a_line_across_the_cell() {
+        let nx = one_cell(3);
+        let lines: Vec<_> = nx.layouts[0]
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Line { line, .. } => Some(*line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 1, "diagonalUp alone draws one line");
+        let l = lines[0];
+        // Bottom-left to top-right: y falls as x rises.
+        assert_eq!((l.start.x.raw(), l.end.y.raw()), (MARGIN, MARGIN));
+        assert!(l.start.y.raw() > l.end.y.raw() && l.end.x.raw() > l.start.x.raw());
+    }
+
+    /// A hatch has no pattern engine behind it: it paints one rect at the
+    /// pattern's coverage, blended over its own `bgColor`.
+    #[test]
+    fn a_hatch_fill_paints_its_coverage_blend() {
+        let nx = one_cell(4);
+        let r = rects(&nx.layouts[0]);
+        assert_eq!(r.len(), 1, "{r:?}");
+        // `lightGray` is one part in four of black over white.
+        let grey = (255.0 * 0.75_f32).round() as u8;
+        assert_eq!(
+            r[0].4,
+            RgbColor {
+                r: grey,
+                g: grey,
+                b: grey
+            }
+        );
     }
 
     /// Paint follows the page split: a page holds its own rows' ink and the
