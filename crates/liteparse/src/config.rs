@@ -264,6 +264,14 @@ impl LiteParseConfig {
     pub fn effective_emit_word_boxes(&self) -> bool {
         self.emit_word_boxes || self.output_format == OutputFormat::Markdown || self.extract_blocks
     }
+
+    /// Whether the bindings return `TextItem.words` (napi, python, wasm; the
+    /// CLI JSON never does). Word boxes extracted only for `extract_blocks`
+    /// are left out there, so turning on blocks doesn't grow their text-item
+    /// payload. Rust callers still get them on `ParseResult`'s items.
+    pub fn output_word_boxes(&self) -> bool {
+        self.emit_word_boxes || self.output_format == OutputFormat::Markdown
+    }
 }
 
 impl Default for LiteParseConfig {
@@ -460,6 +468,20 @@ mod tests {
             ..LiteParseConfig::default()
         };
         assert!(c.effective_emit_word_boxes());
+    }
+
+    #[test]
+    fn word_boxes_extracted_only_for_blocks_are_not_output() {
+        let mut c = LiteParseConfig {
+            extract_blocks: true,
+            ..LiteParseConfig::default()
+        };
+        assert!(!c.output_word_boxes());
+        c.emit_word_boxes = true;
+        assert!(c.output_word_boxes());
+        c.emit_word_boxes = false;
+        c.output_format = OutputFormat::Markdown;
+        assert!(c.output_word_boxes());
     }
 
     #[test]
