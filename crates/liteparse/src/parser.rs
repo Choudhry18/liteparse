@@ -7,6 +7,13 @@
 //! directly, or a caller sequencing the stages themselves could no longer
 //! reproduce `parse()`. `tests/stages_compose.rs` asserts that equivalence.
 
+#[cfg(target_arch = "wasm32")]
+use std::future::{Future, poll_fn};
+#[cfg(target_arch = "wasm32")]
+use std::pin::Pin;
+#[cfg(target_arch = "wasm32")]
+use std::task::Poll;
+
 use crate::config::{LiteParseConfig, parse_target_pages};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::conversion;
@@ -23,6 +30,43 @@ use crate::types::{
     ScreenshotRect, XfaPacket,
 };
 use pdfium::Library;
+
+#[cfg(target_arch = "wasm32")]
+type OcrJob = Pin<Box<dyn Future<Output = stages::PageOcrOutcome>>>;
+
+#[cfg(target_arch = "wasm32")]
+fn ocr_job(
+    raster: stages::OcrRaster,
+    engine: std::sync::Arc<dyn OcrEngine>,
+    language: String,
+) -> OcrJob {
+    Box::pin(async move {
+        stages::recognize(vec![raster], engine, &language, 1)
+            .await
+            .pop()
+            .expect("one OCR raster must produce one outcome")
+    })
+}
+
+/// Return the first OCR job that finishes. All pending jobs use the same
+/// caller waker, so one completed engine callback resumes the scheduler.
+#[cfg(target_arch = "wasm32")]
+async fn next_ocr_outcome(active: &mut Vec<OcrJob>) -> Option<stages::PageOcrOutcome> {
+    if active.is_empty() {
+        return None;
+    }
+    poll_fn(|context| {
+        for index in 0..active.len() {
+            if let Poll::Ready(outcome) = active[index].as_mut().poll(context) {
+                let completed_job = active.swap_remove(index);
+                drop(completed_job);
+                return Poll::Ready(Some(outcome));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
 
 /// Result of parsing a document.
 pub struct ParseResult {
@@ -353,7 +397,7 @@ impl LiteParse {
             std::collections::HashSet::new()
         };
         stages::OcrRenderOptions {
-            // One round per `num_workers` pages bounds raster memory.
+            // One bounded set per `num_workers` pages limits raster memory.
             max_rasters: self.config.num_workers.max(1),
             dpi: self.config.dpi,
             grayscale,
@@ -792,36 +836,93 @@ impl LiteParse {
         if let Some(engine) = ocr_engine {
             let render_options = ocr_render_options;
             let ocr_input = repaired_input.as_ref().unwrap_or(validated_input);
-            let mut round_start = 0usize;
-            while round_start < pages.len() {
-                let (rendered, next_start) = {
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                let worker_count = self.config.num_workers.max(1);
+                let mut active_jobs = Vec::with_capacity(worker_count);
+                let mut outcomes = Vec::new();
+
+                // Fill the active slots in one document pass.
+                let (rendered, mut next_start) = {
                     let lib = Library::init();
                     let document = self.open_document(&lib, ocr_input, password)?;
-                    stages::render_for_ocr(&document, &pages, round_start, &render_options)?
+                    stages::render_for_ocr(&document, &pages, 0, &render_options)?
                     // `lib` drops here, releasing the PDFium lock before the
                     // engine's async recognition below.
                 };
-                round_start = next_start;
-                if rendered.is_empty() {
-                    // The scan reached the end without finding another page
-                    // that needs OCR.
-                    continue;
+                for raster in rendered {
+                    active_jobs.push(ocr_job(
+                        raster,
+                        engine.clone(),
+                        self.config.ocr_language.clone(),
+                    ));
                 }
-                // `OcrRaster::page_idx` is absolute, so the whole slice is
-                // passed regardless of where this round started.
-                let outcomes = stages::recognize(
-                    rendered,
-                    engine.clone(),
-                    &self.config.ocr_language,
-                    self.config.num_workers,
-                )
-                .await;
+
+                // Replace each completed job at once. The other jobs continue
+                // in their Web Workers or HTTP requests while PDFium prepares
+                // the replacement raster. There is no batch-wide wait for the
+                // slowest active job.
+                while let Some(outcome) = next_ocr_outcome(&mut active_jobs).await {
+                    outcomes.push(outcome);
+                    if next_start >= pages.len() {
+                        continue;
+                    }
+
+                    let mut refill_options = render_options.clone();
+                    refill_options.max_rasters = 1;
+                    let (rendered, resume_at) = {
+                        let lib = Library::init();
+                        let document = self.open_document(&lib, ocr_input, password)?;
+                        stages::render_for_ocr(&document, &pages, next_start, &refill_options)?
+                    };
+                    next_start = resume_at;
+                    for raster in rendered {
+                        active_jobs.push(ocr_job(
+                            raster,
+                            engine.clone(),
+                            self.config.ocr_language.clone(),
+                        ));
+                    }
+                }
+
                 stages::merge_ocr(
                     &mut pages,
                     outcomes,
                     self.config.ocr_failure_fatal,
                     self.config.effective_emit_word_boxes(),
                 )?;
+            }
+
+            // Keep the native path unchanged. Its Tokio scheduler already
+            // fills free worker slots inside each bounded raster set.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut round_start = 0usize;
+                while round_start < pages.len() {
+                    let (rendered, next_start) = {
+                        let lib = Library::init();
+                        let document = self.open_document(&lib, ocr_input, password)?;
+                        stages::render_for_ocr(&document, &pages, round_start, &render_options)?
+                    };
+                    round_start = next_start;
+                    if rendered.is_empty() {
+                        continue;
+                    }
+                    let outcomes = stages::recognize(
+                        rendered,
+                        engine.clone(),
+                        &self.config.ocr_language,
+                        self.config.num_workers,
+                    )
+                    .await;
+                    stages::merge_ocr(
+                        &mut pages,
+                        outcomes,
+                        self.config.ocr_failure_fatal,
+                        self.config.effective_emit_word_boxes(),
+                    )?;
+                }
             }
         }
         let t_ocr = web_time::Instant::now();

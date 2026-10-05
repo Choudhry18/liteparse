@@ -75,7 +75,7 @@ All optional, camelCase:
 | `preserveVerySmallText` | `boolean` | `false` | Keep tiny text that's normally filtered |
 | `password` | `string` | — | Password for protected PDFs |
 | `quiet` | `boolean` | `false` | Suppress progress logging |
-| `numWorkers` | `number` | `1` | Maximum concurrent OCR calls and rendered page rasters |
+| `numWorkers` | `number` | `1` | Maximum concurrent OCR calls |
 | `ocrEngine` | `object` | — | JS-side OCR engine (see below) |
 
 ## OCR in the browser
@@ -106,11 +106,12 @@ const parser = new LiteParse({
 });
 ```
 
-LiteParse keeps at most `numWorkers` calls to `recognize` active. An OCR
-engine can send those calls to a Web Worker pool or to concurrent HTTP
-requests. Results stay in page order when jobs finish out of order. Each
-active call also keeps one rendered page raster in memory, so use a small
-value for high-DPI documents.
+LiteParse keeps at most `numWorkers` calls to `recognize` active. When one call
+finishes, LiteParse prepares and starts the next page without waiting for the
+other calls. An OCR engine can send the calls to a Web Worker pool or to
+concurrent HTTP requests. Results stay assigned to their source pages when
+jobs finish out of order. Active calls can keep up to `numWorkers` rendered
+page rasters in memory, so use a small value for high-DPI documents.
 
 ## Building from source
 

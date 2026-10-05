@@ -130,6 +130,8 @@
       let maxActiveOcrCalls = 0;
       let concurrentOcrCalls = 0;
       const completionOrder = [];
+      let firstOcrCallActive = false;
+      let queuedCallStartedBeforeFirstFinished = false;
       const concurrentOcrParser = new LiteParse({
         ocrEnabled: true,
         ocrLanguage: "eng",
@@ -142,13 +144,19 @@
             concurrentOcrCalls += 1;
             activeOcrCalls += 1;
             maxActiveOcrCalls = Math.max(maxActiveOcrCalls, activeOcrCalls);
+            if (width === 72) {
+              firstOcrCallActive = true;
+            } else if (width === 74 && firstOcrCallActive) {
+              queuedCallStartedBeforeFirstFinished = true;
+            }
 
             // Page 2 finishes before page 1. This verifies that LiteParse can
-            // accept out-of-order worker completion and keep page order.
+            // start page 3 without a batch wait and can keep page order.
             const delayMs = width === 72 ? 50 : 5;
             await new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs));
             completionOrder.push(width);
             activeOcrCalls -= 1;
+            if (width === 72) firstOcrCallActive = false;
 
             return [{
               text: `WASM_CONCURRENT_OCR_WIDTH_${width}`,
@@ -168,6 +176,9 @@
       }
       if (completionOrder[0] !== 73) {
         throw new Error(`OCR callbacks did not finish out of order: ${completionOrder}`);
+      }
+      if (!queuedCallStartedBeforeFirstFinished) {
+        throw new Error("The queued OCR call waited for the slowest active call");
       }
       const pageTexts = concurrentResult.pages.map((page) => page.text);
       for (let index = 0; index < pageTexts.length; index += 1) {
