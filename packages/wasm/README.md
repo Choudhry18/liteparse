@@ -75,6 +75,7 @@ All optional, camelCase:
 | `preserveVerySmallText` | `boolean` | `false` | Keep tiny text that's normally filtered |
 | `password` | `string` | — | Password for protected PDFs |
 | `quiet` | `boolean` | `false` | Suppress progress logging |
+| `numWorkers` | `number` | `1` | Maximum concurrent OCR calls and rendered page rasters |
 | `ocrEngine` | `object` | — | JS-side OCR engine (see below) |
 
 ## OCR in the browser
@@ -85,6 +86,8 @@ The native HTTP-OCR and Tesseract backends are not available in the browser. To 
 const parser = new LiteParse({
   ocrEnabled: true,
   ocrLanguage: "eng",
+  // Use more than 1 only if the engine supports concurrent jobs.
+  numWorkers: 2,
   ocrEngine: {
     /**
      * @param imageData PNG-encoded image bytes
@@ -102,6 +105,12 @@ const parser = new LiteParse({
   },
 });
 ```
+
+LiteParse keeps at most `numWorkers` calls to `recognize` active. An OCR
+engine can send those calls to a Web Worker pool or to concurrent HTTP
+requests. Results stay in page order when jobs finish out of order. Each
+active call also keeps one rendered page raster in memory, so use a small
+value for high-DPI documents.
 
 ## Building from source
 
