@@ -82,6 +82,8 @@ pub struct ParseResult {
     /// Page-level PDFium extraction failures collected when
     /// `continue_on_page_error` is enabled.
     pub page_errors: Vec<PageError>,
+    /// OCR failures in source page order. Native text remains available.
+    pub ocr_errors: Vec<PageError>,
     /// Full document text, concatenated from all pages.
     pub text: String,
     /// Document outline (bookmarks) when present. Used by the markdown
@@ -861,6 +863,7 @@ impl LiteParse {
             )
         };
         let mut pages = pages;
+        let mut ocr_errors = Vec::new();
         let t1 = web_time::Instant::now();
 
         if let Some(engine) = ocr_engine {
@@ -900,6 +903,12 @@ impl LiteParse {
                 // slowest active job.
                 while let Some(outcome) = next_ocr_outcome(&mut active_jobs).await {
                     let succeeded = outcome.error.is_none();
+                    if let Some(message) = &outcome.error {
+                        ocr_errors.push(PageError {
+                            page_number: outcome.page_number as u32,
+                            message: message.clone(),
+                        });
+                    }
                     let index = page_indices.get(&outcome.page_number).ok_or_else(|| {
                         LiteParseError::Other(format!(
                             "No page for OCR outcome {}",
@@ -964,6 +973,12 @@ impl LiteParse {
                         self.config.num_workers,
                     )
                     .await;
+                    ocr_errors.extend(outcomes.iter().filter_map(|outcome| {
+                        outcome.error.as_ref().map(|message| PageError {
+                            page_number: outcome.page_number as u32,
+                            message: message.clone(),
+                        })
+                    }));
                     stages::merge_ocr(
                         &mut pages,
                         outcomes,
@@ -974,6 +989,7 @@ impl LiteParse {
             }
         }
         let t_ocr = web_time::Instant::now();
+        ocr_errors.sort_by_key(|error| error.page_number);
         log(&format!(
             "[liteparse] ocr: {:.1}ms",
             t_ocr.duration_since(t1).as_secs_f64() * 1000.0
@@ -1039,6 +1055,7 @@ impl LiteParse {
             total_pages,
             pages: parsed_pages,
             page_errors,
+            ocr_errors,
             text: full_text,
             outline,
             images,
@@ -1078,6 +1095,7 @@ impl LiteParse {
             total_pages,
             pages: parsed_pages,
             page_errors: Vec::new(),
+            ocr_errors: Vec::new(),
             text: full_text,
             outline,
             images: Vec::new(),
@@ -1189,6 +1207,7 @@ impl LiteParse {
             total_pages,
             pages: parsed_pages,
             page_errors: Vec::new(),
+            ocr_errors: Vec::new(),
             text: full_text,
             outline,
             images,

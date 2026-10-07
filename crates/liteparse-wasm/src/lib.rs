@@ -819,6 +819,8 @@ pub struct ParseResult {
     pub screenshots: Vec<ScreenshotResult>,
     pub image_error_count: u32,
     pub page_errors: Vec<PageError>,
+    /// OCR failures in source page order. Empty when no OCR job failed.
+    pub ocr_errors: Vec<PageError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub form_type: Option<i32>,
     /// The document's `/Info` `Creator` entry, when present.
@@ -1387,6 +1389,14 @@ fn to_js_result(result: &liteparse::ParseResult, extract_text_metadata: bool) ->
         image_error_count: result.image_error_count,
         page_errors: result
             .page_errors
+            .iter()
+            .map(|error| PageError {
+                page_num: error.page_number,
+                message: error.message.clone(),
+            })
+            .collect(),
+        ocr_errors: result
+            .ocr_errors
             .iter()
             .map(|error| PageError {
                 page_num: error.page_number,

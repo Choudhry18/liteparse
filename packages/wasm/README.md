@@ -157,6 +157,32 @@ handle rejection and manage its own OCR worker pool. The callback applies to
 Without a callback, LiteParse still merges each OCR page as it finishes, but
 does not create or serialize preview pages. The OCR failure policy is unchanged.
 
+### Read OCR errors
+
+`result.ocrErrors` lists failed OCR jobs as `{ pageNum, message }`, in source
+page order. Page numbers start at 1 and stay the same when `targetPages` is set.
+The list is empty when OCR is disabled or no OCR job failed. A successful OCR
+job with no words is not an error. `pageErrors` remains separate: it reports
+PDF extraction failures, not OCR failures.
+
+```typescript
+const parser = new LiteParse({
+  ocrEnabled: true,
+  ocrEngine,
+  ocrFailureFatal: false,
+});
+const result = await parser.parse(pdfBytes);
+for (const error of result.ocrErrors) {
+  console.warn(`OCR failed on page ${error.pageNum}: ${error.message}`);
+}
+```
+
+This field does not change the failure policy or retry failed pages. If
+`parse()` rejects, it does not return a result. Use `ocrFailureFatal: false`
+to receive partial results when all OCR jobs fail. Other fatal parse errors
+can still reject the call. Node.js also uses `ocrErrors`; Rust and Python use
+`ocr_errors`.
+
 ## Building from source
 
 Requires Rust + [`wasm-pack`](https://rustwasm.github.io/wasm-pack/):

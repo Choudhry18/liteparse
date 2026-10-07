@@ -272,6 +272,7 @@
         const finalOnly = await finalOnlyParser.parse(buildBlankPdf(3));
         finalOnlyParser.free();
         check(JSON.stringify(finalOnly) === JSON.stringify(incrementalResult), "Page callbacks changed the final result");
+        check(finalOnly.ocrErrors.length === 0, "Successful OCR reported an error");
       }
 
       const selectedEvents = [];
@@ -306,7 +307,8 @@
         ocrEnabled: false, quiet: true,
         onOcrPage() { throw new Error("Unexpected callback with OCR disabled"); },
       });
-      await noOcrParser.parse(buildBlankPdf());
+      const noOcrResult = await noOcrParser.parse(buildBlankPdf());
+      check(noOcrResult.ocrErrors.length === 0, "Disabled OCR reported an error");
       noOcrParser.free();
 
       for (const fatal of [true, false]) {
@@ -328,12 +330,39 @@
             } else {
               const partial = await failureParser.parse(buildBlankPdf(3));
               check(partial.pages.length === 3, "Partial OCR lost pages");
+              check(partial.ocrErrors.map((error) => error.pageNum).join(",") === (allFailed ? "1,2,3" : "1"), "OCR errors lost source page numbers");
+              check(partial.ocrErrors.every((error) => error.message.includes("test engine failure")), "OCR errors lost their messages");
+              check(partial.pageErrors.length === 0, "OCR errors were reported as extraction errors");
             }
             check(successfulPages.join(",") === (allFailed ? "" : "2,3"), "Failed OCR emitted a success callback");
           } finally {
             failureParser.free();
           }
         }
+      }
+
+      const failedOrder = [];
+      let releaseFailedFirst;
+      const failureGate = new Promise((resolve) => { releaseFailedFirst = resolve; });
+      const orderedErrorsParser = new LiteParse({
+        ...pageOptions, numWorkers: 2, targetPages: "2-3", ocrFailureFatal: false,
+        ocrEngine: {
+          async recognize(_image, width) {
+            if (width === 73) await failureGate;
+            failedOrder.push(width - 71);
+            if (width === 74) releaseFailedFirst();
+            throw new Error(`failure on page ${width - 71}`);
+          },
+        },
+      });
+      try {
+        const partial = await orderedErrorsParser.parse(buildBlankPdf(3));
+        check(failedOrder.join(",") === "3,2", "Expected out-of-order OCR failures");
+        check(JSON.stringify(partial.ocrErrors.map((error) => error.pageNum)) === "[2,3]", "OCR errors must use source page order");
+        check(partial.ocrErrors.every((error) => error.message.includes(`failure on page ${error.pageNum}`)), "OCR error message has the wrong page");
+      } finally {
+        releaseFailedFirst();
+        orderedErrorsParser.free();
       }
 
       const throwingParser = new LiteParse({
