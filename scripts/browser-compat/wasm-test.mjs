@@ -110,12 +110,14 @@ async function main() {
     const textLength = await page.locator("#result").getAttribute("data-text-length");
     const ocrCallbacks = await page.locator("#result").getAttribute("data-ocr-callbacks");
     const ocrBytes = await page.locator("#result").getAttribute("data-ocr-bytes");
+    const ocrMaxConcurrency = await page.locator("#result").getAttribute("data-ocr-max-concurrency");
 
     console.log(`PASS: ${resultText}`);
     console.log(`  Pages: ${pages}`);
     console.log(`  Text length: ${textLength}`);
     console.log(`  OCR callback calls: ${ocrCallbacks}`);
     console.log(`  OCR input bytes: ${ocrBytes}`);
+    console.log(`  OCR maximum concurrency: ${ocrMaxConcurrency}`);
 
     if (errors.length) {
       console.warn("Browser console errors (non-fatal):", errors);

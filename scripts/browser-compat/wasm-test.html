@@ -15,13 +15,24 @@
     const resultEl = document.getElementById("result");
     const errorEl = document.getElementById("error");
 
-    function buildBlankPdf() {
+    function buildBlankPdf(pageCount = 1) {
+      const kids = Array.from(
+        { length: pageCount },
+        (_, index) => `${3 + index * 2} 0 R`,
+      ).join(" ");
       const objects = [
         "<< /Type /Catalog /Pages 2 0 R >>",
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] /Resources << >> /Contents 4 0 R >>",
-        "<< /Length 0 >>\nstream\n\nendstream",
+        `<< /Type /Pages /Kids [${kids}] /Count ${pageCount} >>`,
       ];
+
+      for (let index = 0; index < pageCount; index += 1) {
+        const contentId = 4 + index * 2;
+        const pageWidth = 72 + index;
+        objects.push(
+          `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} 72] /Resources << >> /Contents ${contentId} 0 R >>`,
+          "<< /Length 0 >>\nstream\n\nendstream",
+        );
+      }
 
       let pdf = "%PDF-1.4\n%1234\n";
       const offsets = [0];
@@ -104,11 +115,77 @@
       });
       const ocrResult = await ocrParser.parse(buildBlankPdf());
 
+      if (ocrParser.config.numWorkers !== 1) {
+        throw new Error(`Expected default OCR concurrency 1, received ${ocrParser.config.numWorkers}`);
+      }
       if (ocrCallbackCalls !== 1) {
         throw new Error(`Expected one OCR callback, received ${ocrCallbackCalls}`);
       }
       if (!ocrResult.text.includes("WASM_OCR_CALLBACK_OK")) {
         throw new Error("OCR callback text was not merged into the parse result");
+      }
+
+      status.textContent = "testing concurrent OCR callbacks";
+      let activeOcrCalls = 0;
+      let maxActiveOcrCalls = 0;
+      let concurrentOcrCalls = 0;
+      const completionOrder = [];
+      let firstOcrCallActive = false;
+      let queuedCallStartedBeforeFirstFinished = false;
+      const concurrentOcrParser = new LiteParse({
+        ocrEnabled: true,
+        ocrLanguage: "eng",
+        outputFormat: "text",
+        dpi: 72,
+        quiet: true,
+        numWorkers: 2,
+        ocrEngine: {
+          async recognize(_imageData, width, height) {
+            concurrentOcrCalls += 1;
+            activeOcrCalls += 1;
+            maxActiveOcrCalls = Math.max(maxActiveOcrCalls, activeOcrCalls);
+            if (width === 72) {
+              firstOcrCallActive = true;
+            } else if (width === 74 && firstOcrCallActive) {
+              queuedCallStartedBeforeFirstFinished = true;
+            }
+
+            // Page 2 finishes before page 1. This verifies that LiteParse can
+            // start page 3 without a batch wait and can keep page order.
+            const delayMs = width === 72 ? 50 : 5;
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs));
+            completionOrder.push(width);
+            activeOcrCalls -= 1;
+            if (width === 72) firstOcrCallActive = false;
+
+            return [{
+              text: `WASM_CONCURRENT_OCR_WIDTH_${width}`,
+              bbox: [4, 4, Math.max(8, width - 4), Math.min(24, height - 4)],
+              confidence: 0.99,
+            }];
+          },
+        },
+      });
+      const concurrentResult = await concurrentOcrParser.parse(buildBlankPdf(3));
+
+      if (concurrentOcrCalls !== 3) {
+        throw new Error(`Expected three OCR callbacks, received ${concurrentOcrCalls}`);
+      }
+      if (maxActiveOcrCalls !== 2) {
+        throw new Error(`Expected two concurrent OCR callbacks, observed ${maxActiveOcrCalls}`);
+      }
+      if (completionOrder[0] !== 73) {
+        throw new Error(`OCR callbacks did not finish out of order: ${completionOrder}`);
+      }
+      if (!queuedCallStartedBeforeFirstFinished) {
+        throw new Error("The queued OCR call waited for the slowest active call");
+      }
+      const pageTexts = concurrentResult.pages.map((page) => page.text);
+      for (let index = 0; index < pageTexts.length; index += 1) {
+        const expected = `WASM_CONCURRENT_OCR_WIDTH_${72 + index}`;
+        if (!pageTexts[index].includes(expected)) {
+          throw new Error(`Page ${index + 1} did not keep its OCR result: ${pageTexts[index]}`);
+        }
       }
 
       status.textContent = "done";
@@ -117,7 +194,8 @@
       resultEl.setAttribute("data-text-length", textLength);
       resultEl.setAttribute("data-ocr-callbacks", ocrCallbackCalls);
       resultEl.setAttribute("data-ocr-bytes", ocrByteLength);
-      resultEl.textContent = `OK: ${pageCount} pages, ${textLength} chars, OCR callback passed`;
+      resultEl.setAttribute("data-ocr-max-concurrency", maxActiveOcrCalls);
+      resultEl.textContent = `OK: ${pageCount} pages, ${textLength} chars, OCR callback and concurrency passed`;
     } catch (err) {
       status.textContent = "error";
       errorEl.style.display = "block";

@@ -4,6 +4,8 @@ use std::sync::Arc;
 use crate::error::LiteParseError;
 use crate::ocr::{OcrEngine, OcrOptions, OcrResult};
 use crate::types::{CutAxis, Page, ParsedPage, Rect, Region, RegionKind, TextItem, WordBox};
+#[cfg(target_arch = "wasm32")]
+use futures_util::stream::{self, StreamExt};
 use pdfium::{Document, ImageBounds};
 use serde::{Deserialize, Serialize};
 
@@ -862,26 +864,36 @@ pub async fn recognize_rasters(
     type OcrTaskResult = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
 
     // Browser WASM uses the JavaScript event loop. It has no Tokio runtime or
-    // blocking thread pool. Run each JavaScript OCR callback directly so the
-    // returned Promise can make progress on the browser event loop.
+    // blocking thread pool. Poll a bounded set of JavaScript OCR promises so
+    // an engine can send work to its Web Worker pool or HTTP server.
     #[cfg(target_arch = "wasm32")]
     let task_results: Vec<(usize, f32, (bool, Vec<Rect>), OcrTaskResult)> = {
-        let _ = num_workers;
-        let mut results = Vec::with_capacity(rendered.len());
-        for r in rendered {
-            let page_number = r.page_number;
-            let page_dpi = r.dpi;
-            let native = (r.has_native_text, r.image_rects.clone());
-            let options = OcrOptions {
-                language: ocr_language.to_string(),
-                dpi: page_dpi,
-            };
-            let result = ocr_engine
-                .recognize(&r.pixels, r.width, r.height, &options)
-                .await;
-            results.push((page_number, page_dpi, native, result));
-        }
-        results
+        let concurrency = num_workers.max(1);
+        let mut results = stream::iter(rendered.into_iter().enumerate().map(|(index, r)| {
+            let engine = ocr_engine.clone();
+            let language = ocr_language.to_string();
+            async move {
+                let page_number = r.page_number;
+                let page_dpi = r.dpi;
+                let native = (r.has_native_text, r.image_rects.clone());
+                let options = OcrOptions {
+                    language,
+                    dpi: page_dpi,
+                };
+                let result = engine
+                    .recognize(&r.pixels, r.width, r.height, &options)
+                    .await;
+                (index, (page_number, page_dpi, native, result))
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        // Worker jobs can finish in any order. Restore raster order before
+        // the outcomes leave this stage.
+        results.sort_unstable_by_key(|(index, _)| *index);
+        results.into_iter().map(|(_, result)| result).collect()
     };
 
     // Phase 1: spawn one async task per page. A semaphore limits how many run
