@@ -228,7 +228,8 @@ pub fn render_for_ocr(
 }
 
 /// Run an [`OcrEngine`] over rasters, at most `num_workers` at a time. Pure
-/// recognition; failures are per-outcome, not errors. A caller with its own
+/// recognition; failures are per-outcome, not errors. Results stay in input
+/// order, including on WASM. A caller with its own
 /// OCR service can skip this and build [`PageOcrOutcome`]s directly from
 /// the [`OcrRaster`] facts and its engine's word boxes (raster pixel space).
 pub async fn recognize(
