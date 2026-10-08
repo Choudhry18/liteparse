@@ -8,11 +8,11 @@
 //! reproduce `parse()`. `tests/stages_compose.rs` asserts that equivalence.
 
 #[cfg(target_arch = "wasm32")]
-use std::future::{Future, poll_fn};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+#[cfg(target_arch = "wasm32")]
+use std::future::Future;
 #[cfg(target_arch = "wasm32")]
 use std::pin::Pin;
-#[cfg(target_arch = "wasm32")]
-use std::task::Poll;
 
 use crate::config::{LiteParseConfig, parse_target_pages};
 #[cfg(not(target_arch = "wasm32"))]
@@ -46,26 +46,6 @@ fn ocr_job(
             .pop()
             .expect("one OCR raster must produce one outcome")
     })
-}
-
-/// Return the first OCR job that finishes. All pending jobs use the same
-/// caller waker, so one completed engine callback resumes the scheduler.
-#[cfg(target_arch = "wasm32")]
-async fn next_ocr_outcome(active: &mut Vec<OcrJob>) -> Option<stages::PageOcrOutcome> {
-    if active.is_empty() {
-        return None;
-    }
-    poll_fn(|context| {
-        for index in 0..active.len() {
-            if let Poll::Ready(outcome) = active[index].as_mut().poll(context) {
-                let completed_job = active.swap_remove(index);
-                drop(completed_job);
-                return Poll::Ready(Some(outcome));
-            }
-        }
-        Poll::Pending
-    })
-    .await
 }
 
 /// Result of parsing a document.
@@ -839,8 +819,7 @@ impl LiteParse {
 
             #[cfg(target_arch = "wasm32")]
             {
-                let worker_count = self.config.num_workers.max(1);
-                let mut active_jobs = Vec::with_capacity(worker_count);
+                let mut active_jobs = FuturesUnordered::new();
                 let page_indices: std::collections::HashMap<_, _> = pages
                     .iter()
                     .enumerate()
@@ -867,7 +846,7 @@ impl LiteParse {
                 // in their Web Workers or HTTP requests while PDFium prepares
                 // the replacement raster. There is no batch-wide wait for the
                 // slowest active job.
-                while let Some(outcome) = next_ocr_outcome(&mut active_jobs).await {
+                while let Some(outcome) = active_jobs.next().await {
                     let index = *page_indices.get(&outcome.page_number).ok_or_else(|| {
                         LiteParseError::Other(format!(
                             "No page for OCR outcome {}",
