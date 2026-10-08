@@ -841,7 +841,11 @@ impl LiteParse {
             {
                 let worker_count = self.config.num_workers.max(1);
                 let mut active_jobs = Vec::with_capacity(worker_count);
-                let mut outcomes = Vec::new();
+                let page_indices: std::collections::HashMap<_, _> = pages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, page)| (page.page_number, index))
+                    .collect();
 
                 // Fill the active slots in one document pass.
                 let (rendered, mut next_start) = {
@@ -864,7 +868,20 @@ impl LiteParse {
                 // the replacement raster. There is no batch-wide wait for the
                 // slowest active job.
                 while let Some(outcome) = next_ocr_outcome(&mut active_jobs).await {
-                    outcomes.push(outcome);
+                    let index = *page_indices.get(&outcome.page_number).ok_or_else(|| {
+                        LiteParseError::Other(format!(
+                            "No page for OCR outcome {}",
+                            outcome.page_number
+                        ))
+                    })?;
+                    // Check each page before starting another OCR job. A failed
+                    // page with sparse native text must keep its fatal error.
+                    stages::merge_ocr(
+                        std::slice::from_mut(&mut pages[index]),
+                        vec![outcome],
+                        self.config.ocr_failure_fatal,
+                        self.config.effective_emit_word_boxes(),
+                    )?;
                     if next_start >= pages.len() {
                         continue;
                     }
@@ -885,13 +902,6 @@ impl LiteParse {
                         ));
                     }
                 }
-
-                stages::merge_ocr(
-                    &mut pages,
-                    outcomes,
-                    self.config.ocr_failure_fatal,
-                    self.config.effective_emit_word_boxes(),
-                )?;
             }
 
             // Keep the native path unchanged. Its Tokio scheduler already

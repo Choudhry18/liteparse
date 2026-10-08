@@ -188,6 +188,109 @@
         }
       }
 
+      status.textContent = "testing OCR failure policy";
+      function deferred() {
+        let resolve;
+        const promise = new Promise((done) => { resolve = done; });
+        return { promise, resolve };
+      }
+      async function withDeadline(promise, message) {
+        let timer;
+        try {
+          return await Promise.race([
+            promise,
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error(message)), 5000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      if (ocrParser.config.ocrFailureFatal !== true) {
+        throw new Error("Expected OCR failures to be fatal by default");
+      }
+      let failureCases = 0;
+      for (const numWorkers of [1, 2]) {
+        for (const fatal of [true, false]) {
+          const secondStarted = deferred();
+          const thirdStarted = deferred();
+          const failed = deferred();
+          const releaseThird = deferred();
+          const thirdFinished = deferred();
+          const calls = [];
+          let thirdActive = false;
+          const failureParser = new LiteParse({
+            ocrEnabled: true, dpi: 72, quiet: true, outputFormat: "text",
+            numWorkers, ocrFailureFatal: fatal,
+            ocrEngine: {
+              async recognize(_imageData, width) {
+                calls.push(width);
+                if (width === 72 && numWorkers === 2) {
+                  await secondStarted.promise;
+                }
+                if (width === 73) {
+                  secondStarted.resolve();
+                  if (numWorkers === 2) await thirdStarted.promise;
+                  failed.resolve();
+                  throw new Error("EXPECTED_OCR_PAGE_FAILURE");
+                }
+                if (width === 74) {
+                  thirdActive = true;
+                  thirdStarted.resolve();
+                  try {
+                    await releaseThird.promise;
+                  } finally {
+                    thirdActive = false;
+                    thirdFinished.resolve();
+                  }
+                }
+                return [{
+                  text: `OCR_SUCCESS_${width}`,
+                  bbox: [4, 4, width - 4, 24], confidence: 0.99,
+                }];
+              },
+            },
+          });
+          const settled = failureParser.parse(buildBlankPdf(3)).then(
+            (result) => ({ result }), (error) => ({ error }),
+          );
+          try {
+            await withDeadline(failed.promise, "The failing OCR page did not start");
+            if (!fatal) releaseThird.resolve();
+            const outcome = await withDeadline(settled, "OCR failure policy did not settle parse()");
+            if (fatal) {
+              if (!String(outcome.error).includes("EXPECTED_OCR_PAGE_FAILURE")) {
+                throw new Error(`Expected a fatal OCR error with ${numWorkers} worker(s)`);
+              }
+              if (numWorkers === 1 && calls.join(",") !== "72,73") {
+                throw new Error("Serial OCR started another page after a fatal error");
+              }
+              if (numWorkers === 2 && !thirdActive) {
+                throw new Error("Fatal OCR did not reject while another call was active");
+              }
+            } else {
+              if (outcome.error) throw outcome.error;
+              const pages = outcome.result.pages;
+              if (pages.length !== 3 || !pages[0].text.includes("OCR_SUCCESS_72") ||
+                  pages[1].text.trim() !== "" || !pages[2].text.includes("OCR_SUCCESS_74")) {
+                throw new Error("Nonfatal OCR did not preserve successful pages");
+              }
+            }
+          } finally {
+            secondStarted.resolve();
+            thirdStarted.resolve();
+            releaseThird.resolve();
+            await withDeadline(settled, "OCR cleanup did not settle parse()");
+            if (calls.includes(74)) {
+              await withDeadline(thirdFinished.promise, "The active OCR call did not finish");
+            }
+            failureParser.free();
+          }
+          failureCases += 1;
+        }
+      }
+
       status.textContent = "done";
       resultEl.style.display = "block";
       resultEl.setAttribute("data-pages", pageCount);
@@ -195,7 +298,8 @@
       resultEl.setAttribute("data-ocr-callbacks", ocrCallbackCalls);
       resultEl.setAttribute("data-ocr-bytes", ocrByteLength);
       resultEl.setAttribute("data-ocr-max-concurrency", maxActiveOcrCalls);
-      resultEl.textContent = `OK: ${pageCount} pages, ${textLength} chars, OCR callback and concurrency passed`;
+      resultEl.setAttribute("data-ocr-failure-cases", failureCases);
+      resultEl.textContent = `OK: ${pageCount} pages, ${textLength} chars, OCR callback, concurrency, and ${failureCases} failure cases passed`;
     } catch (err) {
       status.textContent = "error";
       errorEl.style.display = "block";
