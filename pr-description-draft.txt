@@ -1,0 +1,54 @@
+## Summary
+
+Fast client-side PDF parsing is important for our use case: clients select
+relevant information from a large document before we start working with it.
+This PR lets browser OCR engines process multiple pages concurrently to
+reduce that initial wait.
+
+Expose `numWorkers` in WASM, with a default of `1`. It limits active OCR
+calls. PDF parsing and rendering remain single-threaded, and the supplied
+OCR engine provides the Web Workers or remote service.
+
+## Changes
+
+- Use `FuturesUnordered` to start a replacement OCR job when a slot becomes free.
+- Keep each OCR result assigned to its source page.
+- Support bounded concurrency for direct WASM `stages::recognize` callers,
+  with results returned in input order.
+
+## Scheduling tradeoff
+
+WASM fills each free OCR slot immediately; native waits for the current
+raster batch before rendering the next batch. Each WASM refill reopens the
+PDF, so it performs more document opens than native. The simple benchmark
+below measured 13.6% less OCR time than fixed batches at the same worker count.
+That result supports the rolling approach. A similar native change is worth
+considering separately, with native benchmarks and a failure-policy decision.
+
+## Performance results
+
+Single-pass browser measurements at 72 DPI, timing OCR only:
+
+| Manual | OCR pages | Serial, 1 worker | Fixed batches, 4 workers | Rolling, 4 workers |
+| --- | ---: | ---: | ---: | ---: |
+| Mitsubishi Heavy Industries, 164 pages | 130 | 169.29 s | 64.74 s | 53.87 s |
+| Carrier, 228 pages | 228 | 471.33 s | 166.59 s | 149.15 s |
+| Lennox, 333 pages | 313 | 366.95 s | 139.24 s | 117.26 s |
+| Total | 671 | 1007.57 s | 370.57 s | 320.28 s |
+
+Rolling scheduling reduced total OCR time by 68.2% against serial OCR and
+13.6% against fixed batches. This a quick benchmark I ran for my use case
+and it offered real speed-up happy to test other cases too. 
+
+## Concerns
+
+With fatal errors enabled, WASM is stricter than native batches that contain
+both successes and failures: native rejects only when every outcome in a
+batch fails and at least one failed page has insufficient native text, WASM
+merges each result individually so a single page fail would result in error. 
+This shouldn't be a concern if we adapt the scheduling approach instead of batching
+in native too, but if not the divergance in behaviour is something that needs discussion.
+
+For explicit `numWorkers: 0`, WASM reports `1` in `parser.config`, while native
+reports `0`. Both use one OCR slot during execution. Should WASM preserve the
+supplied value to match native, or report the effective limit?
