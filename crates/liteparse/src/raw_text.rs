@@ -216,7 +216,7 @@ pub fn extract_raw_text_items(
     items
 }
 
-/// The code pdfium gives a hyphen at the end of a line (`FPDFText_IsHyphen`).
+/// The code pdfium gives a hyphen it found at the end of a line (`FPDFText_IsHyphen`).
 const LINE_END_HYPHEN: u32 = 0x02;
 
 /// The per-glyph reads. A glyph whose loose box cannot be read falls back to its
@@ -234,8 +234,9 @@ fn load_glyph(
         true => 0,
         // pdfium reports a hyphen drawn at the end of a line as U+0002. Read as
         // a control code it would also flag the whole word as a buggy font and
-        // re-decode it through the glyph map, so restore the drawn '-'.
-        false if !generated && cv.unicode() == LINE_END_HYPHEN => u32::from('-'),
+        // re-decode it through the glyph map, so restore the drawn '-'. A 0x02
+        // pdfium does not flag as a hyphen is a real code and stays as it is.
+        false if cv.unicode() == LINE_END_HYPHEN && cv.is_hyphen() => u32::from('-'),
         false => cv.unicode(),
     };
     let strict = cv.strict_char_box().unwrap_or_default();

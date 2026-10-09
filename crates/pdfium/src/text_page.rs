@@ -468,6 +468,11 @@ impl TextChar<'_> {
         unsafe { ffi!(FPDFText_IsGenerated(self.text_page.handle, self.index)) == 1 }
     }
 
+    /// A hyphen pdfium found at the end of a line; its unicode reads as 0x02.
+    pub fn is_hyphen(&self) -> bool {
+        unsafe { ffi!(FPDFText_IsHyphen(self.text_page.handle, self.index)) == 1 }
+    }
+
     pub fn has_unicode_map_error(&self) -> bool {
         unsafe {
             ffi!(FPDFText_HasUnicodeMapError(

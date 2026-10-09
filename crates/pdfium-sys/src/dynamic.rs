@@ -287,6 +287,8 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut FS_MATRIX) -> FPDF_BOOL,
     pub FPDFText_IsGenerated:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
+    pub FPDFText_IsHyphen:
+        unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
     pub FPDFText_HasUnicodeMapError:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
     pub FPDFText_GetTextObject:
@@ -689,6 +691,7 @@ impl PdfiumBindings {
             FPDFText_GetCharOrigin: load_fn!(lib, "FPDFText_GetCharOrigin"),
             FPDFText_GetMatrix: load_fn!(lib, "FPDFText_GetMatrix"),
             FPDFText_IsGenerated: load_fn!(lib, "FPDFText_IsGenerated"),
+            FPDFText_IsHyphen: load_fn!(lib, "FPDFText_IsHyphen"),
             FPDFText_HasUnicodeMapError: load_fn!(lib, "FPDFText_HasUnicodeMapError"),
             FPDFText_GetTextObject: load_fn!(lib, "FPDFText_GetTextObject"),
             FPDFText_GetStrokeColor: load_fn!(lib, "FPDFText_GetStrokeColor"),
