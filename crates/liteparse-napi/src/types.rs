@@ -460,6 +460,10 @@ impl JsTextItem {
     }
 
     pub fn from_rust(item: &TextItem) -> Self {
+        Self::from_rust_with_words(item, true)
+    }
+
+    fn from_rust_with_words(item: &TextItem, word_boxes: bool) -> Self {
         Self {
             text: item.text.clone(),
             x: item.x as f64,
@@ -481,14 +485,23 @@ impl JsTextItem {
             char_codes: Some(item.char_codes.clone()),
             trailing_space_generated: Some(item.trailing_space_generated),
             confidence: item.confidence.map(|v| v as f64),
-            words: item.words.iter().map(JsWordBox::from_rust).collect(),
+            words: if word_boxes {
+                item.words.iter().map(JsWordBox::from_rust).collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
     /// `from_rust` with the rich-metadata fields taken from the core-gated
     /// [`liteparse::types::TextMetadata`] view, so the "what counts as text
-    /// metadata" list lives in one place instead of per binding.
-    fn from_rust_for_output(item: &TextItem, extract_text_metadata: bool) -> Self {
+    /// metadata" list lives in one place instead of per binding. `words` is
+    /// left empty unless `word_boxes` (see `LiteParseConfig::output_word_boxes`).
+    fn from_rust_for_output(
+        item: &TextItem,
+        extract_text_metadata: bool,
+        word_boxes: bool,
+    ) -> Self {
         let meta = item.text_metadata(extract_text_metadata);
         Self {
             font_height: meta.font_height.map(|v| v as f64),
@@ -502,7 +515,7 @@ impl JsTextItem {
             stroke_color: meta.stroke_color.map(str::to_owned),
             char_codes: meta.char_codes.map(<[u32]>::to_vec),
             trailing_space_generated: meta.trailing_space_generated,
-            ..Self::from_rust(item)
+            ..Self::from_rust_with_words(item, word_boxes)
         }
     }
 }
@@ -994,7 +1007,7 @@ impl JsLayoutBlock {
 }
 
 impl JsParsedPage {
-    pub fn from_rust(page: &ParsedPage, extract_text_metadata: bool) -> Self {
+    pub fn from_rust(page: &ParsedPage, extract_text_metadata: bool, word_boxes: bool) -> Self {
         Self {
             page_num: page.page_number as u32,
             page_label: page.page_label.clone(),
@@ -1011,7 +1024,9 @@ impl JsParsedPage {
             text_items: page
                 .text_items
                 .iter()
-                .map(|item| JsTextItem::from_rust_for_output(item, extract_text_metadata))
+                .map(|item| {
+                    JsTextItem::from_rust_for_output(item, extract_text_metadata, word_boxes)
+                })
                 .collect(),
             complexity: page
                 .complexity
@@ -1334,7 +1349,13 @@ impl JsParseResult {
             pages: result
                 .pages
                 .iter()
-                .map(|page| JsParsedPage::from_rust(page, config.extract_text_metadata))
+                .map(|page| {
+                    JsParsedPage::from_rust(
+                        page,
+                        config.extract_text_metadata,
+                        config.output_word_boxes(),
+                    )
+                })
                 .collect(),
             page_errors: result
                 .page_errors
@@ -1390,6 +1411,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn words_are_returned_only_when_requested() {
+        let item = TextItem {
+            text: "a b".into(),
+            words: vec![
+                WordBox {
+                    text: "a".into(),
+                    ..Default::default()
+                },
+                WordBox {
+                    text: "b".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            JsTextItem::from_rust_for_output(&item, false, false)
+                .words
+                .is_empty()
+        );
+        assert_eq!(
+            JsTextItem::from_rust_for_output(&item, false, true)
+                .words
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn text_metadata_round_trips_through_napi_type() {
         let item = TextItem {
             text: "A".into(),
@@ -1412,7 +1462,7 @@ mod tests {
         assert_eq!(js.trailing_space_generated, Some(true));
         assert_eq!(js.fill_color.as_deref(), Some("ff112233"));
 
-        let lightweight = JsTextItem::from_rust_for_output(&item, false);
+        let lightweight = JsTextItem::from_rust_for_output(&item, false, false);
         assert_eq!(lightweight.font_height, None);
         assert_eq!(lightweight.font_is_buggy, None);
         assert_eq!(lightweight.char_codes, None);
