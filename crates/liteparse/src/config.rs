@@ -113,13 +113,12 @@ pub struct LiteParseConfig {
     /// scripts nor change raster bytes for form-bearing PDFs.
     #[serde(default)]
     pub render_form_fields: bool,
-    /// Whether a systemic OCR failure (every OCR task failed *and* at least one
-    /// was a text-sparse page whose primary text source was OCR) aborts the
-    /// whole parse. Default `true`: surface the root cause instead of silently
-    /// emitting blank pages. Set `false` to keep already-recovered native text
-    /// and return partial results when OCR is unavailable — useful for callers
-    /// that prefer a degraded document over a hard failure (e.g. when the host
-    /// has its own OCR fallback or treats OCR as best-effort enrichment).
+    /// Whether an OCR failure on a page with insufficient native text
+    /// stops parsing. Default `true`: report the error instead of silently
+    /// returning a page with missing OCR text.
+    /// Set `false` to return partial results and keep the available native
+    /// text, for example when the application has its own OCR fallback.
+    /// Other parsing errors can still stop parsing.
     pub ocr_failure_fatal: bool,
     /// OCR request-hedging schedule (milliseconds) for the HTTP OCR engine.
     /// Empty (default) = no hedging. With multiple delays (e.g.
