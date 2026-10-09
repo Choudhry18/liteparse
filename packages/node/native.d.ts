@@ -71,8 +71,7 @@ export interface JsLiteParseConfig {
   /**
    * Emit each page's classified layout blocks (headings, paragraphs, list
    * items, tables with per-cell boxes, code, rules, figures) with bounding
-   * boxes as `ParsedPage.blocks`. Default false. Independent of
-   * `outputFormat`; enabling it never changes the rendered markdown.
+   * boxes as `ParsedPage.blocks`. Default false.
    */
   extractBlocks?: boolean
   /** Extract AcroForm widget fields and values. */
@@ -137,6 +136,15 @@ export interface JsLiteParseConfig {
    */
   skipDiagonalText?: boolean
   /**
+   * Per-page orientation corrections from an upstream orientation
+   * classifier. Each entry names a 1-based page and the clockwise angle
+   * (0/90/180/270) by which its content appears rotated; LiteParse
+   * counter-rotates that page before extraction so text, reading order,
+   * page size and OCR rasters come out upright. Applied on top of the PDF's
+   * own /Rotate. Unlisted or out-of-range pages are left unchanged.
+   */
+  pageOrientationCorrections?: Array<JsPageOrientationCorrection>
+  /**
    * Compute per-page complexity signals during parse and attach them to each
    * page as `ParsedPage.complexity` (the same signals `isComplex` returns).
    * Default false; enabling it runs an extra vector-text detection pass.
@@ -144,6 +152,14 @@ export interface JsLiteParseConfig {
   includeComplexity?: boolean
   /** Expose page-scoped vector path extraction. Default false. */
   extractVectorGraphics?: boolean
+}
+/**
+ * One page's orientation correction: `page` is 1-based, `angle` is the
+ * clockwise degrees (0/90/180/270) the content appears rotated.
+ */
+export interface JsPageOrientationCorrection {
+  page: number
+  angle: number
 }
 /**
  * A page sub-region as the fraction cropped from each side (top-left origin,
@@ -241,6 +257,12 @@ export interface JsPageInput {
 }
 export interface JsParsedPage {
   pageNum: number
+  /**
+   * The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+   * when the PDF defines none. This is what a reader displays for the page
+   * and is not always its position; fall back to `page_num` when absent.
+   */
+  pageLabel?: string
   width: number
   height: number
   /**

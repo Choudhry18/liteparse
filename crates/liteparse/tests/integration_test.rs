@@ -982,3 +982,218 @@ async fn test_negative_font_size_is_not_reported_as_rotated() {
     assert!(text.contains("Upright text drawn with a negative font size"));
     assert!(text.contains("Second line stays upright too"));
 }
+
+/// `page_labels.pdf` carries a `/PageLabels` number tree that maps pages 0-1 to
+/// lowercase roman and pages 2-3 to decimal restarting at 1, so the labels
+/// ("i", "ii", "1", "2") deliberately disagree with the 1-based page numbers.
+/// pypdf reports the same four labels for this file, which is the contract the
+/// LlamaIndex reader's `page_label` metadata has to match.
+#[tokio::test]
+async fn parse_reports_pdf_page_labels() {
+    let parser = LiteParse::new(LiteParseConfig::default());
+    let result = parser
+        .parse("../../integration_tests_data/page_labels.pdf")
+        .await
+        .expect("parse page_labels.pdf");
+
+    let labels: Vec<Option<&str>> = result
+        .pages
+        .iter()
+        .map(|p| p.page_label.as_deref())
+        .collect();
+    assert_eq!(
+        labels,
+        vec![Some("i"), Some("ii"), Some("1"), Some("2")],
+        "page labels must come from /PageLabels, not the page index"
+    );
+}
+
+/// A PDF with no `/PageLabels` tree reports `None` rather than a synthesized
+/// label, so callers can tell "no label" from a label that happens to equal
+/// the page number and fall back to `page_number` themselves.
+#[tokio::test]
+async fn parse_reports_no_page_label_when_pdf_has_none() {
+    let parser = LiteParse::new(LiteParseConfig::default());
+    let result = parser
+        .parse("../../integration_tests_data/sample.pdf")
+        .await
+        .expect("parse sample.pdf");
+
+    assert!(
+        result.pages.iter().all(|p| p.page_label.is_none()),
+        "sample.pdf has no /PageLabels tree"
+    );
+}
+
+/// `diagonal_text.pdf` draws each word on its own diagonal baseline. pdfium's
+/// char boxes enclose a rotated glyph in page axes, so a grounding box built
+/// from their corners is far taller across the baseline than the ink is; the
+/// outline-derived box is not. The C extractor's value for the first word is the
+/// pinned figure; the rest are held to a fraction of their enclosing box.
+#[test]
+#[serial]
+fn raw_text_diagonal_grounding_bounds_follow_the_glyph_outlines() {
+    use liteparse::extract_raw_text_items;
+
+    let lib = pdfium::Library::init();
+    let document = lib
+        .load_document("../../integration_tests_data/diagonal_text.pdf", None)
+        .expect("diagonal_text.pdf loads");
+    let page = document.page(0).expect("page 0 loads");
+    let text_page = page.text().expect("text page loads");
+    let view_box = page.view_box().expect("page has a bounding box");
+
+    let items = extract_raw_text_items(&page, &text_page, &view_box, None);
+    let rotated: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            let quarter = std::f32::consts::FRAC_PI_2;
+            (item.angle_radians % quarter).abs() > 0.05
+        })
+        .collect();
+    assert!(!rotated.is_empty(), "the fixture has diagonal text");
+    let first = rotated[0]
+        .grounding_bounds
+        .expect("the first diagonal word has grounding bounds");
+    assert!(
+        ((first.bottom - first.top) - 34.049).abs() < 0.01,
+        "first word across-baseline extent {} differs from the C extractor's 34.049",
+        first.bottom - first.top
+    );
+    for item in rotated {
+        let bounds = item
+            .grounding_bounds
+            .expect("a diagonal word with real glyphs has grounding bounds");
+        let across = bounds.bottom - bounds.top;
+        assert!(
+            across > 0.0 && across < item.height,
+            "{:?}: outline box ({across}) should sit inside the loose box ({})",
+            item.text,
+            item.height
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// page_orientation_corrections
+//
+// `sample_rotated_180.pdf` / `sample_rotated_90cw.pdf` are `sample.pdf` with
+// a `/Rotate` applied via `qpdf --rotate`, so their content *appears* rotated
+// in the viewport exactly the way a scanned upside-down / sideways page would
+// to an orientation classifier. A correction equal to that apparent rotation
+// must give back the upright parse.
+// ---------------------------------------------------------------------------
+
+fn text_only_parser(corrections: Vec<liteparse::config::PageOrientationCorrection>) -> LiteParse {
+    LiteParse::new(LiteParseConfig {
+        ocr_enabled: false,
+        quiet: true,
+        page_orientation_corrections: corrections,
+        ..LiteParseConfig::default()
+    })
+}
+
+fn correction(page: u32, angle: u16) -> liteparse::config::PageOrientationCorrection {
+    liteparse::config::PageOrientationCorrection { page, angle }
+}
+
+#[tokio::test]
+async fn test_rotated_fixture_reads_wrong_without_correction() {
+    let upright = text_only_parser(vec![])
+        .parse("../../integration_tests_data/sample.pdf")
+        .await
+        .unwrap();
+    let rotated = text_only_parser(vec![])
+        .parse("../../integration_tests_data/sample_rotated_180.pdf")
+        .await
+        .unwrap();
+    assert_ne!(
+        upright.pages[0].text, rotated.pages[0].text,
+        "fixture is not actually inverted; the correction test below would be vacuous"
+    );
+}
+
+#[tokio::test]
+async fn test_orientation_correction_180_restores_upright_parse() {
+    let upright = text_only_parser(vec![])
+        .parse("../../integration_tests_data/sample.pdf")
+        .await
+        .unwrap();
+    let corrected = text_only_parser(vec![correction(1, 180)])
+        .parse("../../integration_tests_data/sample_rotated_180.pdf")
+        .await
+        .unwrap();
+    assert_eq!(corrected.pages[0].text, upright.pages[0].text);
+    assert_eq!(corrected.pages[0].page_width, upright.pages[0].page_width);
+    assert_eq!(corrected.pages[0].page_height, upright.pages[0].page_height);
+}
+
+#[tokio::test]
+async fn test_orientation_correction_90_restores_upright_parse() {
+    let upright = text_only_parser(vec![])
+        .parse("../../integration_tests_data/sample.pdf")
+        .await
+        .unwrap();
+    // `--rotate=+90` displays the page turned 90° clockwise, so the content
+    // appears rotated 90° clockwise: the correction angle is 90.
+    let corrected = text_only_parser(vec![correction(1, 90)])
+        .parse("../../integration_tests_data/sample_rotated_90cw.pdf")
+        .await
+        .unwrap();
+    assert_eq!(corrected.pages[0].text, upright.pages[0].text);
+    assert_eq!(corrected.pages[0].page_width, upright.pages[0].page_width);
+    assert_eq!(corrected.pages[0].page_height, upright.pages[0].page_height);
+}
+
+#[tokio::test]
+async fn test_orientation_correction_applies_to_screenshots() {
+    let upright = LiteParse::new(LiteParseConfig {
+        ocr_enabled: false,
+        quiet: true,
+        ..LiteParseConfig::default()
+    })
+    .screenshot("../../integration_tests_data/sample.pdf", None)
+    .await
+    .unwrap();
+    let corrected = LiteParse::new(LiteParseConfig {
+        ocr_enabled: false,
+        quiet: true,
+        page_orientation_corrections: vec![correction(1, 90)],
+        ..LiteParseConfig::default()
+    })
+    .screenshot("../../integration_tests_data/sample_rotated_90cw.pdf", None)
+    .await
+    .unwrap();
+    // A sideways page renders landscape; the correction must turn it back.
+    assert_eq!(
+        (corrected[0].width, corrected[0].height),
+        (upright[0].width, upright[0].height)
+    );
+}
+
+#[tokio::test]
+async fn test_orientation_correction_ignores_out_of_range_pages() {
+    let upright = text_only_parser(vec![])
+        .parse("../../integration_tests_data/sample.pdf")
+        .await
+        .unwrap();
+    let corrected = text_only_parser(vec![correction(7, 180), correction(1, 0)])
+        .parse("../../integration_tests_data/sample.pdf")
+        .await
+        .unwrap();
+    assert_eq!(corrected.pages[0].text, upright.pages[0].text);
+}
+
+#[tokio::test]
+async fn test_orientation_correction_rejects_non_cardinal_angle() {
+    let result = text_only_parser(vec![correction(1, 45)])
+        .parse("../../integration_tests_data/sample.pdf")
+        .await;
+    match result {
+        Err(liteparse::LiteParseError::Config(message)) => {
+            assert!(message.contains("45"), "{message}")
+        }
+        Err(other) => panic!("expected a config error, got {other}"),
+        Ok(_) => panic!("45° is not a valid correction and must be rejected"),
+    }
+}

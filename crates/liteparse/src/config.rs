@@ -154,6 +154,17 @@ pub struct LiteParseConfig {
     /// Drop diagonal (skewed) text — items whose rotation is more than 2°
     /// off the nearest right angle (0/90/180/270). Default `false`.
     pub skip_diagonal_text: bool,
+    /// Per-page orientation corrections supplied by the caller, e.g. from an
+    /// upstream orientation classifier that saw the rendered page. Each entry
+    /// names a 1-based page and the clockwise angle (0/90/180/270) by which
+    /// that page's content *appears* rotated in its viewport; LiteParse
+    /// counter-rotates the page by that angle before extraction, so text
+    /// coordinates, reading order, page dimensions and OCR rasters all come out
+    /// upright. Applied on top of the PDF's own `/Rotate`. Pages not listed,
+    /// and pages past the end of the document, are left unchanged. Default
+    /// empty.
+    #[serde(default)]
+    pub page_orientation_corrections: Vec<PageOrientationCorrection>,
     /// Compute per-page complexity signals during `parse` and attach them to
     /// each `ParsedPage` (surfaced as a `complexity` object per page in JSON).
     /// These are the same signals the standalone `is_complex` API returns.
@@ -163,6 +174,35 @@ pub struct LiteParseConfig {
     /// vertical `lines`) in parse results. Default `false`; path objects are
     /// still inspected internally for layout detection when disabled.
     pub extract_vector_graphics: bool,
+}
+
+/// A caller-supplied orientation correction for one page. See
+/// [`LiteParseConfig::page_orientation_corrections`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PageOrientationCorrection {
+    /// 1-based document page number.
+    pub page: u32,
+    /// Clockwise degrees the page content appears rotated in its viewport;
+    /// must be one of 0, 90, 180, 270.
+    pub angle: u16,
+}
+
+impl PageOrientationCorrection {
+    /// Quarter turns to *add* to the page's `/Rotate` so the content reads
+    /// upright: undoing a clockwise `angle` means rotating the page by
+    /// `360 - angle` clockwise. Errors on a non-cardinal angle.
+    pub fn quarter_turns_to_apply(&self) -> Result<i32, String> {
+        match self.angle {
+            0 => Ok(0),
+            90 => Ok(3),
+            180 => Ok(2),
+            270 => Ok(1),
+            other => Err(format!(
+                "page_orientation_corrections: page {} has angle {other}; expected 0, 90, 180 or 270",
+                self.page
+            )),
+        }
+    }
 }
 
 /// A page sub-region expressed as the fraction cropped from each side.
@@ -211,6 +251,19 @@ impl LiteParseConfig {
     pub fn effective_extract_images(&self) -> bool {
         self.extract_images || self.image_mode == ImageMode::Embed
     }
+
+    /// Whether per-word boxes are needed for this run, whichever stage
+    /// produces the text. True when `emit_word_boxes` is set, or when the
+    /// markdown output format is selected: the markdown table detector splits
+    /// PDFium's merged multi-cell runs on real word geometry, so it needs
+    /// word boxes even when the caller didn't ask for them.
+    ///
+    /// Every stage that fills `TextItem.words` must gate on this, so a run
+    /// with word boxes off stays allocation-free on the whole path — including
+    /// the OCR merge, where native text and scanned pages must agree.
+    pub fn effective_emit_word_boxes(&self) -> bool {
+        self.emit_word_boxes || self.output_format == OutputFormat::Markdown
+    }
 }
 
 impl Default for LiteParseConfig {
@@ -235,7 +288,7 @@ impl Default for LiteParseConfig {
             target_pages: None,
             extract_screenshots: false,
             continue_on_page_error: false,
-            dpi: 150.0,
+            dpi: DEFAULT_DPI,
             output_format: OutputFormat::Json,
             preserve_very_small_text: false,
             password: None,
@@ -261,6 +314,7 @@ impl Default for LiteParseConfig {
             extract_text_metadata: false,
             crop_box: None,
             skip_diagonal_text: false,
+            page_orientation_corrections: Vec::new(),
             include_complexity: false,
             extract_vector_graphics: false,
         }
@@ -288,6 +342,10 @@ const MAX_TARGET_PAGES: u64 = 100_000;
 /// large enough that the per-batch document reopen stays modest (it costs
 /// roughly 13% at this size on a 457-page document, ~4% at 50).
 pub const DEFAULT_PAGE_BATCH_SIZE: usize = 25;
+
+/// Default render resolution for OCR rasters and screenshots
+/// (`LiteParseConfig::dpi`).
+pub const DEFAULT_DPI: f32 = 150.0;
 
 #[doc(hidden)]
 pub fn parse_target_pages(s: &str) -> Result<Vec<u32>, String> {
@@ -385,7 +443,7 @@ mod tests {
         assert_eq!(c.max_pages, 1000);
         assert!(!c.extract_screenshots);
         assert!(!c.continue_on_page_error);
-        assert_eq!(c.dpi, 150.0);
+        assert_eq!(c.dpi, DEFAULT_DPI);
         assert_eq!(c.output_format, OutputFormat::Json);
         assert!(!c.preserve_very_small_text);
         assert!(!c.quiet);

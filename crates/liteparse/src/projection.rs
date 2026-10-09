@@ -480,16 +480,39 @@ fn form_lines(
             (1..=2).contains(&digit_count)
         }
 
-        for item in items.iter_mut() {
-            let center = item.item.x + item.item.width / 2.0;
+        // A real gutter line number is isolated on its baseline. An item that
+        // abuts a neighbour is a fragment of a larger token, e.g. the "7" of a
+        // table cell PDFium emits as "7" + ".7" (issue #465).
+        fn abuts_neighbour(items: &[ProjectedTextItem], idx: usize) -> bool {
+            let it = &items[idx].item;
+            let max_gap = it.height * 0.25;
+            items.iter().enumerate().any(|(j, other)| {
+                if j == idx {
+                    return false;
+                }
+                let o = &other.item;
+                if (o.y - it.y).abs() > it.height * 0.5 {
+                    return false;
+                }
+                let gap_right = o.x - (it.x + it.width);
+                let gap_left = it.x - (o.x + o.width);
+                (-0.5..=max_gap).contains(&gap_right) || (-0.5..=max_gap).contains(&gap_left)
+            })
+        }
 
-            if center > margin_left
-                && center < margin_right
-                && is_margin_line_number_text(&item.item.text)
-                && item.item.width < 15.0
-            {
-                item.is_margin_line_number = true;
-            }
+        let margin_idxs: Vec<usize> = (0..items.len())
+            .filter(|&i| {
+                let item = &items[i];
+                let center = item.item.x + item.item.width / 2.0;
+                center > margin_left
+                    && center < margin_right
+                    && is_margin_line_number_text(&item.item.text)
+                    && item.item.width < 15.0
+                    && !abuts_neighbour(items, i)
+            })
+            .collect();
+        for i in margin_idxs {
+            items[i].is_margin_line_number = true;
         }
     }
 
@@ -1091,8 +1114,12 @@ fn compress_wide_spaces(line: &str, min_run: usize, replace_with: usize) -> Stri
                 out.push_str(&" ".repeat(run_len));
             }
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+            // ASCII spaces are UTF-8 boundaries, so this preserves the original text.
+            out.push_str(&line[start..i]);
         }
     }
     out
@@ -2891,8 +2918,10 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 page.page_height,
                 &obstacles,
             );
+            let projected_item_frames = projected_item_frames(&projected_items);
             ParsedPage {
                 page_number: page.page_number,
+                page_label: page.page_label,
                 page_width: page.page_width,
                 page_height: page.page_height,
                 content_bounds: page.content_bounds,
@@ -2914,6 +2943,7 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 graphics: page.graphics,
                 vector_graphics: page.vector_graphics,
                 figures,
+                projected_item_frames,
                 struct_nodes: page.struct_nodes,
                 image_refs: page.image_refs,
                 complexity: None,
@@ -2924,6 +2954,38 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 // page (and whole-document signals) to run.
                 blocks: None,
             }
+        })
+        .collect()
+}
+
+/// `(projected, original)` rect per text item when rotation handling moved
+/// any item on the page (see `ParsedPage::projected_item_frames`); empty
+/// otherwise. Gated on the `rotated` flag rather than on coordinate drift:
+/// projection also rounds sizes and merges neighbours, and those small
+/// deltas are not the frame change block boxes need mapping through — so
+/// the common no-rotation page pays nothing and its boxes pass through
+/// untouched.
+fn projected_item_frames(items: &[ProjectedTextItem]) -> Vec<(Rect, Rect)> {
+    if !items.iter().any(|p| p.rotated) {
+        return Vec::new();
+    }
+    items
+        .iter()
+        .map(|p| {
+            (
+                Rect {
+                    x: p.item.x,
+                    y: p.item.y,
+                    width: p.item.width,
+                    height: p.item.height,
+                },
+                Rect {
+                    x: p.orig_x,
+                    y: p.orig_y,
+                    width: p.orig_width,
+                    height: p.orig_height,
+                },
+            )
         })
         .collect()
 }
@@ -4732,6 +4794,15 @@ pub(crate) fn build_projected_lines(
         .filter(|f| f.width * f.height < page_area * 0.55)
         .cloned()
         .collect();
+    // On a page with native text, OCR only enriches embedded figures
+    // (charts, diagrams, formula images, logos). Lines built from that OCR
+    // text are figure content whatever their box height says, so they are
+    // excluded from heading candidacy like any other in-figure line. On a
+    // scanned page (no native text) OCR *is* the text and headings must
+    // still come from it.
+    let page_has_native_text = items
+        .iter()
+        .any(|p| p.item.font_name.as_deref() != Some("OCR"));
 
     let mut out: Vec<ProjectedLine> = Vec::new();
     for (path, indices) in leaves {
@@ -4796,6 +4867,7 @@ pub(crate) fn build_projected_lines(
                     &current,
                     path.clone(),
                     &heading_excl_figures,
+                    page_has_native_text,
                 ));
                 current = vec![idx];
                 current_y = y;
@@ -4808,6 +4880,7 @@ pub(crate) fn build_projected_lines(
                 &current,
                 path.clone(),
                 &heading_excl_figures,
+                page_has_native_text,
             ));
         }
     }
@@ -4849,6 +4922,7 @@ fn build_one_line(
     idxs: &[usize],
     region_path: Vec<u16>,
     figures: &[Rect],
+    page_has_native_text: bool,
 ) -> ProjectedLine {
     // Sort by x so concatenation reads left→right even if reading order had
     // rotated insertions. `spans` stays in this x-ascending order — the table
@@ -4884,6 +4958,13 @@ fn build_one_line(
     let mut italic_chars: usize = 0;
     let mut mono_chars: usize = 0;
     let mut total_chars: usize = 0;
+    // Chars contributed by OCR-sourced items. Their `font_size` is the OCR
+    // box height, i.e. a bbox estimate with the same jitter as the
+    // baked-size fallback below, so an OCR-dominated line is flagged
+    // `font_size_is_estimated` and gets the wider heading margin. Without
+    // this, chart labels OCR'd at 9.1–9.6pt next to a 9pt body open heading
+    // levels the body then matches under the 0.6pt tolerance.
+    let mut ocr_chars: usize = 0;
     let mut anchor_weights: HashMap<u8, usize> = HashMap::new();
     let mut mcid: Option<i32> = None;
     let mut spans: Vec<TextItem> = Vec::with_capacity(sorted.len());
@@ -4918,6 +4999,9 @@ fn build_one_line(
 
         let n = it.text.chars().count().max(1);
         total_chars += n;
+        if it.font_name.as_deref() == Some("OCR") {
+            ocr_chars += n;
+        }
 
         if let Some(size) = it.font_size
             && size > 0.0
@@ -4997,8 +5081,9 @@ fn build_one_line(
     // Fallback: when PDFium reports font_size ≤ 1.5 (size baked into the text
     // matrix), use char-weighted bbox height so the size-dependent grouping
     // (tables, paragraphs) keeps its well-tuned behavior.
+    let ocr_dominated = ocr_chars * 2 > total_chars;
     let (dominant_font_size, font_size_is_estimated) = if dominant_size_from_font > 1.5 {
-        (dominant_size_from_font, false)
+        (dominant_size_from_font, ocr_dominated)
     } else {
         let h = height_weights
             .iter()
@@ -5077,7 +5162,7 @@ fn build_one_line(
         })
     } else {
         false
-    };
+    } || (ocr_dominated && page_has_native_text);
 
     ProjectedLine {
         text,
@@ -5106,6 +5191,32 @@ fn build_one_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compress_wide_spaces_preserves_utf8_text() {
+        assert_eq!(
+            compress_wide_spaces("売上高    1,234 Café  Größe", 4, 2),
+            "売上高  1,234 Café  Größe"
+        );
+    }
+
+    #[test]
+    fn sparse_blocks_preserve_utf8_text_when_compressing_columns() {
+        let labels = ["売上高", "営業利益", "Café", "Größe"];
+        let mut lines: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(120)))
+            .collect();
+        let end = lines.len();
+
+        fix_sparse_blocks(&mut lines, 0, end);
+
+        let expected: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(FLOATING_SPACES)))
+            .collect();
+        assert_eq!(lines, expected);
+    }
 
     fn projected_item(text: &str, y: f32, width: f32, height: f32) -> ProjectedTextItem {
         ProjectedTextItem {
@@ -5138,6 +5249,7 @@ mod tests {
     fn project_to_grid_handles_text_sparse_zero_width_items() {
         let page = Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5185,6 +5297,42 @@ mod tests {
             orig_height: h,
             orig_rotation: 0.0,
         }
+    }
+
+    #[test]
+    fn gutter_digit_abutting_neighbour_is_not_margin_line_number() {
+        // Issue #465: a table cell "7.7" emitted as runs "7" + ".7" with zero
+        // gap, sitting in the page-centre band. The "7" must stay on the row
+        // and merge with ".7" instead of being split off as a line number.
+        let mut items = vec![
+            item_at("58.5", 252.7, 149.76, 10.9, 8.42),
+            item_at("7", 313.37, 149.76, 3.108, 8.42),
+            item_at(".7", 316.478, 149.76, 4.66, 8.42),
+            item_at("2.3", 370.9, 149.76, 10.6, 8.42),
+        ];
+        let lines = form_lines(&mut items, 10.0, 8.42, 612.0);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].iter().any(|i| i.item.text == "7.7"));
+        assert!(lines[0].iter().all(|i| !i.is_margin_line_number));
+    }
+
+    #[test]
+    fn isolated_gutter_digit_is_still_margin_line_number() {
+        // Two-column paper: "12" alone in the gutter, well clear of both
+        // columns' text, keeps its line-number flag.
+        let mut items = vec![
+            item_at("left column text", 60.0, 100.0, 230.0, 10.0),
+            item_at("12", 310.0, 100.0, 8.0, 10.0),
+            item_at("right column text", 330.0, 100.0, 230.0, 10.0),
+        ];
+        let lines = form_lines(&mut items, 10.0, 10.0, 612.0);
+        let flagged: Vec<_> = lines
+            .iter()
+            .flatten()
+            .filter(|i| i.is_margin_line_number)
+            .map(|i| i.item.text.as_str())
+            .collect();
+        assert_eq!(flagged, vec!["12"]);
     }
 
     #[test]
@@ -5506,6 +5654,7 @@ mod tests {
     fn project_pages_to_grid_handles_page_with_no_text_items() {
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5531,6 +5680,7 @@ mod tests {
         let y = 50.25;
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5582,6 +5732,7 @@ mod tests {
         let y = 50.25;
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5641,6 +5792,7 @@ mod tests {
     fn project_pages_to_grid_unions_original_bbox_when_continuous_items_merge() {
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,

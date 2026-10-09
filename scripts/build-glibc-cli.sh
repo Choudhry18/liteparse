@@ -19,6 +19,21 @@ set -eux
 TARGET="${1:?usage: build-glibc-cli.sh <rust-target>}"
 
 export DEBIAN_FRONTEND=noninteractive
+# Debian 11 (bullseye) is past end-of-life, and deb.debian.org has started
+# pruning the bullseye-security pool while still serving its package index — apt
+# therefore resolves to .deb files that 404 ("Failed to fetch ... 404 Not Found"
+# for libpng-dev / libarchive-dev, exit code 100). Repoint at
+# archive.debian.org, which carries bullseye + bullseye-updates permanently, and
+# drop bullseye-security entirely (its pool is gone from deb.debian.org and has
+# not landed on archive.debian.org). Archived Release files are past their
+# Valid-Until, hence Check-Valid-Until=false.
+cat > /etc/apt/sources.list <<'EOF'
+deb http://archive.debian.org/debian bullseye main
+deb http://archive.debian.org/debian bullseye-updates main
+EOF
+rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources || true
+echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+
 apt-get update
 # NOTE: cmake is deliberately NOT installed from apt here. Debian bullseye ships
 # cmake 3.18, but Leptonica 1.84.1 (compiled from source by tesseract-rs)

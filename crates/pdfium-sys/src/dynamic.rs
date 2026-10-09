@@ -79,6 +79,12 @@ pub struct PdfiumBindings {
         *mut std::os::raw::c_void,
         std::os::raw::c_ulong,
     ) -> std::os::raw::c_ulong,
+    pub FPDF_GetPageLabel: unsafe extern "C" fn(
+        FPDF_DOCUMENT,
+        std::os::raw::c_int,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
     pub FPDF_GetFileVersion:
         unsafe extern "C" fn(FPDF_DOCUMENT, *mut std::os::raw::c_int) -> FPDF_BOOL,
     pub FPDF_GetSecurityHandlerRevision: unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_int,
@@ -120,11 +126,31 @@ pub struct PdfiumBindings {
     pub FPDF_GetPageHeightF: unsafe extern "C" fn(FPDF_PAGE) -> f32,
     pub FPDF_GetPageBoundingBox: unsafe extern "C" fn(FPDF_PAGE, *mut FS_RECTF) -> FPDF_BOOL,
     pub FPDFPage_GetRotation: unsafe extern "C" fn(FPDF_PAGE) -> std::os::raw::c_int,
+    pub FPDFPage_SetRotation: unsafe extern "C" fn(FPDF_PAGE, std::os::raw::c_int),
+    pub FPDFPage_SetCropBox: unsafe extern "C" fn(FPDF_PAGE, f32, f32, f32, f32),
     /// LlamaParse fork API (absent from stock pdfium and older fork
     /// releases); callers fall back to the raw-byte `/UserUnit` scan.
     pub FPDFPage_GetUserUnit: Option<unsafe extern "C" fn(FPDF_PAGE) -> f32>,
     pub FPDFPage_Flatten:
         Option<unsafe extern "C" fn(FPDF_PAGE, std::os::raw::c_int) -> std::os::raw::c_int>,
+    /// `fpdf_edit.h` / `fpdf_ppo.h` page-editing entry points, used to build a
+    /// disposable single-page copy for widget-appearance text (see
+    /// `Document::widget_appearance_copy`). Optional like `FPDFPage_Flatten`: a
+    /// trimmed build without them loses widget text, not the parse.
+    pub FPDF_CreateNewDocument: Option<unsafe extern "C" fn() -> FPDF_DOCUMENT>,
+    pub FPDF_ImportPagesByIndex: Option<
+        unsafe extern "C" fn(
+            FPDF_DOCUMENT,
+            FPDF_DOCUMENT,
+            *const std::os::raw::c_int,
+            std::os::raw::c_ulong,
+            std::os::raw::c_int,
+        ) -> FPDF_BOOL,
+    >,
+    pub FPDFPage_RemoveObject:
+        Option<unsafe extern "C" fn(FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BOOL>,
+    pub FPDFPageObj_Destroy: Option<unsafe extern "C" fn(FPDF_PAGEOBJECT)>,
+    pub FPDFPage_GenerateContent: Option<unsafe extern "C" fn(FPDF_PAGE) -> FPDF_BOOL>,
     pub FPDF_PageToDevice: unsafe extern "C" fn(
         FPDF_PAGE,
         std::os::raw::c_int,
@@ -148,6 +174,7 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
     pub FPDFImageObj_GetRenderedBitmap:
         unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BITMAP,
+    pub FPDFImageObj_GetBitmap: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> FPDF_BITMAP,
     pub FPDFImageObj_GetImageDataDecoded: unsafe extern "C" fn(
         FPDF_PAGEOBJECT,
         *mut std::os::raw::c_void,
@@ -173,6 +200,17 @@ pub struct PdfiumBindings {
         *mut std::os::raw::c_uint,
         *mut std::os::raw::c_uint,
     ) -> FPDF_BOOL,
+    pub FPDFPageObj_GetClipPath: Option<unsafe extern "C" fn(FPDF_PAGEOBJECT) -> FPDF_CLIPPATH>,
+    pub FPDFClipPath_CountPaths: Option<unsafe extern "C" fn(FPDF_CLIPPATH) -> std::os::raw::c_int>,
+    pub FPDFClipPath_CountPathSegments:
+        Option<unsafe extern "C" fn(FPDF_CLIPPATH, std::os::raw::c_int) -> std::os::raw::c_int>,
+    pub FPDFClipPath_GetPathSegment: Option<
+        unsafe extern "C" fn(
+            FPDF_CLIPPATH,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+        ) -> FPDF_PATHSEGMENT,
+    >,
     pub FPDFPageObj_GetMatrix: unsafe extern "C" fn(FPDF_PAGEOBJECT, *mut FS_MATRIX) -> FPDF_BOOL,
     pub FPDFPageObj_GetStrokeColor: unsafe extern "C" fn(
         FPDF_PAGEOBJECT,
@@ -243,6 +281,8 @@ pub struct PdfiumBindings {
     ) -> FPDF_BOOL,
     pub FPDFText_GetLooseCharBox:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut FS_RECTF) -> FPDF_BOOL,
+    pub FPDFText_GetCharOrigin:
+        unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut f64, *mut f64) -> FPDF_BOOL,
     pub FPDFText_GetMatrix:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut FS_MATRIX) -> FPDF_BOOL,
     pub FPDFText_IsGenerated:
@@ -310,6 +350,7 @@ pub struct PdfiumBindings {
     pub FPDFBitmap_GetWidth: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetHeight: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetStride: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
+    pub FPDFBitmap_GetFormat: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetBuffer: unsafe extern "C" fn(FPDF_BITMAP) -> *mut std::os::raw::c_void,
     pub FPDFBitmap_FillRect: unsafe extern "C" fn(
         FPDF_BITMAP,
@@ -578,6 +619,7 @@ impl PdfiumBindings {
             FORM_DoPageAAction: load_fn!(lib, "FORM_DoPageAAction"),
             FPDF_FFLDraw: load_fn!(lib, "FPDF_FFLDraw"),
             FPDF_GetMetaText: load_fn!(lib, "FPDF_GetMetaText"),
+            FPDF_GetPageLabel: load_fn!(lib, "FPDF_GetPageLabel"),
             FPDF_GetFileVersion: load_fn!(lib, "FPDF_GetFileVersion"),
             FPDF_GetSecurityHandlerRevision: load_fn!(lib, "FPDF_GetSecurityHandlerRevision"),
             FPDF_GetDocPermissions: load_fn!(lib, "FPDF_GetDocPermissions"),
@@ -593,8 +635,15 @@ impl PdfiumBindings {
             FPDF_GetPageHeightF: load_fn!(lib, "FPDF_GetPageHeightF"),
             FPDF_GetPageBoundingBox: load_fn!(lib, "FPDF_GetPageBoundingBox"),
             FPDFPage_GetRotation: load_fn!(lib, "FPDFPage_GetRotation"),
+            FPDFPage_SetRotation: load_fn!(lib, "FPDFPage_SetRotation"),
+            FPDFPage_SetCropBox: load_fn!(lib, "FPDFPage_SetCropBox"),
             FPDFPage_GetUserUnit: load_fn_opt!(lib, "FPDFPage_GetUserUnit"),
             FPDFPage_Flatten: load_fn_opt!(lib, "FPDFPage_Flatten"),
+            FPDF_CreateNewDocument: load_fn_opt!(lib, "FPDF_CreateNewDocument"),
+            FPDF_ImportPagesByIndex: load_fn_opt!(lib, "FPDF_ImportPagesByIndex"),
+            FPDFPage_RemoveObject: load_fn_opt!(lib, "FPDFPage_RemoveObject"),
+            FPDFPageObj_Destroy: load_fn_opt!(lib, "FPDFPageObj_Destroy"),
+            FPDFPage_GenerateContent: load_fn_opt!(lib, "FPDFPage_GenerateContent"),
             FPDF_PageToDevice: load_fn!(lib, "FPDF_PageToDevice"),
             FPDFPage_CountObjects: load_fn!(lib, "FPDFPage_CountObjects"),
             FPDFPage_GetObject: load_fn!(lib, "FPDFPage_GetObject"),
@@ -602,12 +651,17 @@ impl PdfiumBindings {
             FPDFPageObj_GetBounds: load_fn!(lib, "FPDFPageObj_GetBounds"),
             FPDFPageObj_GetMarkedContentID: load_fn!(lib, "FPDFPageObj_GetMarkedContentID"),
             FPDFImageObj_GetRenderedBitmap: load_fn!(lib, "FPDFImageObj_GetRenderedBitmap"),
+            FPDFImageObj_GetBitmap: load_fn!(lib, "FPDFImageObj_GetBitmap"),
             FPDFImageObj_GetImageDataDecoded: load_fn!(lib, "FPDFImageObj_GetImageDataDecoded"),
             FPDFImageObj_GetImageDataRaw: load_fn!(lib, "FPDFImageObj_GetImageDataRaw"),
             FPDFImageObj_GetImageFilterCount: load_fn!(lib, "FPDFImageObj_GetImageFilterCount"),
             FPDFImageObj_GetImageFilter: load_fn!(lib, "FPDFImageObj_GetImageFilter"),
             FPDFImageObj_GetImageMetadata: load_fn!(lib, "FPDFImageObj_GetImageMetadata"),
             FPDFImageObj_GetImagePixelSize: load_fn!(lib, "FPDFImageObj_GetImagePixelSize"),
+            FPDFPageObj_GetClipPath: load_fn_opt!(lib, "FPDFPageObj_GetClipPath"),
+            FPDFClipPath_CountPaths: load_fn_opt!(lib, "FPDFClipPath_CountPaths"),
+            FPDFClipPath_CountPathSegments: load_fn_opt!(lib, "FPDFClipPath_CountPathSegments"),
+            FPDFClipPath_GetPathSegment: load_fn_opt!(lib, "FPDFClipPath_GetPathSegment"),
             FPDFPageObj_GetMatrix: load_fn!(lib, "FPDFPageObj_GetMatrix"),
             FPDFPageObj_GetStrokeColor: load_fn!(lib, "FPDFPageObj_GetStrokeColor"),
             FPDFPageObj_GetFillColor: load_fn!(lib, "FPDFPageObj_GetFillColor"),
@@ -632,6 +686,7 @@ impl PdfiumBindings {
             FPDFText_GetCharAngle: load_fn!(lib, "FPDFText_GetCharAngle"),
             FPDFText_GetCharBox: load_fn!(lib, "FPDFText_GetCharBox"),
             FPDFText_GetLooseCharBox: load_fn!(lib, "FPDFText_GetLooseCharBox"),
+            FPDFText_GetCharOrigin: load_fn!(lib, "FPDFText_GetCharOrigin"),
             FPDFText_GetMatrix: load_fn!(lib, "FPDFText_GetMatrix"),
             FPDFText_IsGenerated: load_fn!(lib, "FPDFText_IsGenerated"),
             FPDFText_HasUnicodeMapError: load_fn!(lib, "FPDFText_HasUnicodeMapError"),
@@ -648,6 +703,7 @@ impl PdfiumBindings {
             FPDFBitmap_GetWidth: load_fn!(lib, "FPDFBitmap_GetWidth"),
             FPDFBitmap_GetHeight: load_fn!(lib, "FPDFBitmap_GetHeight"),
             FPDFBitmap_GetStride: load_fn!(lib, "FPDFBitmap_GetStride"),
+            FPDFBitmap_GetFormat: load_fn!(lib, "FPDFBitmap_GetFormat"),
             FPDFBitmap_GetBuffer: load_fn!(lib, "FPDFBitmap_GetBuffer"),
             FPDFBitmap_FillRect: load_fn!(lib, "FPDFBitmap_FillRect"),
             FPDF_RenderPageBitmap: load_fn!(lib, "FPDF_RenderPageBitmap"),

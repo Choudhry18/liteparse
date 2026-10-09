@@ -131,6 +131,17 @@ export interface LiteParseConfig {
    */
   skipDiagonalText: boolean;
   /**
+   * Per-page orientation corrections from an upstream orientation classifier
+   * (one that saw the rendered page). Each entry names a 1-based page and the
+   * clockwise angle (0/90/180/270) by which that page's content *appears*
+   * rotated in its viewport; LiteParse counter-rotates the page before
+   * extraction, so text coordinates, reading order, page dimensions and OCR
+   * rasters all come out upright. Applied on top of the PDF's own `/Rotate`.
+   * Pages not listed, or past the end of the document, are left unchanged.
+   * Default: none.
+   */
+  pageOrientationCorrections?: PageOrientationCorrection[];
+  /**
    * Compute per-page complexity signals during {@link LiteParse.parse} and
    * attach them to each page as {@link ParsedPage.complexity} (the same signals
    * {@link LiteParse.isComplex} returns). Default false; enabling it runs an
@@ -150,6 +161,17 @@ export interface CropBox {
   right: number;
   bottom: number;
   left: number;
+}
+
+/**
+ * One page's orientation correction (see
+ * {@link LiteParseConfig.pageOrientationCorrections}).
+ */
+export interface PageOrientationCorrection {
+  /** 1-based document page number. */
+  page: number;
+  /** Clockwise degrees the content appears rotated: 0, 90, 180 or 270. */
+  angle: 0 | 90 | 180 | 270;
 }
 
 /**
@@ -250,6 +272,12 @@ export interface Rect {
 
 export interface ParsedPage {
   pageNum: number;
+  /**
+   * The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+   * when the PDF defines none. This is what a reader displays for the page
+   * and is not always its position, so fall back to `pageNum` when absent.
+   */
+  pageLabel?: string;
   width: number;
   height: number;
   /**
@@ -665,6 +693,7 @@ export class LiteParse {
       extractTextMetadata: userConfig.extractTextMetadata,
       cropBox: userConfig.cropBox,
       skipDiagonalText: userConfig.skipDiagonalText,
+      pageOrientationCorrections: userConfig.pageOrientationCorrections,
       includeComplexity: userConfig.includeComplexity,
       extractVectorGraphics: userConfig.extractVectorGraphics,
     };
@@ -725,6 +754,8 @@ export class LiteParse {
       extractTextMetadata: resolved.extractTextMetadata ?? false,
       cropBox: resolved.cropBox ?? undefined,
       skipDiagonalText: resolved.skipDiagonalText ?? false,
+      pageOrientationCorrections:
+        (resolved.pageOrientationCorrections as PageOrientationCorrection[] | undefined) ?? undefined,
       includeComplexity: resolved.includeComplexity ?? false,
       extractVectorGraphics: resolved.extractVectorGraphics ?? false,
     };
@@ -926,6 +957,7 @@ export function toParseResult(result: NativeParseResult): ParseResult {
 function toPage(p: NativeParsedPage): ParsedPage {
   return {
     pageNum: p.pageNum,
+    pageLabel: p.pageLabel ?? undefined,
     width: p.width,
     height: p.height,
     contentBounds: p.contentBounds,

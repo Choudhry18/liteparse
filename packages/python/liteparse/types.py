@@ -174,6 +174,11 @@ class ParsedPage:
     height: float
     text: str
     markdown: str = ""
+    #: The document's ``/PageLabels`` label for this page ("iv", "A-1"),
+    #: or ``None`` when the PDF defines none. This is what a reader displays
+    #: for the page and is not always its position in the document, so fall
+    #: back to ``page_num`` when it is ``None``.
+    page_label: Optional[str] = None
     text_items: List[TextItem] = field(default_factory=list)
     #: Per-page complexity signals (the same :meth:`LiteParse.is_complex`
     #: returns). Populated only when parsing with ``include_complexity=True``;
@@ -478,6 +483,9 @@ class LiteParseConfig:
     crop_box: Optional[Tuple[float, float, float, float]]
     skip_diagonal_text: bool
     include_complexity: bool
+    #: ``(page, angle)`` pairs: 1-based page and the clockwise degrees
+    #: (0/90/180/270) its content appears rotated. Empty when none.
+    page_orientation_corrections: List[Tuple[int, int]] = field(default_factory=list)
     extract_text_metadata: bool = False
     #: Keep running headers/footers in markdown output instead of stripping
     #: repeated page-band lines and page chrome.

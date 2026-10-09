@@ -427,6 +427,7 @@ A few config options are only reachable from the library and bindings:
 | `emit_word_boxes` | Per-word sub-boxes (see above). |
 | `crop_box` | Restrict output to a sub-region of each page. A text item is kept only if it falls entirely inside. |
 | `skip_diagonal_text` | Drop text rotated more than 2° off the nearest right angle — watermarks and diagonal stamps. |
+| `page_orientation_corrections` | Counter-rotate specific pages before extraction, using angles from your own orientation classifier (see below). |
 | `detect_screenshot_rects` | Populate `rects` on screenshot results. |
 | `render_form_fields` | Draw form-field appearances into rendered pages. |
 | `ocr_failure_fatal` | When `false`, a systemic OCR failure returns partial results instead of erroring. Defaults to `true`. |
@@ -450,6 +451,42 @@ const parser = new LiteParse({
 ```python
 # (top, right, bottom, left)
 parser = LiteParse(crop_box=(0.1, 0.0, 0.05, 0.0))
+```
+
+</TabItem>
+</Tabs>
+
+### Correcting page orientation
+
+LiteParse honours a page's `/Rotate` entry, but a scanned page whose *content* is
+upside down or sideways carries no such hint: its text layer (or OCR raster) reads
+bottom-up, so reading order and label/value pairs come out inverted. If you run an
+orientation classifier on the rendered page, hand its verdict to
+`page_orientation_corrections`. Each entry names a 1-based page and the clockwise
+angle (`0`, `90`, `180` or `270`) by which that page's content appears rotated;
+LiteParse counter-rotates the page before extraction, so text coordinates, reading
+order, page dimensions, OCR rasters and screenshots all come out upright. Pages not
+listed, or past the end of the document, are left unchanged.
+
+<Tabs>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+// Page 3 was scanned upside down, page 7 sideways (content rotated 90° clockwise)
+const parser = new LiteParse({
+  pageOrientationCorrections: [
+    { page: 3, angle: 180 },
+    { page: 7, angle: 90 },
+  ],
+});
+```
+
+</TabItem>
+<TabItem label="Python" value="python">
+
+```python
+# (page, angle) pairs
+parser = LiteParse(page_orientation_corrections=[(3, 180), (7, 90)])
 ```
 
 </TabItem>

@@ -101,6 +101,61 @@ impl SignatureApi {
     }
 }
 
+/// The page-editing entry points [`Document::widget_appearance_copy`] needs,
+/// resolved together so a build missing any of them degrades to "no widget
+/// text" rather than failing the whole pdfium load.
+struct PageEditApi {
+    create: unsafe extern "C" fn() -> pdfium_sys::FPDF_DOCUMENT,
+    import: unsafe extern "C" fn(
+        pdfium_sys::FPDF_DOCUMENT,
+        pdfium_sys::FPDF_DOCUMENT,
+        *const std::os::raw::c_int,
+        std::os::raw::c_ulong,
+        std::os::raw::c_int,
+    ) -> pdfium_sys::FPDF_BOOL,
+    remove_object: unsafe extern "C" fn(
+        pdfium_sys::FPDF_PAGE,
+        pdfium_sys::FPDF_PAGEOBJECT,
+    ) -> pdfium_sys::FPDF_BOOL,
+    destroy_object: unsafe extern "C" fn(pdfium_sys::FPDF_PAGEOBJECT),
+    generate_content: unsafe extern "C" fn(pdfium_sys::FPDF_PAGE) -> pdfium_sys::FPDF_BOOL,
+    flatten:
+        unsafe extern "C" fn(pdfium_sys::FPDF_PAGE, std::os::raw::c_int) -> std::os::raw::c_int,
+    set_flags: unsafe extern "C" fn(
+        pdfium_sys::FPDF_ANNOTATION,
+        std::os::raw::c_int,
+    ) -> pdfium_sys::FPDF_BOOL,
+}
+
+impl PageEditApi {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load() -> Option<Self> {
+        let bindings = pdfium_sys::dynamic::pdfium();
+        Some(Self {
+            create: bindings.FPDF_CreateNewDocument?,
+            import: bindings.FPDF_ImportPagesByIndex?,
+            remove_object: bindings.FPDFPage_RemoveObject?,
+            destroy_object: bindings.FPDFPageObj_Destroy?,
+            generate_content: bindings.FPDFPage_GenerateContent?,
+            flatten: bindings.FPDFPage_Flatten?,
+            set_flags: bindings.FPDFAnnot_SetFlags?,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn load() -> Option<Self> {
+        Some(Self {
+            create: pdfium_sys::FPDF_CreateNewDocument,
+            import: pdfium_sys::FPDF_ImportPagesByIndex,
+            remove_object: pdfium_sys::FPDFPage_RemoveObject,
+            destroy_object: pdfium_sys::FPDFPageObj_Destroy,
+            generate_content: pdfium_sys::FPDFPage_GenerateContent,
+            flatten: pdfium_sys::FPDFPage_Flatten,
+            set_flags: pdfium_sys::FPDFAnnot_SetFlags,
+        })
+    }
+}
+
 impl<'lib> Document<'lib> {
     pub fn page_count(&self) -> i32 {
         unsafe { ffi!(FPDF_GetPageCount(self.handle)) }
@@ -188,6 +243,76 @@ impl<'lib> Document<'lib> {
         })
     }
 
+    /// A private one-page document whose page 0 is page `index` reduced to its
+    /// visible form-widget appearances, flattened into page content so pdfium's
+    /// text API reports the glyphs they paint.
+    ///
+    /// The page is imported into a fresh document, every annotation that is not a
+    /// visible widget is hidden, the original content objects are removed, and the
+    /// page is flattened. Extracting the appearances on a copy — rather than
+    /// flattening them over the ordinary text — keeps pdfium from suppressing
+    /// either run when their origins coincide; this document's own pages are never
+    /// touched. `None` when the loaded pdfium build lacks the editing API or any
+    /// step fails; the caller keeps the page text it already has. Load page 0 of
+    /// the result fresh: a page handle open across a flatten keeps its old text.
+    pub fn widget_appearance_copy(&self, index: i32) -> Option<Document<'lib>> {
+        let api = PageEditApi::load()?;
+        let handle = unsafe { (api.create)() };
+        if handle.is_null() {
+            return None;
+        }
+        let copy = Document {
+            handle,
+            page_user_units: self
+                .page_user_units
+                .get(index as usize)
+                .map(|unit| vec![*unit])
+                .unwrap_or_default(),
+            _lib: std::marker::PhantomData,
+        };
+        if unsafe { (api.import)(copy.handle, self.handle, &index, 1, 0) } == 0 {
+            return None;
+        }
+        let page = copy.page(0).ok()?;
+        let annot_count = unsafe { ffi!(FPDFPage_GetAnnotCount(page.handle)) };
+        for annot_index in 0..annot_count {
+            let annot = unsafe { ffi!(FPDFPage_GetAnnot(page.handle, annot_index)) };
+            if annot.is_null() {
+                return None;
+            }
+            let flags = unsafe { ffi!(FPDFAnnot_GetFlags(annot)) };
+            let suppressed = (pdfium_sys::FPDF_ANNOT_FLAG_INVISIBLE
+                | pdfium_sys::FPDF_ANNOT_FLAG_HIDDEN
+                | pdfium_sys::FPDF_ANNOT_FLAG_NOVIEW) as i32;
+            let visible_widget = unsafe { ffi!(FPDFAnnot_GetSubtype(annot)) }
+                == pdfium_sys::FPDF_ANNOT_WIDGET as i32
+                && flags & suppressed == 0;
+            let ok = visible_widget
+                || unsafe {
+                    (api.set_flags)(annot, flags | pdfium_sys::FPDF_ANNOT_FLAG_HIDDEN as i32)
+                } != 0;
+            unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
+            if !ok {
+                return None;
+            }
+        }
+        for object_index in (0..unsafe { ffi!(FPDFPage_CountObjects(page.handle)) }).rev() {
+            let object = unsafe { ffi!(FPDFPage_GetObject(page.handle, object_index)) };
+            if object.is_null() || unsafe { (api.remove_object)(page.handle, object) } == 0 {
+                return None;
+            }
+            unsafe { (api.destroy_object)(object) };
+        }
+        if unsafe { (api.generate_content)(page.handle) } == 0
+            || unsafe { (api.flatten)(page.handle, pdfium_sys::FLAT_NORMALDISPLAY as i32) }
+                != pdfium_sys::FLATTEN_SUCCESS as i32
+        {
+            return None;
+        }
+        drop(page);
+        Some(copy)
+    }
+
     /// Flatten the visible form-widget appearances on `index` into the page
     /// content stream and hand back a freshly loaded page reflecting them.
     ///
@@ -247,6 +372,52 @@ impl<'lib> Document<'lib> {
         // is reserved for a document with no Info dictionary at all, which
         // callers reporting provenance need to distinguish from `""`.
         Some(String::from_utf16_lossy(&buf[..end]))
+    }
+
+    /// The document's `/PageLabels` entry for a zero-based page index, when
+    /// the document defines one.
+    ///
+    /// This is the label a reader displays for the page — `"iv"`, `"A-1"`,
+    /// `"12"` — which is not always the page's position in the document.
+    /// `None` when the document has no `/PageLabels` tree, or none covering
+    /// this page; callers should fall back to the one-based page number.
+    pub fn page_label(&self, page_index: i32) -> Option<String> {
+        if page_index < 0 {
+            return None;
+        }
+        let needed = unsafe {
+            ffi!(FPDF_GetPageLabel(
+                self.handle,
+                page_index,
+                std::ptr::null_mut(),
+                0
+            ))
+        } as usize;
+        // `needed` is the byte length of the UTF-16 label including its
+        // trailing NUL, so anything under 4 bytes is an empty or absent label.
+        if needed < 4 {
+            return None;
+        }
+        let mut buf: Vec<u16> = vec![0; needed / 2];
+        let written = unsafe {
+            ffi!(FPDF_GetPageLabel(
+                self.handle,
+                page_index,
+                buf.as_mut_ptr() as *mut std::os::raw::c_void,
+                needed as std::os::raw::c_ulong,
+            ))
+        } as usize;
+        if written < 4 {
+            return None;
+        }
+        let chars = written / 2;
+        let end = if buf.get(chars - 1) == Some(&0) {
+            chars - 1
+        } else {
+            chars
+        };
+        let label = String::from_utf16_lossy(&buf[..end]);
+        (!label.is_empty()).then_some(label)
     }
 
     /// Encoded PDF version (`14` means PDF 1.4), when present.

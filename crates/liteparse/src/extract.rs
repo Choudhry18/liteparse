@@ -12,6 +12,7 @@ use pdfium::{
     Document, Font, FontType, FormEnvironment, Library, Page, PathObject, PdfLink, RectF,
     SegmentKind, TextPage,
 };
+use serde::{Deserialize, Serialize};
 
 /// Dedup spatial-grid cell size bounds (pt). The cell tracks the typical item
 /// footprint so a cell holds O(1) non-overlapping items.
@@ -37,6 +38,37 @@ pub(crate) fn load_document_from_input<'lib>(
         PdfInput::Path(path) => Ok(lib.load_document(path, password)?),
         PdfInput::Bytes(data) => Ok(lib.load_document_from_bytes(data, password)?),
     }
+}
+
+/// Rewrite `/Rotate` on every page named in `corrections` so its content
+/// reads upright (see `LiteParseConfig::page_orientation_corrections`).
+///
+/// PDFium stores the new rotation in the page dictionary of the open
+/// document, so it survives every later `FPDF_LoadPage` of that page: text
+/// extraction, OCR rasters and screenshots all see the corrected page without
+/// any further plumbing. It does NOT survive reopening the input, which is why
+/// every document open in `parser.rs` goes through
+/// `LiteParse::open_document` rather than this crate's raw loader.
+///
+/// Pages past the end of the document are skipped: a caller that parses a
+/// page slice (`target_pages`) may hand over corrections for the whole
+/// document. A non-cardinal angle is a config error.
+pub(crate) fn apply_page_orientation_corrections(
+    document: &Document,
+    corrections: &[crate::config::PageOrientationCorrection],
+) -> Result<(), LiteParseError> {
+    let page_count = document.page_count().max(0) as u32;
+    for correction in corrections {
+        let quarter_turns = correction
+            .quarter_turns_to_apply()
+            .map_err(LiteParseError::Config)?;
+        if quarter_turns == 0 || correction.page == 0 || correction.page > page_count {
+            continue;
+        }
+        let page = document.page((correction.page - 1) as i32)?;
+        page.set_rotation((page.rotation() + quarter_turns).rem_euclid(4));
+    }
+    Ok(())
 }
 
 /// Extract pages from a `PdfInput` (file path or bytes) with filtering.
@@ -74,6 +106,11 @@ pub(crate) fn extract_pages_from_document(
 }
 
 /// Output of [`extract_pages_and_images`].
+///
+/// Serializable so the whole result can cross a stage boundary (see
+/// `stages`); image payloads (`ExtractedImage::bytes`) are the one thing
+/// that does not, and travel separately keyed by image id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedPages {
     pub pages: Vec<LitePage>,
     pub page_errors: Vec<PageError>,
@@ -359,6 +396,7 @@ fn extract_single_page(
     Ok(PageExtraction {
         page: LitePage {
             page_number: page_number as usize,
+            page_label: document.page_label(page_index),
             page_width,
             page_height,
             content_bounds: output_options
@@ -1474,6 +1512,7 @@ fn extract_page_text_items(
         eprintln!("[extract-debug] char_count={char_count}, skip_invisible={skip_invisible}");
     }
 
+    let clips = crate::text_clip::TextClip::new(page);
     let page_rotation = page.rotation();
     let vp_xform = page.viewport_transform(view_box);
     let mut items: Vec<TextItem> = Vec::new();
@@ -1491,6 +1530,10 @@ fn extract_page_text_items(
             ch: &ch,
             rec: char_chunks.as_mut().and_then(|chunks| chunks.record(i)),
         };
+        if clips.hides(&cv) {
+            seg.flush(&mut items);
+            continue;
+        }
         let unicode = cv.unicode();
         let is_generated = cv.is_generated();
 
@@ -3925,6 +3968,7 @@ mod tests {
     fn page_with(items: Vec<TextItem>) -> LitePage {
         LitePage {
             page_number: 1,
+            page_label: None,
             page_width: 100.0,
             page_height: 100.0,
             content_bounds: None,

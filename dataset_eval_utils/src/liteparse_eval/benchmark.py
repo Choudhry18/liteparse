@@ -7,6 +7,7 @@ latency and an aggregate summary table.
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -50,8 +51,12 @@ PROVIDER_MAP = {
 
 
 def find_pdfs(directory: Path) -> list[Path]:
-    """Find all PDF files in a directory (non-recursive)."""
-    return sorted(directory.glob("*.pdf"))
+    """Find all PDF files in a directory, recursively.
+
+    Recursive so nested corpora (ParseBench, olmOCR-bench) can be pointed at
+    directly; a flat directory behaves exactly as before.
+    """
+    return sorted(directory.rglob("*.pdf"))
 
 
 def count_pages(file_path: Path) -> Optional[int]:
@@ -64,19 +69,33 @@ def count_pages(file_path: Path) -> Optional[int]:
         return None
 
 
-def time_extraction(provider: ParserProvider, file_path: Path) -> tuple[float, int]:
-    """Time a single extraction, returning (seconds, text_length)."""
+_FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*$", re.M)
+
+
+def content_length(text: str) -> int:
+    """Characters of actual content, ignoring structural boilerplate.
+
+    A raw ``len(text)`` overstates coverage: some parsers emit an empty code fence
+    or page separators for a page they could not read, which is non-empty output
+    carrying no content. Stripping fences and whitespace makes "produced nothing"
+    comparable across parsers.
+    """
+    return len(re.sub(r"\s+", "", _FENCE.sub("", text).replace("-----", "")))
+
+
+def time_extraction(provider: ParserProvider, file_path: Path) -> tuple[float, int, int]:
+    """Time a single extraction, returning (seconds, text_length, content_length)."""
     start = time.perf_counter()
     text = provider.extract_text(file_path)
     elapsed = time.perf_counter() - start
-    return elapsed, len(text)
+    return elapsed, len(text), content_length(text)
 
 
 def format_table(
     providers: list[str],
     doc_names: list[str],
-    # results[provider_name][doc_name] = (seconds, chars) | None (error)
-    results: dict[str, dict[str, tuple[float, int] | None]],
+    # results[provider_name][doc_name] = (seconds, chars, content_chars) | None
+    results: dict[str, dict[str, tuple[float, int, int] | None]],
     page_counts: dict[str, Optional[int]] | None = None,
 ) -> str:
     """Build a formatted table string."""
@@ -179,8 +198,16 @@ def run_benchmark(
         print(f"No PDF files found in {input_dir}")
         return {}
 
-    doc_names = [f.name for f in pdf_files]
-    page_counts = {f.name: count_pages(f) for f in pdf_files}
+    # Key results by path RELATIVE to input_dir, not by basename. The search is
+    # recursive, and corpora do contain the same filename in different
+    # subdirectories (ParseBench has 37 such collisions); keying by basename
+    # silently collapses those documents into one entry, dropping their
+    # measurements and under-reporting the corpus size.
+    def key_of(f: Path) -> str:
+        return str(f.relative_to(input_dir))
+
+    doc_names = [key_of(f) for f in pdf_files]
+    page_counts = {key_of(f): count_pages(f) for f in pdf_files}
     total_pages = sum(p for p in page_counts.values() if p)
 
     print(f"Found {len(pdf_files)} documents ({total_pages} pages) in {input_dir}")
@@ -188,38 +215,45 @@ def run_benchmark(
     print()
 
     # results[provider][doc_name] = (seconds, chars) | None
-    results: dict[str, dict[str, tuple[float, int] | None]] = {
+    results: dict[str, dict[str, tuple[float, int, int] | None]] = {
         p: {} for p in providers
     }
+    init_seconds: dict[str, float] = {}
 
     for provider_name in providers:
         print(f"[{provider_name}]")
         try:
+            _t0 = time.perf_counter()
             provider = PROVIDER_MAP[provider_name]()
+            init_seconds[provider_name] = time.perf_counter() - _t0
         except Exception as e:
             print(f"  Failed to initialize: {e}\n")
             for f in pdf_files:
-                results[provider_name][f.name] = None
+                results[provider_name][key_of(f)] = None
             continue
 
-        # Warmup runs
+        # Warmup: repeat ONE document, not the whole corpus. The point is to pay
+        # lazy imports, JIT and first-call setup once before timing starts; doing a
+        # full pass per warmup run multiplies the benchmark's wall time by
+        # warmup_runs and warms the OS page cache for every file, which flatters
+        # the timings that follow.
         if warmup_runs > 0:
-            print(f"  Warming up ({warmup_runs} runs)...")
+            warmup_doc = pdf_files[0]
+            print(f"  Warming up ({warmup_runs} runs on {warmup_doc.name})...")
             for _ in range(warmup_runs):
-                for pdf_path in pdf_files:
-                    try:
-                        provider.extract_text(pdf_path)
-                    except Exception:
-                        pass
+                try:
+                    provider.extract_text(warmup_doc)
+                except Exception:
+                    pass
 
         for pdf_path in pdf_files:
             try:
-                elapsed, text_len = time_extraction(provider, pdf_path)
-                results[provider_name][pdf_path.name] = (elapsed, text_len)
-                print(f"  {pdf_path.name}: {elapsed:.3f}s ({text_len:,} chars)")
+                elapsed, text_len, content_len = time_extraction(provider, pdf_path)
+                results[provider_name][key_of(pdf_path)] = (elapsed, text_len, content_len)
+                print(f"  {key_of(pdf_path)}: {elapsed:.3f}s ({text_len:,} chars)")
             except Exception as e:
-                results[provider_name][pdf_path.name] = None
-                print(f"  {pdf_path.name}: ERROR - {e}")
+                results[provider_name][key_of(pdf_path)] = None
+                print(f"  {key_of(pdf_path)}: ERROR - {e}")
         print()
 
     # Print table
@@ -245,6 +279,7 @@ def run_benchmark(
                 provider_results[doc] = {
                     "seconds": round(entry[0], 4),
                     "text_length": entry[1],
+                    "content_length": entry[2],
                     "ms_per_page": round(entry[0] / pc * 1000, 3) if pc else None,
                 }
         times = [results[p][d][0] for d in doc_names if results[p].get(d) is not None]
@@ -260,6 +295,7 @@ def run_benchmark(
             if results[p].get(d) is not None and page_counts.get(d)
         )
         output["providers"][p] = {
+            "init_seconds": round(init_seconds.get(p, 0.0), 4),
             "per_document": provider_results,
             "total_seconds": round(sum(times), 4) if times else None,
             "avg_seconds": round(sum(times) / len(times), 4) if times else None,

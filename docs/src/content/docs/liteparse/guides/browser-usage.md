@@ -97,6 +97,7 @@ All optional, camelCase:
 | `preserveVerySmallText` | `boolean` | `false` | Keep tiny text that's normally filtered |
 | `skipDiagonalText` | `boolean` | `false` | Drop text more than 2° off the nearest right angle |
 | `cropBox` | `{ top, right, bottom, left }` | — | Fraction to crop from each side of every page |
+| `pageOrientationCorrections` | `{ page, angle }[]` | — | Counter-rotate listed pages (1-based) by the clockwise `angle` (0/90/180/270) their content appears rotated |
 | `password` | `string` | — | Password for protected PDFs |
 | `quiet` | `boolean` | `false` | Suppress progress logging |
 | `imageMode` | `"off" \| "placeholder" \| "embed"` | `"placeholder"` | How image references appear in markdown. Also accepts `"none"` for `off` |

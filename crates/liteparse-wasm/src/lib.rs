@@ -18,6 +18,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use liteparse::config::{
     CropBox as CoreCropBox, ImageMode, LiteParseConfig as CoreConfig, OutputFormat,
+    PageOrientationCorrection as CorePageOrientationCorrection,
 };
 use liteparse::ocr::{OcrEngine, OcrOptions, OcrResult as CoreOcrResult};
 use liteparse::parser::LiteParse as CoreLiteParse;
@@ -93,6 +94,13 @@ pub struct LiteParseConfig {
     /// Drop diagonal text (rotation >2° off the nearest right angle). Default
     /// false. Use to exclude rotated watermarks/stamps from the output.
     skip_diagonal_text: Option<bool>,
+    /// Per-page orientation corrections from an upstream orientation
+    /// classifier. Each entry names a 1-based page and the clockwise angle
+    /// (0/90/180/270) by which its content appears rotated; LiteParse
+    /// counter-rotates that page before extraction so text, reading order,
+    /// page size and OCR rasters come out upright. Applied on top of the PDF's
+    /// own /Rotate. Unlisted or out-of-range pages are left unchanged.
+    page_orientation_corrections: Option<Vec<PageOrientationCorrection>>,
     /// Compute per-page complexity signals during parse and attach them to each
     /// page as `ParsedPage.complexity` (the same signals `isComplex` returns).
     /// Default false; enabling it runs an extra vector-text detection pass.
@@ -121,6 +129,16 @@ pub struct CropBox {
     right: f32,
     bottom: f32,
     left: f32,
+}
+
+/// One page's orientation correction: `page` is 1-based, `angle` is the
+/// clockwise degrees (0/90/180/270) the content appears rotated.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Tsify)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PageOrientationCorrection {
+    page: u32,
+    angle: u16,
 }
 
 impl LiteParseConfig {
@@ -235,6 +253,15 @@ impl LiteParseConfig {
         if let Some(v) = self.skip_diagonal_text {
             cfg.skip_diagonal_text = v;
         }
+        if let Some(v) = self.page_orientation_corrections {
+            cfg.page_orientation_corrections = v
+                .into_iter()
+                .map(|c| CorePageOrientationCorrection {
+                    page: c.page,
+                    angle: c.angle,
+                })
+                .collect();
+        }
         if let Some(v) = self.include_complexity {
             cfg.include_complexity = v;
         }
@@ -303,6 +330,15 @@ impl LiteParseConfig {
                 left: c.left,
             }),
             skip_diagonal_text: Some(cfg.skip_diagonal_text),
+            page_orientation_corrections: Some(
+                cfg.page_orientation_corrections
+                    .iter()
+                    .map(|c| PageOrientationCorrection {
+                        page: c.page,
+                        angle: c.angle,
+                    })
+                    .collect(),
+            ),
             include_complexity: Some(cfg.include_complexity),
             extract_vector_graphics: Some(cfg.extract_vector_graphics),
             extract_text_metadata: Some(cfg.extract_text_metadata),
@@ -378,6 +414,11 @@ pub struct TextItem {
 #[serde(rename_all = "camelCase")]
 pub struct ParsedPage {
     pub page_num: usize,
+    /// The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+    /// when the PDF defines none. This is what a reader displays for the page
+    /// and is not always its position; fall back to `page_num` when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
     pub width: f32,
     pub height: f32,
     /// Union bbox of the page's top-level content objects in viewport
@@ -1127,6 +1168,7 @@ fn to_js_result(result: &liteparse::ParseResult, extract_text_metadata: bool) ->
         .iter()
         .map(|p| ParsedPage {
             page_num: p.page_number,
+            page_label: p.page_label.clone(),
             width: p.page_width,
             height: p.page_height,
             content_bounds: p.content_bounds.as_ref().map(|b| VectorRect {

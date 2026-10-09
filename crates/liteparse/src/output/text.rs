@@ -16,6 +16,7 @@ mod tests {
     fn page(n: usize, text: &str) -> ParsedPage {
         ParsedPage {
             page_number: n,
+            page_label: None,
             page_width: 0.0,
             page_height: 0.0,
             content_bounds: None,
@@ -27,6 +28,7 @@ mod tests {
             graphics: vec![],
             vector_graphics: None,
             figures: vec![],
+            projected_item_frames: vec![],
             struct_nodes: vec![],
             image_refs: vec![],
             complexity: None,

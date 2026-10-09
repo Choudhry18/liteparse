@@ -17,7 +17,10 @@ pub struct ImageBounds {
     pub height: f32,
 }
 
-fn image_object_data(obj: pdfium_sys::FPDF_PAGEOBJECT, decoded: bool) -> Option<Vec<u8>> {
+pub(crate) fn image_object_data(
+    obj: pdfium_sys::FPDF_PAGEOBJECT,
+    decoded: bool,
+) -> Option<Vec<u8>> {
     let size = unsafe {
         if decoded {
             ffi!(FPDFImageObj_GetImageDataDecoded(
@@ -266,8 +269,80 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
         self.user_unit
     }
 
+    /// The page's `/Rotate` in quarter turns clockwise (0..=3), as PDFium
+    /// reports it.
     pub fn rotation(&self) -> i32 {
         unsafe { ffi!(FPDFPage_GetRotation(self.handle)) }
+    }
+
+    /// Overwrite the page's `/Rotate` with `quarter_turns` (0..=3, clockwise
+    /// when displayed). PDFium writes the value into the page dictionary and
+    /// recomputes the page size, so [`Self::width`] / [`Self::height`], the
+    /// viewport mapping, and every later `FPDF_LoadPage` of this page in the
+    /// same document see the new rotation. Values outside 0..=3 are ignored
+    /// by PDFium.
+    pub fn set_rotation(&self, quarter_turns: i32) {
+        unsafe { ffi!(FPDFPage_SetRotation(self.handle, quarter_turns)) }
+    }
+
+    /// Replace the page's `/CropBox` (PDF user space, points, bottom-left origin).
+    /// pdfium recomputes the page size, so [`Self::width`], [`Self::height`],
+    /// [`Self::view_box`] and any later render see the new box. This is how a
+    /// caller renders one region of a page at full resolution: crop, then render
+    /// the whole (now smaller) page.
+    pub fn set_crop_box(&self, left: f32, bottom: f32, right: f32, top: f32) {
+        unsafe { ffi!(FPDFPage_SetCropBox(self.handle, left, bottom, right, top)) }
+    }
+
+    /// Render into a caller-owned bitmap with explicit pixel geometry and pdfium
+    /// flags, then draw form fields on top when `form` is given.
+    ///
+    /// The page is mapped onto the `size_x × size_y` pixel rectangle whose top-left
+    /// sits at (`start_x`, `start_y`) in `bitmap`; parts outside the bitmap are
+    /// clipped, so a shorter bitmap with a negative `start_y` renders one horizontal
+    /// strip of a tall page. The bitmap is not cleared first. For a plain DPI-based
+    /// render use [`Self::render_with_form`]; this exists for consumers that need an
+    /// exact edge length or a different flag set (the LlamaParse extractor renders
+    /// with `FPDF_ANNOT` alone, at a pixel size it computes from a max-edge rule).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_into(
+        &self,
+        bitmap: &Bitmap<'lib>,
+        start_x: i32,
+        start_y: i32,
+        size_x: i32,
+        size_y: i32,
+        form: Option<&FormEnvironment>,
+        flags: i32,
+    ) {
+        unsafe {
+            ffi!(FPDF_RenderPageBitmap(
+                bitmap.handle(),
+                self.handle,
+                start_x,
+                start_y,
+                size_x,
+                size_y,
+                0,
+                flags,
+            ));
+        }
+        if let Some(form) = form {
+            // Form layer drawn with flags 0, as the extractor does (no popups).
+            unsafe {
+                ffi!(FPDF_FFLDraw(
+                    form.handle,
+                    bitmap.handle(),
+                    self.handle,
+                    start_x,
+                    start_y,
+                    size_x,
+                    size_y,
+                    0,
+                    0,
+                ));
+            }
+        }
     }
 
     /// Page dimensions in the same rotation-adjusted viewport coordinate
@@ -971,6 +1046,25 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
             }
         }
         false
+    }
+
+    /// Whether any visible AcroForm widget on the page paints text through its
+    /// appearance stream (nested form XObjects included). The cheap gate in
+    /// front of [`Document::widget_appearance_copy`]: pdfium's page text API
+    /// omits these glyphs until the appearances are flattened.
+    pub fn has_form_widget_text(&self) -> bool {
+        let count = unsafe { ffi!(FPDFPage_GetAnnotCount(self.handle)) };
+        (0..count).any(|index| {
+            let annot = unsafe { ffi!(FPDFPage_GetAnnot(self.handle, index)) };
+            if annot.is_null() {
+                return false;
+            }
+            let found = unsafe { ffi!(FPDFAnnot_GetSubtype(annot)) }
+                == pdfium_sys::FPDF_ANNOT_WIDGET as i32
+                && annotation_paints_text_deep(annot);
+            unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
+            found
+        })
     }
 
     /// Viewport rects of the visible AcroForm widgets that paint text through
@@ -1804,7 +1898,7 @@ fn collect_path_objects(
 
 /// Helper: call a PDFium getter for RGBA color channels and pack into our `Color`.
 /// Returns None when the FFI call reports failure.
-fn read_color<F>(getter: F) -> Option<Color>
+pub(crate) fn read_color<F>(getter: F) -> Option<Color>
 where
     F: FnOnce(*mut u32, *mut u32, *mut u32, *mut u32) -> i32,
 {

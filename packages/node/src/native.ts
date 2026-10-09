@@ -55,6 +55,7 @@ export interface LiteParseNativeConfig {
   extractTextMetadata?: boolean;
   cropBox?: NativeCropBox;
   skipDiagonalText?: boolean;
+  pageOrientationCorrections?: NativePageOrientationCorrection[];
   includeComplexity?: boolean;
   extractVectorGraphics?: boolean;
 }
@@ -64,6 +65,11 @@ export interface NativeCropBox {
   right: number;
   bottom: number;
   left: number;
+}
+
+export interface NativePageOrientationCorrection {
+  page: number;
+  angle: number;
 }
 
 export interface NativeWordBox {
@@ -132,6 +138,7 @@ export interface NativeRect {
 
 export interface NativeParsedPage {
   pageNum: number;
+  pageLabel?: string;
   width: number;
   height: number;
   contentBounds?: NativeRect;
