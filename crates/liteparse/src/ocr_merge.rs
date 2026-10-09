@@ -1637,9 +1637,14 @@ fn box_center_in(rect: &Rect, x: f32, y: f32, w: f32, h: f32) -> bool {
 }
 
 /// A chart label: a number (with separators/units) or a token of ≤ 3 chars.
+///
+/// The length rule only applies to text without CJK characters. Tesseract
+/// splits Chinese, Japanese and Korean text into words of one to three
+/// characters ("を", "変換", "します"), so in those scripts a short token is
+/// ordinary prose, not an axis tick or legend key.
 fn is_chart_label(text: &str) -> bool {
     let t = text.trim();
-    if t.chars().count() <= 3 {
+    if t.chars().count() <= 3 && !t.chars().any(is_cjk) {
         return true;
     }
     t.chars().any(|c| c.is_ascii_digit())
@@ -1650,6 +1655,21 @@ fn is_chart_label(text: &str) -> bool {
                     ',' | '.' | '%' | '-' | '+' | '$' | '€' | '£' | ' ' | 'k' | 'K' | 'M' | 'x'
                 )
         })
+}
+
+/// Han ideographs, kana and Hangul: scripts written without spaces between
+/// words, or with short syllable blocks, where OCR words are naturally short.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{1100}'..='\u{11FF}'   // Hangul Jamo
+        | '\u{3040}'..='\u{30FF}' // Hiragana, Katakana
+        | '\u{3130}'..='\u{318F}' // Hangul Compatibility Jamo
+        | '\u{3400}'..='\u{4DBF}' // CJK Unified Ideographs Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{FF66}'..='\u{FF9F}' // Halfwidth Katakana
+    )
 }
 
 /// For each figure rect, whether its OCR results look like a chart's
@@ -1772,6 +1792,12 @@ mod tests {
         assert!(is_chart_label("Yr"));
         assert!(!is_chart_label("Year"));
         assert!(!is_chart_label("Fruit Production in British Columbia"));
+        // Short CJK words are prose, not chart labels.
+        assert!(!is_chart_label("を"));
+        assert!(!is_chart_label("変換"));
+        assert!(!is_chart_label("します"));
+        assert!(!is_chart_label("中文"));
+        assert!(!is_chart_label("한국"));
 
         let rect = Rect {
             x: 50.0,
@@ -1802,6 +1828,19 @@ mod tests {
             mk("2020", 100.0, 240.0),
         ];
         assert_eq!(chart_like_images(&[rect.clone()], &prose, 1.0), vec![false]);
+        // Japanese prose, which OCR returns as one- to three-character words:
+        // not a chart.
+        let japanese = vec![
+            mk("文書", 60.0, 110.0),
+            mk("を", 80.0, 110.0),
+            mk("変換", 100.0, 110.0),
+            mk("します", 120.0, 110.0),
+            mk("。", 140.0, 110.0),
+        ];
+        assert_eq!(
+            chart_like_images(&[rect.clone()], &japanese, 1.0),
+            vec![false]
+        );
         // Too few results to judge.
         assert_eq!(chart_like_images(&[rect], &chart[..3], 1.0), vec![false]);
     }
