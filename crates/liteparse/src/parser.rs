@@ -323,10 +323,7 @@ impl LiteParse {
                 continue_on_page_error: self.config.continue_on_page_error,
                 extract_content_bounds: self.config.extract_content_bounds,
                 extract_images: self.config.effective_extract_images(),
-                // The markdown table detector splits PDFium's merged
-                // multi-cell runs on real word geometry, so it needs word
-                // boxes even when the caller didn't ask for them.
-                emit_word_boxes: self.config.emit_word_boxes || markdown,
+                emit_word_boxes: self.config.effective_emit_word_boxes(),
                 extract_text_metadata: self.config.extract_text_metadata,
                 extract_vector_graphics: self.config.extract_vector_graphics,
                 extract_annotations: self.config.extract_annotations,
@@ -794,12 +791,10 @@ impl LiteParse {
 
         if let Some(engine) = ocr_engine {
             // `ocr_render_options` already carries the re-flatten set and a
-            // `max_rasters` cap of `num_workers`. Native parses override that
-            // cap with the number of free workers so a finished request
-            // refills the window without waiting out the rest of a batch.
-            #[cfg(not(target_arch = "wasm32"))]
-            let mut render_options = ocr_render_options;
-            #[cfg(target_arch = "wasm32")]
+            // `max_rasters` cap of `num_workers`. Native parses ignore that
+            // cap and render only as many pages as there are free workers,
+            // so a finished request refills the window without waiting out
+            // the rest of a batch.
             let render_options = ocr_render_options;
             let ocr_input = repaired_input.as_ref().unwrap_or(validated_input);
             let mut scan_start = 0usize;
@@ -820,29 +815,37 @@ impl LiteParse {
                         break;
                     }
 
-                    let render_capacity = ocr_tasks.available_capacity();
-                    if render_capacity == 0 {
+                    if ocr_tasks.available_capacity() == 0 {
                         ocr_tasks.complete_one().await;
                         continue;
                     }
 
-                    render_options.max_rasters = render_capacity;
+                    // Each refill reopens the document, often for a single
+                    // page. That costs a few ms (measured 1-12 ms on large
+                    // PDFs), small next to one OCR request, and the PDFium
+                    // lock cannot be held across the awaits. A render error
+                    // returns here; dropping `ocr_tasks` abandons in-flight
+                    // recognitions.
                     let (rendered, next_start) = {
                         let lib = Library::init();
                         let document = self.open_document(&lib, ocr_input, password)?;
-                        stages::render_for_ocr(&document, &pages, scan_start, &render_options)?
+                        ocr_tasks.render_next(&document, &pages, scan_start, &render_options)?
                         // `lib` drops here, releasing the PDFium lock before the
                         // next await.
                     };
                     scan_start = next_start;
 
                     for raster in rendered {
-                        ocr_tasks.submit(raster);
+                        ocr_tasks.submit(raster).await;
                     }
                 }
 
                 ocr_tasks
-                    .finish_and_merge(&mut pages, self.config.ocr_failure_fatal)
+                    .finish_and_merge(
+                        &mut pages,
+                        self.config.ocr_failure_fatal,
+                        self.config.effective_emit_word_boxes(),
+                    )
                     .await?;
             }
 
@@ -871,7 +874,12 @@ impl LiteParse {
                     self.config.num_workers,
                 )
                 .await;
-                stages::merge_ocr(&mut pages, outcomes, self.config.ocr_failure_fatal)?;
+                stages::merge_ocr(
+                    &mut pages,
+                    outcomes,
+                    self.config.ocr_failure_fatal,
+                    self.config.effective_emit_word_boxes(),
+                )?;
             }
         }
         let t_ocr = web_time::Instant::now();

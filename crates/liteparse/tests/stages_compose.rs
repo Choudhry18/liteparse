@@ -316,7 +316,13 @@ async fn compose(parser: &LiteParse, input: PdfInput) -> ParseResult {
             )
             .await;
             let outcomes = round_trip(outcomes, "Vec<PageOcrOutcome>");
-            stages::merge_ocr(&mut pages, outcomes, config.ocr_failure_fatal).unwrap();
+            stages::merge_ocr(
+                &mut pages,
+                outcomes,
+                config.ocr_failure_fatal,
+                config.effective_emit_word_boxes(),
+            )
+            .unwrap();
         }
     }
 
@@ -665,7 +671,7 @@ fn merge_ocr_rejects_outcome_for_unknown_page() {
         }],
         error: None,
     };
-    let err = stages::merge_ocr(&mut pages, vec![outcome], false).unwrap_err();
+    let err = stages::merge_ocr(&mut pages, vec![outcome], false, false).unwrap_err();
     assert!(err.to_string().contains("page 7"), "{err}");
 }
 

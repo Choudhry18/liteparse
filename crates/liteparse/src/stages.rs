@@ -246,8 +246,9 @@ pub async fn recognize(
 /// [`LiteParse::parse`](crate::LiteParse::parse) instead keeps at most
 /// `num_workers` recognitions running and renders the next page as soon as
 /// one finishes, so a slow page does not idle the other workers. Raster
-/// memory stays bounded by `num_workers`: pass
-/// [`OcrWindow::available_capacity`] as [`OcrRenderOptions::max_rasters`].
+/// memory stays bounded by `num_workers` when each round is rendered with
+/// [`OcrWindow::render_next`], which renders no more pages than there are
+/// free slots.
 ///
 /// Browser WASM has no blocking thread pool, so `parse` uses [`recognize`]
 /// there. This type exists only on native targets.
@@ -265,9 +266,27 @@ impl OcrWindow {
         }
     }
 
-    /// How many more rasters can be submitted without exceeding `num_workers`.
+    /// How many more rasters can be submitted without waiting.
     pub fn available_capacity(&self) -> usize {
         self.inner.available_capacity()
+    }
+
+    /// [`render_for_ocr`] capped at [`available_capacity`](Self::available_capacity)
+    /// (`options.max_rasters` is ignored). Renders nothing, and returns
+    /// `start` unchanged, when the window is full.
+    pub fn render_next(
+        &self,
+        document: &Document,
+        pages: &[Page],
+        start: usize,
+        options: &OcrRenderOptions,
+    ) -> Result<(Vec<OcrRaster>, usize), LiteParseError> {
+        match self.available_capacity() {
+            0 => Ok((Vec::new(), start)),
+            capacity => {
+                ocr_merge::render_pages_for_ocr_capped(document, pages, start, options, capacity)
+            }
+        }
     }
 
     /// Record recognitions that have already finished, without waiting.
@@ -275,23 +294,33 @@ impl OcrWindow {
         self.inner.complete_ready()
     }
 
-    /// Wait until one in-flight recognition finishes and record it.
-    pub async fn complete_one(&mut self) {
+    /// Wait until one in-flight recognition finishes and record it. Returns
+    /// `false` without waiting when nothing is in flight.
+    pub async fn complete_one(&mut self) -> bool {
         self.inner.complete_one().await
     }
 
-    /// Start recognition for one raster. Panics if the window is already full.
-    pub fn submit(&mut self, raster: OcrRaster) {
-        self.inner.submit(raster)
+    /// Start recognition for one raster, first waiting for a free slot if the
+    /// window is full.
+    pub async fn submit(&mut self, raster: OcrRaster) {
+        self.inner.submit(raster).await
     }
 
-    /// Wait for the remaining recognitions and merge them into `pages`.
+    /// Wait for the remaining recognitions and return every outcome, in
+    /// submission order.
+    pub async fn finish(self) -> Vec<PageOcrOutcome> {
+        self.inner.finish().await
+    }
+
+    /// [`finish`](Self::finish), then [`merge_ocr`] the outcomes into `pages`.
     pub async fn finish_and_merge(
         self,
         pages: &mut [Page],
         ocr_failure_fatal: bool,
+        emit_word_boxes: bool,
     ) -> Result<(), LiteParseError> {
-        self.inner.finish_and_merge(pages, ocr_failure_fatal).await
+        let outcomes = self.finish().await;
+        merge_ocr(pages, outcomes, ocr_failure_fatal, emit_word_boxes)
     }
 }
 
@@ -299,12 +328,19 @@ impl OcrWindow {
 /// text, filter engine artifacts, append the surviving results as `OCR`
 /// text items in viewport points. Errors only when every outcome failed and
 /// one of the failed pages had no usable native text (`ocr_failure_fatal`).
+///
+/// Pass `LiteParseConfig::effective_emit_word_boxes` for `emit_word_boxes`:
+/// each engine result is one word, so this is the only place the OCR path can
+/// attach a word box, and it has to agree with what extraction used or a run
+/// ends up with word boxes on native text only. See
+/// [`ExtractionOutputOptions::emit_word_boxes`](crate::extract::ExtractionOutputOptions).
 pub fn merge_ocr(
     pages: &mut [Page],
     outcomes: Vec<PageOcrOutcome>,
     ocr_failure_fatal: bool,
+    emit_word_boxes: bool,
 ) -> Result<(), LiteParseError> {
-    ocr_merge::merge_ocr_results(pages, outcomes, ocr_failure_fatal)
+    ocr_merge::merge_ocr_results(pages, outcomes, ocr_failure_fatal, emit_word_boxes)
 }
 
 // ── Content filters ────────────────────────────────────────────────────

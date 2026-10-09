@@ -28,6 +28,7 @@ pub mod parser;
 pub mod raw_text;
 pub mod search;
 pub mod stages;
+mod text_clip;
 pub mod types;
 
 // ── Internal modules (available for binding crates, hidden from docs) ──

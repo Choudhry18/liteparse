@@ -120,6 +120,78 @@ impl<'page, 'lib> PageObject<'page, 'lib> {
         }
     }
 
+    /// Clip paths in the containing form's coordinates (page coordinates at the
+    /// top level). The object's own matrix is already applied to clip points.
+    /// No clip is an empty list; unavailable APIs, failed reads, or more than
+    /// 1024 segments return `None`. Text-based clipping is not exposed by PDFium.
+    pub fn clip_paths(&self) -> Option<Vec<Vec<RawPathSegment>>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (get_clip, count_paths, count_segments, get_segment) = {
+            let api = pdfium_sys::dynamic::pdfium();
+            (
+                api.FPDFPageObj_GetClipPath?,
+                api.FPDFClipPath_CountPaths?,
+                api.FPDFClipPath_CountPathSegments?,
+                api.FPDFClipPath_GetPathSegment?,
+            )
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (get_clip, count_paths, count_segments, get_segment) = (
+            pdfium_sys::FPDFPageObj_GetClipPath,
+            pdfium_sys::FPDFClipPath_CountPaths,
+            pdfium_sys::FPDFClipPath_CountPathSegments,
+            pdfium_sys::FPDFClipPath_GetPathSegment,
+        );
+        let clip = unsafe { get_clip(self.handle) };
+        if clip.is_null() {
+            return None;
+        }
+        let count = unsafe { count_paths(clip) };
+        // PDFium returns -1 for an object with no clip-path reference.
+        if count == -1 {
+            return Some(Vec::new());
+        }
+        if !(0..=1024).contains(&count) {
+            return None;
+        }
+        let mut paths = Vec::new();
+        let mut budget = 1024;
+        for path in 0..count {
+            let count = unsafe { count_segments(clip, path) };
+            if count < 0 || count > budget {
+                return None;
+            }
+            budget -= count;
+            let mut segments = Vec::new();
+            for index in 0..count {
+                let segment = unsafe { get_segment(clip, path, index) };
+                if segment.is_null() {
+                    return None;
+                }
+                let kind = match unsafe { ffi!(FPDFPathSegment_GetType(segment)) } {
+                    t if t == pdfium_sys::FPDF_SEGMENT_MOVETO as i32 => Some(SegmentKind::MoveTo),
+                    t if t == pdfium_sys::FPDF_SEGMENT_LINETO as i32 => Some(SegmentKind::LineTo),
+                    t if t == pdfium_sys::FPDF_SEGMENT_BEZIERTO as i32 => {
+                        Some(SegmentKind::BezierTo)
+                    }
+                    _ => None,
+                };
+                let mut x = 0.0;
+                let mut y = 0.0;
+                if unsafe { ffi!(FPDFPathSegment_GetPoint(segment, &mut x, &mut y)) } == 0 {
+                    return None;
+                }
+                segments.push(RawPathSegment {
+                    kind,
+                    point: Some((x, y)),
+                    close: unsafe { ffi!(FPDFPathSegment_GetClose(segment)) } != 0,
+                });
+            }
+            paths.push(segments);
+        }
+        Some(paths)
+    }
+
     /// The object's transformation matrix (`FPDFPageObj_GetMatrix`). For an object
     /// inside a form this is relative to the form, not the page. `None` when pdfium
     /// reports none — normal for a shading object without a clip path.

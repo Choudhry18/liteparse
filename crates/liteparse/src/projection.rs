@@ -480,16 +480,39 @@ fn form_lines(
             (1..=2).contains(&digit_count)
         }
 
-        for item in items.iter_mut() {
-            let center = item.item.x + item.item.width / 2.0;
+        // A real gutter line number is isolated on its baseline. An item that
+        // abuts a neighbour is a fragment of a larger token, e.g. the "7" of a
+        // table cell PDFium emits as "7" + ".7" (issue #465).
+        fn abuts_neighbour(items: &[ProjectedTextItem], idx: usize) -> bool {
+            let it = &items[idx].item;
+            let max_gap = it.height * 0.25;
+            items.iter().enumerate().any(|(j, other)| {
+                if j == idx {
+                    return false;
+                }
+                let o = &other.item;
+                if (o.y - it.y).abs() > it.height * 0.5 {
+                    return false;
+                }
+                let gap_right = o.x - (it.x + it.width);
+                let gap_left = it.x - (o.x + o.width);
+                (-0.5..=max_gap).contains(&gap_right) || (-0.5..=max_gap).contains(&gap_left)
+            })
+        }
 
-            if center > margin_left
-                && center < margin_right
-                && is_margin_line_number_text(&item.item.text)
-                && item.item.width < 15.0
-            {
-                item.is_margin_line_number = true;
-            }
+        let margin_idxs: Vec<usize> = (0..items.len())
+            .filter(|&i| {
+                let item = &items[i];
+                let center = item.item.x + item.item.width / 2.0;
+                center > margin_left
+                    && center < margin_right
+                    && is_margin_line_number_text(&item.item.text)
+                    && item.item.width < 15.0
+                    && !abuts_neighbour(items, i)
+            })
+            .collect();
+        for i in margin_idxs {
+            items[i].is_margin_line_number = true;
         }
     }
 
@@ -1091,8 +1114,12 @@ fn compress_wide_spaces(line: &str, min_run: usize, replace_with: usize) -> Stri
                 out.push_str(&" ".repeat(run_len));
             }
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+            // ASCII spaces are UTF-8 boundaries, so this preserves the original text.
+            out.push_str(&line[start..i]);
         }
     }
     out
@@ -5165,6 +5192,32 @@ fn build_one_line(
 mod tests {
     use super::*;
 
+    #[test]
+    fn compress_wide_spaces_preserves_utf8_text() {
+        assert_eq!(
+            compress_wide_spaces("売上高    1,234 Café  Größe", 4, 2),
+            "売上高  1,234 Café  Größe"
+        );
+    }
+
+    #[test]
+    fn sparse_blocks_preserve_utf8_text_when_compressing_columns() {
+        let labels = ["売上高", "営業利益", "Café", "Größe"];
+        let mut lines: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(120)))
+            .collect();
+        let end = lines.len();
+
+        fix_sparse_blocks(&mut lines, 0, end);
+
+        let expected: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(FLOATING_SPACES)))
+            .collect();
+        assert_eq!(lines, expected);
+    }
+
     fn projected_item(text: &str, y: f32, width: f32, height: f32) -> ProjectedTextItem {
         ProjectedTextItem {
             item: TextItem {
@@ -5244,6 +5297,42 @@ mod tests {
             orig_height: h,
             orig_rotation: 0.0,
         }
+    }
+
+    #[test]
+    fn gutter_digit_abutting_neighbour_is_not_margin_line_number() {
+        // Issue #465: a table cell "7.7" emitted as runs "7" + ".7" with zero
+        // gap, sitting in the page-centre band. The "7" must stay on the row
+        // and merge with ".7" instead of being split off as a line number.
+        let mut items = vec![
+            item_at("58.5", 252.7, 149.76, 10.9, 8.42),
+            item_at("7", 313.37, 149.76, 3.108, 8.42),
+            item_at(".7", 316.478, 149.76, 4.66, 8.42),
+            item_at("2.3", 370.9, 149.76, 10.6, 8.42),
+        ];
+        let lines = form_lines(&mut items, 10.0, 8.42, 612.0);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].iter().any(|i| i.item.text == "7.7"));
+        assert!(lines[0].iter().all(|i| !i.is_margin_line_number));
+    }
+
+    #[test]
+    fn isolated_gutter_digit_is_still_margin_line_number() {
+        // Two-column paper: "12" alone in the gutter, well clear of both
+        // columns' text, keeps its line-number flag.
+        let mut items = vec![
+            item_at("left column text", 60.0, 100.0, 230.0, 10.0),
+            item_at("12", 310.0, 100.0, 8.0, 10.0),
+            item_at("right column text", 330.0, 100.0, 230.0, 10.0),
+        ];
+        let lines = form_lines(&mut items, 10.0, 10.0, 612.0);
+        let flagged: Vec<_> = lines
+            .iter()
+            .flatten()
+            .filter(|i| i.is_margin_line_number)
+            .map(|i| i.item.text.as_str())
+            .collect();
+        assert_eq!(flagged, vec!["12"]);
     }
 
     #[test]

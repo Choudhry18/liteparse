@@ -200,6 +200,17 @@ pub struct PdfiumBindings {
         *mut std::os::raw::c_uint,
         *mut std::os::raw::c_uint,
     ) -> FPDF_BOOL,
+    pub FPDFPageObj_GetClipPath: Option<unsafe extern "C" fn(FPDF_PAGEOBJECT) -> FPDF_CLIPPATH>,
+    pub FPDFClipPath_CountPaths: Option<unsafe extern "C" fn(FPDF_CLIPPATH) -> std::os::raw::c_int>,
+    pub FPDFClipPath_CountPathSegments:
+        Option<unsafe extern "C" fn(FPDF_CLIPPATH, std::os::raw::c_int) -> std::os::raw::c_int>,
+    pub FPDFClipPath_GetPathSegment: Option<
+        unsafe extern "C" fn(
+            FPDF_CLIPPATH,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+        ) -> FPDF_PATHSEGMENT,
+    >,
     pub FPDFPageObj_GetMatrix: unsafe extern "C" fn(FPDF_PAGEOBJECT, *mut FS_MATRIX) -> FPDF_BOOL,
     pub FPDFPageObj_GetStrokeColor: unsafe extern "C" fn(
         FPDF_PAGEOBJECT,
@@ -647,6 +658,10 @@ impl PdfiumBindings {
             FPDFImageObj_GetImageFilter: load_fn!(lib, "FPDFImageObj_GetImageFilter"),
             FPDFImageObj_GetImageMetadata: load_fn!(lib, "FPDFImageObj_GetImageMetadata"),
             FPDFImageObj_GetImagePixelSize: load_fn!(lib, "FPDFImageObj_GetImagePixelSize"),
+            FPDFPageObj_GetClipPath: load_fn_opt!(lib, "FPDFPageObj_GetClipPath"),
+            FPDFClipPath_CountPaths: load_fn_opt!(lib, "FPDFClipPath_CountPaths"),
+            FPDFClipPath_CountPathSegments: load_fn_opt!(lib, "FPDFClipPath_CountPathSegments"),
+            FPDFClipPath_GetPathSegment: load_fn_opt!(lib, "FPDFClipPath_GetPathSegment"),
             FPDFPageObj_GetMatrix: load_fn!(lib, "FPDFPageObj_GetMatrix"),
             FPDFPageObj_GetStrokeColor: load_fn!(lib, "FPDFPageObj_GetStrokeColor"),
             FPDFPageObj_GetFillColor: load_fn!(lib, "FPDFPageObj_GetFillColor"),

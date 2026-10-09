@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::LiteParseError;
 use crate::ocr::{OcrEngine, OcrOptions, OcrResult};
-use crate::types::{CutAxis, Page, ParsedPage, Rect, Region, RegionKind, TextItem};
+use crate::types::{CutAxis, Page, ParsedPage, Rect, Region, RegionKind, TextItem, WordBox};
 use pdfium::{Document, ImageBounds};
 use serde::{Deserialize, Serialize};
 
@@ -127,20 +127,54 @@ mod base64_bytes {
 }
 
 type OcrTaskResult = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
-/// `(page_number, dpi, has_native_text, image_rects)` carried alongside a
-/// running recognition so a completion can become a [`PageOcrOutcome`]
-/// without the raster.
-type OcrTaskMetadata = (usize, f32, bool, Vec<Rect>);
-type OcrTaskOutput = (usize, f32, bool, Vec<Rect>, OcrTaskResult);
 
+impl PageOcrOutcome {
+    /// The outcome for `raster` before recognition: its page facts, no
+    /// results yet. Lets the pixels go to the engine while the small facts
+    /// wait for the result.
+    fn pending(raster: &OcrRaster) -> Self {
+        Self {
+            page_number: raster.page_number,
+            dpi: raster.dpi,
+            has_native_text: raster.has_native_text,
+            image_rects: raster.image_rects.clone(),
+            results: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn with_result(mut self, result: OcrTaskResult) -> Self {
+        match result {
+            Ok(results) => self.results = results,
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        self
+    }
+}
+
+/// At most `max_workers` recognitions in flight; a slot frees as soon as its
+/// recognition finishes, so the caller can refill it without waiting on the
+/// slowest request.
+///
+/// Each recognition runs on a blocking thread (Tesseract is CPU-bound). A
+/// task is only spawned once a slot is free, so at most `max_workers`
+/// blocking threads are ever in use. That bound is load-bearing: the HTTP
+/// engine's client resolves DNS through its own `spawn_blocking`, and if
+/// every pool thread were parked waiting for a slot, that lookup could never
+/// run and the whole OCR pass would deadlock.
+///
+/// Dropping the pool aborts the async tasks, but a recognition already on a
+/// blocking thread runs to completion in the background and is discarded.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct OcrTaskPool {
     max_workers: usize,
     engine: Arc<dyn OcrEngine>,
     language: String,
-    tasks: tokio::task::JoinSet<OcrTaskOutput>,
-    task_metadata: HashMap<tokio::task::Id, OcrTaskMetadata>,
-    completed: Vec<OcrTaskOutput>,
+    tasks: tokio::task::JoinSet<OcrTaskResult>,
+    /// Submission index and pending outcome for each running task.
+    running: HashMap<tokio::task::Id, (usize, PageOcrOutcome)>,
+    completed: Vec<(usize, PageOcrOutcome)>,
+    submitted: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -151,8 +185,9 @@ impl OcrTaskPool {
             engine,
             language: language.to_string(),
             tasks: tokio::task::JoinSet::new(),
-            task_metadata: HashMap::new(),
+            running: HashMap::new(),
             completed: Vec::new(),
+            submitted: 0,
         }
     }
 
@@ -160,60 +195,49 @@ impl OcrTaskPool {
         self.max_workers - self.tasks.len()
     }
 
-    pub(crate) fn submit(&mut self, rendered: OcrRaster) {
-        assert!(
-            self.tasks.len() < self.max_workers,
-            "OCR task pool is at capacity"
-        );
+    /// Start recognition for `raster`, first waiting for a free slot if the
+    /// pool is full.
+    pub(crate) async fn submit(&mut self, raster: OcrRaster) {
+        while self.available_capacity() == 0 {
+            self.complete_one().await;
+        }
 
+        let pending = PageOcrOutcome::pending(&raster);
         let engine = self.engine.clone();
-        let language = self.language.clone();
-        let metadata = (
-            rendered.page_number,
-            rendered.dpi,
-            rendered.has_native_text,
-            rendered.image_rects.clone(),
-        );
-        let task_metadata = metadata.clone();
+        let options = OcrOptions {
+            language: self.language.clone(),
+            dpi: raster.dpi,
+        };
         let runtime = tokio::runtime::Handle::current();
         let task = self.tasks.spawn(async move {
-            let options = OcrOptions {
-                language,
-                dpi: rendered.dpi,
-            };
-            let result = match tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 runtime.block_on(engine.recognize(
-                    &rendered.pixels,
-                    rendered.width,
-                    rendered.height,
+                    &raster.pixels,
+                    raster.width,
+                    raster.height,
                     &options,
                 ))
             })
             .await
             {
                 Ok(result) => result,
-                Err(join_err) => {
-                    Err(Box::new(join_err) as Box<dyn std::error::Error + Send + Sync>)
-                }
-            };
-            (
-                task_metadata.0,
-                task_metadata.1,
-                task_metadata.2,
-                task_metadata.3,
-                result,
-            )
+                Err(join_err) => Err(Box::new(join_err) as _),
+            }
         });
-        self.task_metadata.insert(task.id(), metadata);
+        self.running.insert(task.id(), (self.submitted, pending));
+        self.submitted += 1;
     }
 
-    pub(crate) async fn complete_one(&mut self) {
-        let joined = self
-            .tasks
-            .join_next_with_id()
-            .await
-            .expect("OCR task pool is empty");
-        self.record_completion(joined);
+    /// Wait for one running recognition to finish and record it. Returns
+    /// `false` (without waiting) when nothing is running.
+    pub(crate) async fn complete_one(&mut self) -> bool {
+        match self.tasks.join_next_with_id().await {
+            Some(joined) => {
+                self.record_completion(joined);
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn complete_ready(&mut self) {
@@ -224,56 +248,29 @@ impl OcrTaskPool {
 
     fn record_completion(
         &mut self,
-        joined: Result<(tokio::task::Id, OcrTaskOutput), tokio::task::JoinError>,
+        joined: Result<(tokio::task::Id, OcrTaskResult), tokio::task::JoinError>,
     ) {
-        match joined {
-            Ok((id, output)) => {
-                self.task_metadata.remove(&id);
-                self.completed.push(output);
-            }
-            Err(join_err) => {
-                let metadata = self
-                    .task_metadata
-                    .remove(&join_err.id())
-                    .expect("OCR task metadata is missing");
-                self.completed.push((
-                    metadata.0,
-                    metadata.1,
-                    metadata.2,
-                    metadata.3,
-                    Err(Box::new(join_err)),
-                ));
-            }
-        }
+        let (id, result) = match joined {
+            Ok((id, result)) => (id, result),
+            Err(join_err) => (join_err.id(), Err(Box::new(join_err) as _)),
+        };
+        let (order, pending) = self
+            .running
+            .remove(&id)
+            .expect("every spawned OCR task is tracked");
+        self.completed.push((order, pending.with_result(result)));
     }
 
-    pub(crate) async fn finish_and_merge(
-        mut self,
-        pages: &mut [Page],
-        ocr_failure_fatal: bool,
-    ) -> Result<(), LiteParseError> {
-        while !self.tasks.is_empty() {
-            self.complete_one().await;
-        }
-        let outcomes = self
-            .completed
+    /// Wait for the remaining recognitions. Outcomes come back in submission
+    /// order, not completion order, so the result (and which failure the
+    /// merge reports first) does not depend on request timing.
+    pub(crate) async fn finish(mut self) -> Vec<PageOcrOutcome> {
+        while self.complete_one().await {}
+        self.completed.sort_by_key(|(order, _)| *order);
+        self.completed
             .into_iter()
-            .map(|(page_number, dpi, has_native_text, image_rects, result)| {
-                let (results, error) = match result {
-                    Ok(results) => (results, None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
-                };
-                PageOcrOutcome {
-                    page_number,
-                    dpi,
-                    has_native_text,
-                    image_rects,
-                    results,
-                    error,
-                }
-            })
-            .collect();
-        merge_ocr_results(pages, outcomes, ocr_failure_fatal)
+            .map(|(_, outcome)| outcome)
+            .collect()
     }
 }
 
@@ -825,8 +822,21 @@ pub fn render_pages_for_ocr(
     start: usize,
     options: &OcrRenderOptions,
 ) -> Result<(Vec<OcrRaster>, usize), LiteParseError> {
+    render_pages_for_ocr_capped(document, pages, start, options, options.max_rasters)
+}
+
+/// [`render_pages_for_ocr`] with `max_rasters` overriding the one in
+/// `options`, so a caller sizing each round to its free OCR slots need not
+/// clone the options.
+pub(crate) fn render_pages_for_ocr_capped(
+    document: &Document,
+    pages: &[Page],
+    start: usize,
+    options: &OcrRenderOptions,
+    max_rasters: usize,
+) -> Result<(Vec<OcrRaster>, usize), LiteParseError> {
     let OcrRenderOptions {
-        max_rasters,
+        max_rasters: _,
         dpi,
         grayscale,
         render_form_fields,
@@ -834,8 +844,7 @@ pub fn render_pages_for_ocr(
         reflatten_pages: flatten_page_numbers,
         selection,
     } = options;
-    let (max_rasters, dpi, grayscale, render_form_fields, continue_on_page_error) = (
-        *max_rasters,
+    let (dpi, grayscale, render_form_fields, continue_on_page_error) = (
         *dpi,
         *grayscale,
         *render_form_fields,
@@ -1010,121 +1019,34 @@ pub async fn recognize_rasters(
     ocr_language: &str,
     num_workers: usize,
 ) -> Vec<PageOcrOutcome> {
-    type OcrTaskResult = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
-
     // Browser WASM uses the JavaScript event loop. It has no Tokio runtime or
     // blocking thread pool. Run each JavaScript OCR callback directly so the
     // returned Promise can make progress on the browser event loop.
     #[cfg(target_arch = "wasm32")]
-    let task_results: Vec<(usize, f32, (bool, Vec<Rect>), OcrTaskResult)> = {
+    {
         let _ = num_workers;
-        let mut results = Vec::with_capacity(rendered.len());
+        let mut outcomes = Vec::with_capacity(rendered.len());
         for r in rendered {
-            let page_number = r.page_number;
-            let page_dpi = r.dpi;
-            let native = (r.has_native_text, r.image_rects.clone());
             let options = OcrOptions {
                 language: ocr_language.to_string(),
-                dpi: page_dpi,
+                dpi: r.dpi,
             };
             let result = ocr_engine
                 .recognize(&r.pixels, r.width, r.height, &options)
                 .await;
-            results.push((page_number, page_dpi, native, result));
+            outcomes.push(PageOcrOutcome::pending(&r).with_result(result));
         }
-        results
-    };
+        outcomes
+    }
 
-    // Phase 1: spawn one async task per page. A semaphore limits how many run
-    // `recognize` concurrently to `num_workers`.
-    //
-    // The permit MUST be acquired in async context (`acquire_owned().await`),
-    // not inside `spawn_blocking` via `block_on`. Acquiring it on a blocking
-    // thread parks that OS thread until a permit is free; with more pages than
-    // tokio's blocking pool (default `max_blocking_threads = 512`), every pool
-    // thread ends up parked waiting on the semaphore. The single task holding
-    // the permit then calls `recognize`, whose HTTP client resolves DNS via its
-    // own internal `spawn_blocking` — which can never get a thread, so the
-    // request never goes out, the permit is never released, and the whole OCR
-    // pass deadlocks. Acquiring the permit asynchronously parks the lightweight
-    // task instead, so only `num_workers` blocking threads are ever consumed.
     #[cfg(not(target_arch = "wasm32"))]
-    let task_results: Vec<(usize, f32, (bool, Vec<Rect>), OcrTaskResult)> = {
-        let num_workers = num_workers.max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
-        let mut handles = Vec::with_capacity(rendered.len());
-
-        let handle = tokio::runtime::Handle::current();
-
+    {
+        let mut pool = OcrTaskPool::new(ocr_engine, ocr_language, num_workers);
         for r in rendered {
-            let engine = ocr_engine.clone();
-            let sem = semaphore.clone();
-            let language = ocr_language.to_string();
-            let page_number = r.page_number;
-            let rt_handle = handle.clone();
-
-            handles.push((
-                page_number,
-                r.dpi,
-                (r.has_native_text, r.image_rects.clone()),
-                tokio::spawn(async move {
-                    // Park the task (not an OS thread) until a permit is available.
-                    let _permit = sem.acquire_owned().await.expect("semaphore closed");
-                    let options = OcrOptions {
-                        language,
-                        dpi: r.dpi,
-                    };
-                    // Offload the (possibly CPU-blocking, e.g. Tesseract) recognize
-                    // onto a blocking thread. Because the permit is already held,
-                    // at most `num_workers` blocking threads are in use at once,
-                    // leaving the rest of the pool free for the HTTP client's
-                    // internal DNS resolution.
-                    match tokio::task::spawn_blocking(move || {
-                        rt_handle.block_on(engine.recognize(&r.pixels, r.width, r.height, &options))
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(join_err) => {
-                            Err(Box::new(join_err) as Box<dyn std::error::Error + Send + Sync>)
-                        }
-                    }
-                }),
-            ));
+            pool.submit(r).await;
         }
-
-        let mut results = Vec::with_capacity(handles.len());
-        for (page_number, page_dpi, native, handle) in handles {
-            let result = match handle.await {
-                Ok(result) => result,
-                Err(join_err) => {
-                    Err(Box::new(join_err) as Box<dyn std::error::Error + Send + Sync>)
-                }
-            };
-            results.push((page_number, page_dpi, native, result));
-        }
-        results
-    };
-
-    task_results
-        .into_iter()
-        .map(
-            |(page_number, dpi, (has_native_text, image_rects), result)| {
-                let (results, error) = match result {
-                    Ok(results) => (results, None),
-                    Err(e) => (Vec::new(), Some(e.to_string())),
-                };
-                PageOcrOutcome {
-                    page_number,
-                    dpi,
-                    has_native_text,
-                    image_rects,
-                    results,
-                    error,
-                }
-            },
-        )
-        .collect()
+        pool.finish().await
+    }
 }
 
 /// Merge recognition outcomes into `pages`, in place. Pure: needs neither the
@@ -1139,10 +1061,19 @@ pub async fn recognize_rasters(
 /// Outcomes are matched to pages by `page_number`; an outcome for a page not
 /// in `pages` is an error rather than a panic, so a caller can merge a
 /// subset of pages or hand-built outcomes safely.
+///
+/// `emit_word_boxes` must match what the extraction stage used
+/// (`LiteParseConfig::effective_emit_word_boxes`). An engine reports one
+/// [`OcrResult`] per word, so each surviving result becomes a one-word
+/// [`TextItem`]; the item's own word box is attached here, which is what lets
+/// the projection pass merge neighbouring OCR items into a run that still
+/// carries per-word boxes. When `false`, no box is attached, matching the
+/// zero-allocation promise the config makes for native text.
 pub fn merge_ocr_results(
     pages: &mut [Page],
     outcomes: Vec<PageOcrOutcome>,
     ocr_failure_fatal: bool,
+    emit_word_boxes: bool,
 ) -> Result<(), LiteParseError> {
     // Track OCR task outcomes so we can distinguish a systemic failure (e.g.
     // missing Tesseract language data, which fails identically on every page)
@@ -1346,6 +1277,21 @@ pub fn merge_ocr_results(
                 ocr_h
             };
 
+            // The engine already segmented this result as a single word, so
+            // its box is the item's box. The clone only happens when the
+            // caller asked for word boxes.
+            let words = if emit_word_boxes {
+                vec![WordBox {
+                    text: cleaned.clone(),
+                    x: ocr_x,
+                    y: ocr_y,
+                    width: ocr_w,
+                    height: ocr_h,
+                }]
+            } else {
+                Vec::new()
+            };
+
             page.text_items.push(TextItem {
                 text: cleaned,
                 x: ocr_x,
@@ -1356,6 +1302,7 @@ pub fn merge_ocr_results(
                 font_name: Some("OCR".to_string()),
                 font_size: Some(font_size_hint),
                 confidence: Some((r.confidence * 1000.0).round() / 1000.0),
+                words,
                 ..Default::default()
             });
         }
@@ -1580,8 +1527,20 @@ fn garbled_scope(page: &Page) -> GarbledScope {
     }
 }
 
+/// Page-level garbled signal: substitution-cipher text (see [`garbled_scope`])
+/// or a substantial share of text whose Unicode mapping failed outright.
 fn page_is_garbled(page: &Page) -> bool {
-    !matches!(garbled_scope(page), GarbledScope::None)
+    !matches!(garbled_scope(page), GarbledScope::None) || page_has_unmapped_text(page)
+}
+
+/// True when text with a failed Unicode mapping is both a real amount (not a
+/// stray Type3 symbol glyph) and a real share of the page's native text.
+fn page_has_unmapped_text(page: &Page) -> bool {
+    let (unmapped, total) = page.text_items.iter().fold((0usize, 0usize), |(u, t), it| {
+        let n = it.text.chars().filter(|c| !c.is_whitespace()).count();
+        (u + if it.has_unicode_map_error { n } else { 0 }, t + n)
+    });
+    unmapped >= GARBLE_MIN_LETTERS && unmapped as f32 >= total as f32 * GARBLE_MIN_FONT_SHARE
 }
 
 /// Recover a discrete CCW rotation in degrees from a 4-point OCR polygon.
@@ -1769,6 +1728,14 @@ fn clean_ocr_table_artifacts(text: &str) -> String {
         || without_artifacts == "-";
 
     if is_numeric_ish {
+        // Parentheses directly around a number mark it negative, e.g. "(78,939)",
+        // so keep that pair; only what lies outside it is a border misread.
+        if let Some((before, after)) = trimmed.split_once(without_artifacts)
+            && before.ends_with('(')
+            && after.starts_with(')')
+        {
+            return format!("({without_artifacts})");
+        }
         without_artifacts.to_string()
     } else {
         trimmed.to_string()
@@ -2087,6 +2054,19 @@ mod tests {
         assert_eq!(clean_ocr_table_artifacts("|||"), "|||");
     }
 
+    #[test]
+    fn test_clean_ocr_keeps_accounting_negatives() {
+        // Parentheses around a number mark it negative (issue #468).
+        assert_eq!(clean_ocr_table_artifacts("(78,939)"), "(78,939)");
+        assert_eq!(clean_ocr_table_artifacts("(12.5%)"), "(12.5%)");
+        // Border misreads next to them are still removed.
+        assert_eq!(clean_ocr_table_artifacts("(78,939)|"), "(78,939)");
+        assert_eq!(clean_ocr_table_artifacts("|(78,939)]"), "(78,939)");
+        // A lone parenthesis is still treated as a border misread.
+        assert_eq!(clean_ocr_table_artifacts("78,939)"), "78,939");
+        assert_eq!(clean_ocr_table_artifacts("(78,939"), "78,939");
+    }
+
     fn make_item(x: f32, y: f32, w: f32, h: f32) -> TextItem {
         TextItem {
             text: "x".into(),
@@ -2305,6 +2285,51 @@ mod tests {
         assert!(page_is_garbled(&page));
     }
 
+    /// A page of unmappable text (PUA char-code fallback) has no ASCII letters
+    /// for the vowel ratio to judge, and every item is excluded from
+    /// `text_length` — it must still report as garbled.
+    #[test]
+    fn test_page_is_garbled_unmapped_text() {
+        let mut page = make_font_page(&[
+            (
+                "T3Font",
+                "\u{E001}\u{E002}\u{E003}\u{E004}\u{E005}\u{E006}\u{E007}\u{E008}",
+            ),
+            (
+                "T3Font",
+                "\u{E011}\u{E012}\u{E013}\u{E014}\u{E015}\u{E016}\u{E017}\u{E018}",
+            ),
+            (
+                "T3Font",
+                "\u{E021}\u{E022}\u{E023}\u{E024}\u{E025}\u{E026}\u{E027}\u{E028}",
+            ),
+            (
+                "T3Font",
+                "\u{E031}\u{E032}\u{E033}\u{E034}\u{E035}\u{E036}\u{E037}\u{E038}",
+            ),
+        ]);
+        for it in &mut page.text_items {
+            it.has_unicode_map_error = true;
+        }
+        assert!(matches!(garbled_scope(&page), GarbledScope::None));
+        assert_eq!(native_text_length(&page), 0);
+        assert!(page_is_garbled(&page));
+    }
+
+    /// A stray unmappable symbol glyph (e.g. a Type3 checkmark) on a healthy
+    /// page must not flag it.
+    #[test]
+    fn test_page_is_garbled_ignores_stray_unmapped_glyph() {
+        let mut items: Vec<(&str, &str)> = HEALTHY_PARAGRAPH
+            .iter()
+            .map(|t| ("Helvetica", *t))
+            .collect();
+        items.push(("T3Font", "\u{E001}"));
+        let mut page = make_font_page(&items);
+        page.text_items.last_mut().unwrap().has_unicode_map_error = true;
+        assert!(!page_is_garbled(&page));
+    }
+
     /// A small run of low-vowel text (acronyms, tickers, part numbers) in its
     /// own font must not flag an otherwise healthy page.
     #[test]
@@ -2355,9 +2380,10 @@ mod tests {
         language: &str,
         num_workers: usize,
         ocr_failure_fatal: bool,
+        emit_word_boxes: bool,
     ) -> Result<(), LiteParseError> {
         let outcomes = recognize_rasters(rendered, engine, language, num_workers).await;
-        merge_ocr_results(pages, outcomes, ocr_failure_fatal)
+        merge_ocr_results(pages, outcomes, ocr_failure_fatal, emit_word_boxes)
     }
 
     // A page that already has substantial native text coverage, as would be the
@@ -2425,7 +2451,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         let err = result.expect_err("expected systemic OCR failure to be surfaced");
         let msg = err.to_string();
@@ -2439,6 +2466,65 @@ mod tests {
         );
     }
 
+    /// Sleeps longer for lower DPIs, then fails with a message naming the DPI,
+    /// so completion order is the reverse of submission order and each
+    /// outcome shows which raster it came from.
+    struct ReverseLatencyEngine;
+
+    impl OcrEngine for ReverseLatencyEngine {
+        fn name(&self) -> &str {
+            "reverse-latency"
+        }
+
+        fn recognize<'a, 'b: 'a, 'c: 'a>(
+            &'a self,
+            _image_data: &'c [u8],
+            _width: u32,
+            _height: u32,
+            options: &'b OcrOptions,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = OcrTaskResult> + Send + 'a>>
+        {
+            let dpi = options.dpi;
+            Box::pin(async move {
+                let delay = (100.0 - dpi).max(0.0) as u64 * 5;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                Err(format!("dpi {dpi}").into())
+            })
+        }
+    }
+
+    // Outcomes come back in submission order whatever order recognitions
+    // finish in, with each result attached to its own raster's facts. Five
+    // rasters over two workers also exercises `submit` waiting for a slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_recognize_returns_submission_order() {
+        let rendered = (0..5)
+            .map(|i| OcrRaster {
+                dpi: 72.0 + i as f32 * 4.0,
+                ..make_rendered(i)
+            })
+            .collect();
+        let engine: Arc<dyn OcrEngine> = Arc::new(ReverseLatencyEngine);
+
+        let outcomes = recognize_rasters(rendered, engine, "eng", 2).await;
+
+        let got: Vec<(usize, String)> = outcomes
+            .iter()
+            .map(|o| (o.page_number, o.error.clone().unwrap_or_default()))
+            .collect();
+        let want: Vec<(usize, String)> = (0..5)
+            .map(|i| (i + 1, format!("dpi {}", 72.0 + i as f32 * 4.0)))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_empty_pool_complete_one_does_not_wait() {
+        let mut pool = OcrTaskPool::new(Arc::new(FailingEngine), "eng", 2);
+        assert!(!pool.complete_one().await);
+        assert!(pool.finish().await.is_empty());
+    }
+
     // With no rendered pages there is nothing to OCR; this must remain a no-op
     // success rather than tripping the all-failed guard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2446,7 +2532,8 @@ mod tests {
         let mut pages = vec![make_blank_page(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, Vec::new(), engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, Vec::new(), engine, "eng", 2, true, false).await;
 
         assert!(result.is_ok(), "empty OCR set should succeed: {result:?}");
     }
@@ -2460,7 +2547,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         assert!(
             result.is_ok(),
@@ -2480,7 +2568,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         let err = result.expect_err("a text-starved page losing all OCR must surface an error");
         assert!(
@@ -2498,7 +2587,8 @@ mod tests {
         let rendered = vec![make_rendered(0)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         let err = result.expect_err("low-coverage text page losing OCR must surface an error");
         assert!(
@@ -2517,7 +2607,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, false).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, false, false).await;
 
         assert!(
             result.is_ok(),
@@ -2525,5 +2616,62 @@ mod tests {
         );
         // The native-text page keeps its text; the blank page simply has no OCR.
         assert_eq!(pages[0].text_items.len(), 1);
+    }
+
+    /// An OCR-sourced `TextItem` must carry a word box the way a native one
+    /// does. The engine already reports one word per result (`RIL_WORD` for
+    /// Tesseract), so the item's own text and box are the word box. Without
+    /// it the projection pass has nothing to carry forward when it joins
+    /// neighbouring OCR items into a run, so a caller asking for word boxes
+    /// gets them on native text only and none on scanned pages (#473).
+    #[test]
+    fn test_ocr_items_carry_word_boxes_when_enabled() {
+        let outcome = |page_number: usize| PageOcrOutcome {
+            page_number,
+            dpi: 72.0,
+            has_native_text: false,
+            image_rects: Vec::new(),
+            results: vec![
+                OcrResult {
+                    text: "hello".into(),
+                    bbox: [10.0, 20.0, 60.0, 30.0],
+                    confidence: 0.9,
+                    polygon: None,
+                },
+                OcrResult {
+                    text: "world".into(),
+                    bbox: [62.0, 20.0, 110.0, 30.0],
+                    confidence: 0.9,
+                    polygon: None,
+                },
+            ],
+            error: None,
+        };
+
+        let mut enabled = vec![make_blank_page(1)];
+        merge_ocr_results(&mut enabled, vec![outcome(1)], false, true).unwrap();
+        assert_eq!(enabled[0].text_items.len(), 2);
+        for item in &enabled[0].text_items {
+            assert_eq!(
+                item.words.len(),
+                1,
+                "OCR item {:?} should carry one word box",
+                item.text
+            );
+            let word = &item.words[0];
+            assert_eq!(word.text, item.text);
+            assert_eq!(
+                (word.x, word.y, word.width, word.height),
+                (item.x, item.y, item.width, item.height),
+                "the word box is the result's own box"
+            );
+        }
+
+        // The same input with word boxes off must stay allocation-free, as
+        // `LiteParseConfig::emit_word_boxes` promises for native text.
+        let mut disabled = vec![make_blank_page(1)];
+        merge_ocr_results(&mut disabled, vec![outcome(1)], false, false).unwrap();
+        assert_eq!(disabled[0].text_items.len(), 2);
+        assert!(disabled[0].text_items.iter().all(|i| i.words.is_empty()));
     }
 }

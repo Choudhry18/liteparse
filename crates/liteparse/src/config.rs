@@ -251,6 +251,19 @@ impl LiteParseConfig {
     pub fn effective_extract_images(&self) -> bool {
         self.extract_images || self.image_mode == ImageMode::Embed
     }
+
+    /// Whether per-word boxes are needed for this run, whichever stage
+    /// produces the text. True when `emit_word_boxes` is set, or when the
+    /// markdown output format is selected: the markdown table detector splits
+    /// PDFium's merged multi-cell runs on real word geometry, so it needs
+    /// word boxes even when the caller didn't ask for them.
+    ///
+    /// Every stage that fills `TextItem.words` must gate on this, so a run
+    /// with word boxes off stays allocation-free on the whole path — including
+    /// the OCR merge, where native text and scanned pages must agree.
+    pub fn effective_emit_word_boxes(&self) -> bool {
+        self.emit_word_boxes || self.output_format == OutputFormat::Markdown
+    }
 }
 
 impl Default for LiteParseConfig {
