@@ -126,6 +126,154 @@ mod base64_bytes {
     }
 }
 
+type OcrTaskResult = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
+
+impl PageOcrOutcome {
+    /// The outcome for `raster` before recognition: its page facts, no
+    /// results yet. Lets the pixels go to the engine while the small facts
+    /// wait for the result.
+    fn pending(raster: &OcrRaster) -> Self {
+        Self {
+            page_number: raster.page_number,
+            dpi: raster.dpi,
+            has_native_text: raster.has_native_text,
+            image_rects: raster.image_rects.clone(),
+            results: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn with_result(mut self, result: OcrTaskResult) -> Self {
+        match result {
+            Ok(results) => self.results = results,
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        self
+    }
+}
+
+/// At most `max_workers` recognitions in flight; a slot frees as soon as its
+/// recognition finishes, so the caller can refill it without waiting on the
+/// slowest request.
+///
+/// Each recognition runs on a blocking thread (Tesseract is CPU-bound). A
+/// task is only spawned once a slot is free, so at most `max_workers`
+/// blocking threads are ever in use. That bound is load-bearing: the HTTP
+/// engine's client resolves DNS through its own `spawn_blocking`, and if
+/// every pool thread were parked waiting for a slot, that lookup could never
+/// run and the whole OCR pass would deadlock.
+///
+/// Dropping the pool aborts the async tasks, but a recognition already on a
+/// blocking thread runs to completion in the background and is discarded.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct OcrTaskPool {
+    max_workers: usize,
+    engine: Arc<dyn OcrEngine>,
+    language: String,
+    tasks: tokio::task::JoinSet<OcrTaskResult>,
+    /// Submission index and pending outcome for each running task.
+    running: HashMap<tokio::task::Id, (usize, PageOcrOutcome)>,
+    completed: Vec<(usize, PageOcrOutcome)>,
+    submitted: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OcrTaskPool {
+    pub(crate) fn new(engine: Arc<dyn OcrEngine>, language: &str, num_workers: usize) -> Self {
+        Self {
+            max_workers: num_workers.max(1),
+            engine,
+            language: language.to_string(),
+            tasks: tokio::task::JoinSet::new(),
+            running: HashMap::new(),
+            completed: Vec::new(),
+            submitted: 0,
+        }
+    }
+
+    pub(crate) fn available_capacity(&self) -> usize {
+        self.max_workers - self.tasks.len()
+    }
+
+    /// Start recognition for `raster`, first waiting for a free slot if the
+    /// pool is full.
+    pub(crate) async fn submit(&mut self, raster: OcrRaster) {
+        while self.available_capacity() == 0 {
+            self.complete_one().await;
+        }
+
+        let pending = PageOcrOutcome::pending(&raster);
+        let engine = self.engine.clone();
+        let options = OcrOptions {
+            language: self.language.clone(),
+            dpi: raster.dpi,
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let task = self.tasks.spawn(async move {
+            match tokio::task::spawn_blocking(move || {
+                runtime.block_on(engine.recognize(
+                    &raster.pixels,
+                    raster.width,
+                    raster.height,
+                    &options,
+                ))
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(join_err) => Err(Box::new(join_err) as _),
+            }
+        });
+        self.running.insert(task.id(), (self.submitted, pending));
+        self.submitted += 1;
+    }
+
+    /// Wait for one running recognition to finish and record it. Returns
+    /// `false` (without waiting) when nothing is running.
+    pub(crate) async fn complete_one(&mut self) -> bool {
+        match self.tasks.join_next_with_id().await {
+            Some(joined) => {
+                self.record_completion(joined);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn complete_ready(&mut self) {
+        while let Some(joined) = self.tasks.try_join_next_with_id() {
+            self.record_completion(joined);
+        }
+    }
+
+    fn record_completion(
+        &mut self,
+        joined: Result<(tokio::task::Id, OcrTaskResult), tokio::task::JoinError>,
+    ) {
+        let (id, result) = match joined {
+            Ok((id, result)) => (id, result),
+            Err(join_err) => (join_err.id(), Err(Box::new(join_err) as _)),
+        };
+        let (order, pending) = self
+            .running
+            .remove(&id)
+            .expect("every spawned OCR task is tracked");
+        self.completed.push((order, pending.with_result(result)));
+    }
+
+    /// Wait for the remaining recognitions. Outcomes come back in submission
+    /// order, not completion order, so the result (and which failure the
+    /// merge reports first) does not depend on request timing.
+    pub(crate) async fn finish(mut self) -> Vec<PageOcrOutcome> {
+        while self.complete_one().await {}
+        self.completed.sort_by_key(|(order, _)| *order);
+        self.completed
+            .into_iter()
+            .map(|(_, outcome)| outcome)
+            .collect()
+    }
+}
+
 /// Why a page was flagged as needing more than the cheap text-only path.
 /// Multiple reasons can apply to one page (e.g. a sparse page whose little
 /// text is also garbled). Empty exactly when `needs_ocr` is false.
@@ -674,8 +822,21 @@ pub fn render_pages_for_ocr(
     start: usize,
     options: &OcrRenderOptions,
 ) -> Result<(Vec<OcrRaster>, usize), LiteParseError> {
+    render_pages_for_ocr_capped(document, pages, start, options, options.max_rasters)
+}
+
+/// [`render_pages_for_ocr`] with `max_rasters` overriding the one in
+/// `options`, so a caller sizing each round to its free OCR slots need not
+/// clone the options.
+pub(crate) fn render_pages_for_ocr_capped(
+    document: &Document,
+    pages: &[Page],
+    start: usize,
+    options: &OcrRenderOptions,
+    max_rasters: usize,
+) -> Result<(Vec<OcrRaster>, usize), LiteParseError> {
     let OcrRenderOptions {
-        max_rasters,
+        max_rasters: _,
         dpi,
         grayscale,
         render_form_fields,
@@ -683,8 +844,7 @@ pub fn render_pages_for_ocr(
         reflatten_pages: flatten_page_numbers,
         selection,
     } = options;
-    let (max_rasters, dpi, grayscale, render_form_fields, continue_on_page_error) = (
-        *max_rasters,
+    let (dpi, grayscale, render_form_fields, continue_on_page_error) = (
         *dpi,
         *grayscale,
         *render_form_fields,
@@ -859,121 +1019,34 @@ pub async fn recognize_rasters(
     ocr_language: &str,
     num_workers: usize,
 ) -> Vec<PageOcrOutcome> {
-    type OcrTaskResult = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
-
     // Browser WASM uses the JavaScript event loop. It has no Tokio runtime or
     // blocking thread pool. Run each JavaScript OCR callback directly so the
     // returned Promise can make progress on the browser event loop.
     #[cfg(target_arch = "wasm32")]
-    let task_results: Vec<(usize, f32, (bool, Vec<Rect>), OcrTaskResult)> = {
+    {
         let _ = num_workers;
-        let mut results = Vec::with_capacity(rendered.len());
+        let mut outcomes = Vec::with_capacity(rendered.len());
         for r in rendered {
-            let page_number = r.page_number;
-            let page_dpi = r.dpi;
-            let native = (r.has_native_text, r.image_rects.clone());
             let options = OcrOptions {
                 language: ocr_language.to_string(),
-                dpi: page_dpi,
+                dpi: r.dpi,
             };
             let result = ocr_engine
                 .recognize(&r.pixels, r.width, r.height, &options)
                 .await;
-            results.push((page_number, page_dpi, native, result));
+            outcomes.push(PageOcrOutcome::pending(&r).with_result(result));
         }
-        results
-    };
+        outcomes
+    }
 
-    // Phase 1: spawn one async task per page. A semaphore limits how many run
-    // `recognize` concurrently to `num_workers`.
-    //
-    // The permit MUST be acquired in async context (`acquire_owned().await`),
-    // not inside `spawn_blocking` via `block_on`. Acquiring it on a blocking
-    // thread parks that OS thread until a permit is free; with more pages than
-    // tokio's blocking pool (default `max_blocking_threads = 512`), every pool
-    // thread ends up parked waiting on the semaphore. The single task holding
-    // the permit then calls `recognize`, whose HTTP client resolves DNS via its
-    // own internal `spawn_blocking` — which can never get a thread, so the
-    // request never goes out, the permit is never released, and the whole OCR
-    // pass deadlocks. Acquiring the permit asynchronously parks the lightweight
-    // task instead, so only `num_workers` blocking threads are ever consumed.
     #[cfg(not(target_arch = "wasm32"))]
-    let task_results: Vec<(usize, f32, (bool, Vec<Rect>), OcrTaskResult)> = {
-        let num_workers = num_workers.max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
-        let mut handles = Vec::with_capacity(rendered.len());
-
-        let handle = tokio::runtime::Handle::current();
-
+    {
+        let mut pool = OcrTaskPool::new(ocr_engine, ocr_language, num_workers);
         for r in rendered {
-            let engine = ocr_engine.clone();
-            let sem = semaphore.clone();
-            let language = ocr_language.to_string();
-            let page_number = r.page_number;
-            let rt_handle = handle.clone();
-
-            handles.push((
-                page_number,
-                r.dpi,
-                (r.has_native_text, r.image_rects.clone()),
-                tokio::spawn(async move {
-                    // Park the task (not an OS thread) until a permit is available.
-                    let _permit = sem.acquire_owned().await.expect("semaphore closed");
-                    let options = OcrOptions {
-                        language,
-                        dpi: r.dpi,
-                    };
-                    // Offload the (possibly CPU-blocking, e.g. Tesseract) recognize
-                    // onto a blocking thread. Because the permit is already held,
-                    // at most `num_workers` blocking threads are in use at once,
-                    // leaving the rest of the pool free for the HTTP client's
-                    // internal DNS resolution.
-                    match tokio::task::spawn_blocking(move || {
-                        rt_handle.block_on(engine.recognize(&r.pixels, r.width, r.height, &options))
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(join_err) => {
-                            Err(Box::new(join_err) as Box<dyn std::error::Error + Send + Sync>)
-                        }
-                    }
-                }),
-            ));
+            pool.submit(r).await;
         }
-
-        let mut results = Vec::with_capacity(handles.len());
-        for (page_number, page_dpi, native, handle) in handles {
-            let result = match handle.await {
-                Ok(result) => result,
-                Err(join_err) => {
-                    Err(Box::new(join_err) as Box<dyn std::error::Error + Send + Sync>)
-                }
-            };
-            results.push((page_number, page_dpi, native, result));
-        }
-        results
-    };
-
-    task_results
-        .into_iter()
-        .map(
-            |(page_number, dpi, (has_native_text, image_rects), result)| {
-                let (results, error) = match result {
-                    Ok(results) => (results, None),
-                    Err(e) => (Vec::new(), Some(e.to_string())),
-                };
-                PageOcrOutcome {
-                    page_number,
-                    dpi,
-                    has_native_text,
-                    image_rects,
-                    results,
-                    error,
-                }
-            },
-        )
-        .collect()
+        pool.finish().await
+    }
 }
 
 /// Merge recognition outcomes into `pages`, in place. Pure: needs neither the
@@ -2391,6 +2464,65 @@ mod tests {
             msg.contains("traineddata"),
             "error should carry the underlying cause: {msg}"
         );
+    }
+
+    /// Sleeps longer for lower DPIs, then fails with a message naming the DPI,
+    /// so completion order is the reverse of submission order and each
+    /// outcome shows which raster it came from.
+    struct ReverseLatencyEngine;
+
+    impl OcrEngine for ReverseLatencyEngine {
+        fn name(&self) -> &str {
+            "reverse-latency"
+        }
+
+        fn recognize<'a, 'b: 'a, 'c: 'a>(
+            &'a self,
+            _image_data: &'c [u8],
+            _width: u32,
+            _height: u32,
+            options: &'b OcrOptions,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = OcrTaskResult> + Send + 'a>>
+        {
+            let dpi = options.dpi;
+            Box::pin(async move {
+                let delay = (100.0 - dpi).max(0.0) as u64 * 5;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                Err(format!("dpi {dpi}").into())
+            })
+        }
+    }
+
+    // Outcomes come back in submission order whatever order recognitions
+    // finish in, with each result attached to its own raster's facts. Five
+    // rasters over two workers also exercises `submit` waiting for a slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_recognize_returns_submission_order() {
+        let rendered = (0..5)
+            .map(|i| OcrRaster {
+                dpi: 72.0 + i as f32 * 4.0,
+                ..make_rendered(i)
+            })
+            .collect();
+        let engine: Arc<dyn OcrEngine> = Arc::new(ReverseLatencyEngine);
+
+        let outcomes = recognize_rasters(rendered, engine, "eng", 2).await;
+
+        let got: Vec<(usize, String)> = outcomes
+            .iter()
+            .map(|o| (o.page_number, o.error.clone().unwrap_or_default()))
+            .collect();
+        let want: Vec<(usize, String)> = (0..5)
+            .map(|i| (i + 1, format!("dpi {}", 72.0 + i as f32 * 4.0)))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_empty_pool_complete_one_does_not_wait() {
+        let mut pool = OcrTaskPool::new(Arc::new(FailingEngine), "eng", 2);
+        assert!(!pool.complete_one().await);
+        assert!(pool.finish().await.is_empty());
     }
 
     // With no rendered pages there is nothing to OCR; this must remain a no-op

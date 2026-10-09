@@ -80,8 +80,16 @@ fn clipped_overflow_does_not_leak_into_next_row() {
 
 #[test]
 fn horizontal_partial_glyphs_survive_in_full_at_every_page_rotation() {
+    // Courier advances 6 pt, so C's advance starts at x = 22 and its ink a little after.
+    // A clip edge at 22 touches the advance but shows none of C's ink.
     for rotation in [0, 90, 180, 270] {
-        for (edge, expected) in [(26, "ABC"), (24, "ABC"), (22, "ABC"), (21, "AB")] {
+        for (edge, expected) in [
+            (26, "ABC"),
+            (24, "ABC"),
+            (23, "ABC"),
+            (22, "AB"),
+            (21, "AB"),
+        ] {
             let content = format!(
                 "q 10 10 {} 30 re W n BT /F1 10 Tf 10 20 Td (ABCDE) Tj ET Q",
                 edge - 10
@@ -184,24 +192,94 @@ fn unsupported_parent_clip_preserves_form_text() {
     );
 }
 
+/// Left, right, bottom and top of a box in y-up page space.
+type Edges = (f32, f32, f32, f32);
+
+/// The glyph's ink box (its strict box, `grounding_bounds`) in y-up page space, with
+/// its loose box (advance width by font ascent and descent), as (left, right, bottom, top).
+fn glyph_boxes(item: &RawTextItem) -> (Edges, Edges) {
+    // Raw item coordinates have a top-left origin; content streams use y-up.
+    let ink = item.grounding_bounds.unwrap();
+    let ink = (ink.left, ink.right, 800.0 - ink.bottom, 800.0 - ink.top);
+    let top = 800.0 - item.y;
+    let loose = (item.x, item.x + item.width, top - item.height, top);
+    (ink, loose)
+}
+
 #[test]
 fn partial_glyphs_keep_the_full_text_and_geometry_at_all_clip_edges() {
     let text = "BT /F1 10 Tf 10 20 Td (A) Tj ET";
     let original = extract(&pdf(text, &[], 0));
     let glyph = original.0.iter().find(|item| item.text == "A").unwrap();
-    // Raw item coordinates have a top-left origin; content streams use y-up.
-    let left = glyph.x;
-    let right = left + glyph.width;
-    let top = 800.0 - glyph.y;
-    let bottom = top - glyph.height;
+    // A clip that shows 0.1 pt of the glyph's ink at any edge keeps the whole glyph.
+    let ((left, right, bottom, top), _) = glyph_boxes(glyph);
+    let (width, height) = (right - left, top - bottom);
     let clips = [
-        (left - 1.0, bottom - 1.0, 1.1, glyph.height + 2.0),
-        (right - 0.1, bottom - 1.0, 1.1, glyph.height + 2.0),
-        (left - 1.0, bottom - 1.0, glyph.width + 2.0, 1.1),
-        (left - 1.0, top - 0.1, glyph.width + 2.0, 1.1),
+        (left - 1.0, bottom - 1.0, 1.1, height + 2.0),
+        (right - 0.1, bottom - 1.0, 1.1, height + 2.0),
+        (left - 1.0, bottom - 1.0, width + 2.0, 1.1),
+        (left - 1.0, top - 0.1, width + 2.0, 1.1),
     ];
     for (x, y, width, height) in clips {
         let content = format!("q {x} {y} {width} {height} re W n {text} Q");
         assert_eq!(extract(&pdf(&content, &[], 0)), original);
     }
+}
+
+#[test]
+fn glyphs_whose_ink_lies_outside_the_clip_are_hidden_even_when_their_loose_box_grazes_it() {
+    // The loose box carries side bearings, ascent and descent, so a clip edge can touch
+    // it while no ink is visible. Each clip reaches 0.05 pt into the loose box only.
+    let graze = 0.05;
+    for (text, vertical) in [("A", true), (".", false)] {
+        let content = format!("BT /F1 10 Tf 10 20 Td ({text}) Tj ET");
+        let original = extract(&pdf(&content, &[], 0));
+        let glyph = original.0.iter().find(|item| item.text == text).unwrap();
+        let ((ink_left, ink_right, ink_bottom, ink_top), (left, right, bottom, top)) =
+            glyph_boxes(glyph);
+        let (width, height) = (right - left, top - bottom);
+        let clips = if vertical {
+            // "A" stands on the baseline and stops below the ascent.
+            assert!(ink_bottom > bottom + 1.0 && ink_top < top - 1.0);
+            [
+                (left - 1.0, bottom - 1.0, width + 2.0, 1.0 + graze),
+                (left - 1.0, top - graze, width + 2.0, 1.0 + graze),
+            ]
+        } else {
+            // "." is narrow ink in the middle of a 6 pt advance.
+            assert!(ink_left > left + 1.0 && ink_right < right - 1.0);
+            [
+                (left - 1.0, bottom - 1.0, 1.0 + graze, height + 2.0),
+                (right - graze, bottom - 1.0, 1.0 + graze, height + 2.0),
+            ]
+        };
+        for (x, y, width, height) in clips {
+            let content = format!("q {x} {y} {width} {height} re W n {content} Q");
+            assert_text(&pdf(&content, &[], 0), "");
+        }
+    }
+}
+
+#[test]
+fn ink_just_outside_the_clip_is_kept_within_a_small_share_of_the_em() {
+    // PDFium's ink box can understate the painted outline by about 1% of the font
+    // size, so a clip edge 0.1 pt past the ink of a 10 pt glyph still shows it.
+    let text = "BT /F1 10 Tf 10 20 Td (A) Tj ET";
+    let original = extract(&pdf(text, &[], 0));
+    let glyph = original.0.iter().find(|item| item.text == "A").unwrap();
+    let ((left, right, _, top), _) = glyph_boxes(glyph);
+    let content = format!(
+        "q {} {} {} 5 re W n {text} Q",
+        left - 1.0,
+        top + 0.1,
+        right - left + 2.0
+    );
+    assert_eq!(extract(&pdf(&content, &[], 0)), original);
+    let content = format!(
+        "q {} {} {} 5 re W n {text} Q",
+        left - 1.0,
+        top + 1.0,
+        right - left + 2.0
+    );
+    assert_text(&pdf(&content, &[], 0), "");
 }
