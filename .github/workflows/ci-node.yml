@@ -191,7 +191,13 @@ jobs:
 
       - name: Install dependencies
         working-directory: packages/node
-        run: npm install --ignore-scripts
+        shell: bash
+        # Drop the published @llamaindex/liteparse-<platform> optional deps: the
+        # loader prefers them over a local .node, so tests would otherwise run
+        # against the last release instead of the binary built from this commit.
+        run: |
+          npm install --ignore-scripts
+          rm -rf node_modules/@llamaindex/liteparse-*
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
