@@ -1433,6 +1433,22 @@ fn is_likely_garbled(text: &str) -> bool {
     vowels * 10 < letters
 }
 
+/// Precomposed Latin vowels carrying diacritics, lowercase. Without these,
+/// languages that put a mark on most vowels (Vietnamese, tone-marked pinyin)
+/// lose their vowels from the count while keeping their plain consonants, so
+/// clean text drops below the garble floor. Covers Latin-1, Latin Extended-A/B
+/// and the Vietnamese block of Latin Extended Additional.
+const ACCENTED_VOWELS: &str = "àáâãäåāăąǎȁȃȧ\
+    ạảấầẩẫậắằẳẵặ\
+    èéêëēĕėęěȅȇ\
+    ẹẻẽếềểễệ\
+    ìíîïĩīĭįǐȉȋ\
+    ỉị\
+    òóôõöøōŏőǒȍȏȯ\
+    ọỏốồổỗộơớờởỡợ\
+    ùúûüũūŭůűųǔǖǘǚǜȕȗ\
+    ụủưứừửữự";
+
 fn count_letters_and_vowels(text: &str) -> (usize, usize) {
     let mut letters = 0usize;
     let mut vowels = 0usize;
@@ -1442,6 +1458,9 @@ fn count_letters_and_vowels(text: &str) -> (usize, usize) {
             if matches!(ch.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u') {
                 vowels += 1;
             }
+        } else if !ch.is_ascii() && ch.to_lowercase().any(|c| ACCENTED_VOWELS.contains(c)) {
+            letters += 1;
+            vowels += 1;
         }
     }
     (letters, vowels)
@@ -2276,6 +2295,48 @@ mod tests {
         "All names, identifiers, quantities, and dates are fabricated.",
         "A PDF viewer still renders both sections as readable text.",
     ];
+
+    /// Clean Vietnamese: most vowels carry a diacritic. Counting ASCII letters
+    /// only, this paragraph's vowel ratio is ~0.18 and the page was flagged
+    /// garbled although the text layer is intact.
+    const VIETNAMESE_PARAGRAPH: &[&str] = &[
+        "Trường học tổ chức buổi họp phụ huynh vào sáng thứ bảy tuần trước.",
+        "Những người tham dự đã thảo luận về chương trình học kỳ mới.",
+        "Thầy hiệu trưởng nhấn mạnh việc rèn luyện thể chất cho học sinh.",
+        "Cuối buổi, phụ huynh được nhận tài liệu hướng dẫn chi tiết.",
+    ];
+
+    /// Tone-marked Hanyu pinyin: same failure mode, more severe.
+    const PINYIN_PARAGRAPH: &[&str] = &[
+        "Rénrén shēng ér zìyóu, zài zūnyán hé quánlì shàng yīlǜ píngděng.",
+        "Tāmen fùyǒu lǐxìng hé liángxīn, bìng yīng yǐ xiōngdì guānxì de jīngshén xiāng duìdài.",
+    ];
+
+    #[test]
+    fn test_accented_vowels_are_not_garbled() {
+        for para in [VIETNAMESE_PARAGRAPH, PINYIN_PARAGRAPH] {
+            let items: Vec<(&str, &str)> = para.iter().map(|t| ("ArialUnicodeMS", *t)).collect();
+            let page = make_font_page(&items);
+            assert!(
+                matches!(garbled_scope(&page), GarbledScope::None),
+                "{:?}",
+                para[0]
+            );
+            assert!(!page_is_garbled(&page));
+        }
+    }
+
+    #[test]
+    fn test_count_letters_and_vowels_accented() {
+        // NFC and NFD spellings of the same word count the same.
+        assert_eq!(count_letters_and_vowels("trường"), (6, 2));
+        assert_eq!(
+            count_letters_and_vowels("tru\u{031b}o\u{031b}\u{0300}ng"),
+            (6, 2)
+        );
+        // Non-Latin scripts still contribute nothing.
+        assert_eq!(count_letters_and_vowels("مرحبا こんにちは"), (0, 0));
+    }
 
     #[test]
     fn test_garbled_scope_clean_page() {
