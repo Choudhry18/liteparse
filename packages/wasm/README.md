@@ -61,7 +61,7 @@ All optional, camelCase:
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `ocrLanguage` | `string` | `"eng"` | Language code passed to the OCR engine |
-| `ocrEnabled` | `boolean` | `true` | Run OCR on text-sparse pages |
+| `ocrEnabled` | `boolean` | `false` | Run OCR on text-sparse pages |
 | `maxPages` | `number` | `1000` | Stop after this many pages |
 | `targetPages` | `string` | — | e.g. `"1-5,10,15-20"` |
 | `extractScreenshots` | `boolean` | `false` | Return parsed pages as PNG bytes on `result.screenshots` |
@@ -79,7 +79,9 @@ All optional, camelCase:
 
 ## OCR in the browser
 
-The native HTTP-OCR and Tesseract backends are not available in the browser. To use OCR, pass an object with a `recognize` method:
+The native HTTP-OCR and Tesseract backends are not available in the browser.
+To use OCR, set `ocrEnabled: true` and supply an `ocrEngine` object with a
+`recognize` method. Supplying `ocrEngine` alone does not enable OCR.
 
 ```ts
 const parser = new LiteParse({
