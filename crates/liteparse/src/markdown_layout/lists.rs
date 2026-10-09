@@ -11,7 +11,13 @@ pub(super) const LIST_INDENT_STEP_PT: f32 = 12.0;
 /// `\u{f0b7}` is the Symbol-font bullet (0xB7) that Word/Adobe emit into the
 /// Private Use Area; it isn't remapped to `•` during extraction, so recognize
 /// it here rather than let it read as an undecodable label.
-const BULLET_CHARS: &[char] = &['•', '·', '◦', '▪', '▸', '▶', '●', '○', '■', '□', '\u{f0b7}'];
+/// `-`, `–` (en dash), `—` (em dash) cover dash bullets (LNCS style uses en
+/// dashes; PDFium normalizes them to `-`): a line starting with a dash
+/// followed by whitespace is a Markdown bullet, not prose (#488). A bare
+/// hyphen without trailing space (e.g. `-5`, hyphenated words) does not match.
+const BULLET_CHARS: &[char] = &[
+    '•', '·', '◦', '▪', '▸', '▶', '●', '○', '■', '□', '\u{f0b7}', '-', '–', '—',
+];
 
 /// Detect a list marker at the start of `text`. Returns `(ordered, marker_str,
 /// remainder)` when matched; otherwise `None`.
@@ -316,6 +322,21 @@ mod tests {
         assert!(!ordered);
         assert_eq!(marker, "•");
         assert_eq!(rest, "item one");
+    }
+
+    #[test]
+    fn parse_list_marker_dash_bullets() {
+        // #488: LNCS-style en-dash bullets arrive from PDFium as `-`.
+        for dash in ["- We pioneer", "– We pioneer", "— We pioneer"] {
+            let (ordered, marker, rest) = parse_list_marker(dash).unwrap();
+            assert!(!ordered, "{dash:?} must be unordered");
+            assert_eq!(rest, "We pioneer");
+            assert!(!marker.is_empty());
+        }
+        // A hyphen without trailing space is not a bullet (negative numbers,
+        // hyphenated words).
+        assert!(parse_list_marker("-5").is_none());
+        assert!(parse_list_marker("-foo").is_none());
     }
 
     #[test]
