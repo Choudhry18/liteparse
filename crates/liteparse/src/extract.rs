@@ -2751,6 +2751,7 @@ impl ObjMetaCache {
 /// char-info records (`FPDF_CHARINFO_LP::char_type`).
 const CHAR_TYPE_GENERATED: i32 = 1;
 const CHAR_TYPE_NOT_UNICODE: i32 = 2;
+const CHAR_TYPE_HYPHEN: i32 = 3;
 
 /// Records per `FPDFText_GetCharInfoBatch` call (80 bytes each → ~1.3 MB).
 const CHAR_INFO_CHUNK: usize = 16 * 1024;
@@ -2828,6 +2829,13 @@ impl CharView<'_, '_> {
         match &self.rec {
             Some(rec) => rec.char_type == CHAR_TYPE_NOT_UNICODE,
             None => self.ch.has_unicode_map_error(),
+        }
+    }
+
+    pub(crate) fn is_hyphen(&self) -> bool {
+        match &self.rec {
+            Some(rec) => rec.char_type == CHAR_TYPE_HYPHEN,
+            None => self.ch.is_hyphen(),
         }
     }
 

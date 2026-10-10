@@ -1464,6 +1464,22 @@ fn is_likely_garbled(text: &str) -> bool {
     vowels * 10 < letters
 }
 
+/// Precomposed Latin vowels carrying diacritics, lowercase. Without these,
+/// languages that put a mark on most vowels (Vietnamese, tone-marked pinyin)
+/// lose their vowels from the count while keeping their plain consonants, so
+/// clean text drops below the garble floor. Covers Latin-1, Latin Extended-A/B
+/// and the Vietnamese block of Latin Extended Additional.
+const ACCENTED_VOWELS: &str = "àáâãäåāăąǎȁȃȧ\
+    ạảấầẩẫậắằẳẵặ\
+    èéêëēĕėęěȅȇ\
+    ẹẻẽếềểễệ\
+    ìíîïĩīĭįǐȉȋ\
+    ỉị\
+    òóôõöøōŏőǒȍȏȯ\
+    ọỏốồổỗộơớờởỡợ\
+    ùúûüũūŭůűųǔǖǘǚǜȕȗ\
+    ụủưứừửữự";
+
 fn count_letters_and_vowels(text: &str) -> (usize, usize) {
     let mut letters = 0usize;
     let mut vowels = 0usize;
@@ -1473,6 +1489,9 @@ fn count_letters_and_vowels(text: &str) -> (usize, usize) {
             if matches!(ch.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u') {
                 vowels += 1;
             }
+        } else if !ch.is_ascii() && ch.to_lowercase().any(|c| ACCENTED_VOWELS.contains(c)) {
+            letters += 1;
+            vowels += 1;
         }
     }
     (letters, vowels)
@@ -1668,9 +1687,14 @@ fn box_center_in(rect: &Rect, x: f32, y: f32, w: f32, h: f32) -> bool {
 }
 
 /// A chart label: a number (with separators/units) or a token of ≤ 3 chars.
+///
+/// The length rule only applies to text without CJK characters. Tesseract
+/// splits Chinese, Japanese and Korean text into words of one to three
+/// characters ("を", "変換", "します"), so in those scripts a short token is
+/// ordinary prose, not an axis tick or legend key.
 fn is_chart_label(text: &str) -> bool {
     let t = text.trim();
-    if t.chars().count() <= 3 {
+    if t.chars().count() <= 3 && !t.chars().any(is_cjk) {
         return true;
     }
     t.chars().any(|c| c.is_ascii_digit())
@@ -1681,6 +1705,21 @@ fn is_chart_label(text: &str) -> bool {
                     ',' | '.' | '%' | '-' | '+' | '$' | '€' | '£' | ' ' | 'k' | 'K' | 'M' | 'x'
                 )
         })
+}
+
+/// Han ideographs, kana and Hangul: scripts written without spaces between
+/// words, or with short syllable blocks, where OCR words are naturally short.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{1100}'..='\u{11FF}'   // Hangul Jamo
+        | '\u{3040}'..='\u{30FF}' // Hiragana, Katakana
+        | '\u{3130}'..='\u{318F}' // Hangul Compatibility Jamo
+        | '\u{3400}'..='\u{4DBF}' // CJK Unified Ideographs Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{FF66}'..='\u{FF9F}' // Halfwidth Katakana
+    )
 }
 
 /// For each figure rect, whether its OCR results look like a chart's
@@ -1803,6 +1842,12 @@ mod tests {
         assert!(is_chart_label("Yr"));
         assert!(!is_chart_label("Year"));
         assert!(!is_chart_label("Fruit Production in British Columbia"));
+        // Short CJK words are prose, not chart labels.
+        assert!(!is_chart_label("を"));
+        assert!(!is_chart_label("変換"));
+        assert!(!is_chart_label("します"));
+        assert!(!is_chart_label("中文"));
+        assert!(!is_chart_label("한국"));
 
         let rect = Rect {
             x: 50.0,
@@ -1833,6 +1878,19 @@ mod tests {
             mk("2020", 100.0, 240.0),
         ];
         assert_eq!(chart_like_images(&[rect.clone()], &prose, 1.0), vec![false]);
+        // Japanese prose, which OCR returns as one- to three-character words:
+        // not a chart.
+        let japanese = vec![
+            mk("文書", 60.0, 110.0),
+            mk("を", 80.0, 110.0),
+            mk("変換", 100.0, 110.0),
+            mk("します", 120.0, 110.0),
+            mk("。", 140.0, 110.0),
+        ];
+        assert_eq!(
+            chart_like_images(&[rect.clone()], &japanese, 1.0),
+            vec![false]
+        );
         // Too few results to judge.
         assert_eq!(chart_like_images(&[rect], &chart[..3], 1.0), vec![false]);
     }
@@ -2268,6 +2326,48 @@ mod tests {
         "All names, identifiers, quantities, and dates are fabricated.",
         "A PDF viewer still renders both sections as readable text.",
     ];
+
+    /// Clean Vietnamese: most vowels carry a diacritic. Counting ASCII letters
+    /// only, this paragraph's vowel ratio is ~0.18 and the page was flagged
+    /// garbled although the text layer is intact.
+    const VIETNAMESE_PARAGRAPH: &[&str] = &[
+        "Trường học tổ chức buổi họp phụ huynh vào sáng thứ bảy tuần trước.",
+        "Những người tham dự đã thảo luận về chương trình học kỳ mới.",
+        "Thầy hiệu trưởng nhấn mạnh việc rèn luyện thể chất cho học sinh.",
+        "Cuối buổi, phụ huynh được nhận tài liệu hướng dẫn chi tiết.",
+    ];
+
+    /// Tone-marked Hanyu pinyin: same failure mode, more severe.
+    const PINYIN_PARAGRAPH: &[&str] = &[
+        "Rénrén shēng ér zìyóu, zài zūnyán hé quánlì shàng yīlǜ píngděng.",
+        "Tāmen fùyǒu lǐxìng hé liángxīn, bìng yīng yǐ xiōngdì guānxì de jīngshén xiāng duìdài.",
+    ];
+
+    #[test]
+    fn test_accented_vowels_are_not_garbled() {
+        for para in [VIETNAMESE_PARAGRAPH, PINYIN_PARAGRAPH] {
+            let items: Vec<(&str, &str)> = para.iter().map(|t| ("ArialUnicodeMS", *t)).collect();
+            let page = make_font_page(&items);
+            assert!(
+                matches!(garbled_scope(&page), GarbledScope::None),
+                "{:?}",
+                para[0]
+            );
+            assert!(!page_is_garbled(&page));
+        }
+    }
+
+    #[test]
+    fn test_count_letters_and_vowels_accented() {
+        // NFC and NFD spellings of the same word count the same.
+        assert_eq!(count_letters_and_vowels("trường"), (6, 2));
+        assert_eq!(
+            count_letters_and_vowels("tru\u{031b}o\u{031b}\u{0300}ng"),
+            (6, 2)
+        );
+        // Non-Latin scripts still contribute nothing.
+        assert_eq!(count_letters_and_vowels("مرحبا こんにちは"), (0, 0));
+    }
 
     #[test]
     fn test_garbled_scope_clean_page() {
