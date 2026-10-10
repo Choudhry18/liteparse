@@ -550,12 +550,11 @@ class LiteParse:
                 the rendered Markdown.
             extract_structure_tree: Include the tagged-PDF logical structure
                 tree as page-scoped structured data (default: False).
-            ocr_failure_fatal: Whether an OCR failure on a page with insufficient
-                native text stops parsing. Default True: report the error instead
-                of silently returning a page with missing OCR text.
-                Set False to return partial results and keep the available native
-                text, for example when the application has its own OCR fallback.
-                Other parsing errors can still stop parsing.
+            ocr_failure_fatal: Whether a systemic OCR failure (every OCR task
+                failed and at least one was a text-sparse page) aborts the whole
+                parse (default: True). Set False to keep already-recovered native
+                text and return partial results instead of raising — for callers
+                that prefer a degraded document over a hard failure.
             ocr_hedge_delays_ms: Request-hedging schedule for HTTP OCR, in
                 milliseconds. Empty or single-element means no hedging (one
                 request per attempt — the default). With multiple delays (e.g.

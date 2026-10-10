@@ -289,36 +289,6 @@
         groupedParser.free();
       }
 
-      status.textContent = "testing a ready failure before refill";
-      const releaseReadyPair = deferred();
-      let readyPairCalls = 0;
-      const readyFailureParser = new LiteParse({
-        ocrEnabled: true, dpi: 72, quiet: true, numWorkers: 2, ocrFailureFatal: true,
-        ocrEngine: {
-          async recognize(_imageData, width) {
-            readyPairCalls += 1;
-            if (readyPairCalls === 2) releaseReadyPair.resolve();
-            await withDeadline(releaseReadyPair.promise, "The first two OCR pages did not start");
-            if (width === 73) throw new Error("READY_OCR_FAILURE");
-            return [{text: `READY_${width}`, bbox: [4, 4, width - 4, 24], confidence: 0.99}];
-          },
-        },
-      });
-      try {
-        let failure;
-        try {
-          await readyFailureParser.parse(buildTestPdf(4));
-        } catch (error) {
-          failure = String(error);
-        }
-        if (!failure?.includes("READY_OCR_FAILURE") || readyPairCalls !== 2) {
-          throw new Error(`A ready failure must stop refill: calls=${readyPairCalls}, error=${failure}`);
-        }
-      } finally {
-        releaseReadyPair.resolve();
-        readyFailureParser.free();
-      }
-
       status.textContent = "testing more workers than pages";
       const allPagesStarted = deferred();
       let largePoolCalls = 0;
@@ -390,84 +360,51 @@
       }
 
       status.textContent = "testing OCR failure policy";
+      // `ocrFailureFatal` only rejects when every OCR call failed. One failed
+      // page among successes never rejects, in either mode.
       let failureCases = 0;
       for (const numWorkers of [1, 2]) {
         for (const fatal of [true, false]) {
-          const secondStarted = deferred();
-          const thirdStarted = deferred();
-          const failed = deferred();
-          const releaseThird = deferred();
-          const thirdFinished = deferred();
-          const calls = [];
-          let thirdActive = false;
-          const failureParser = new LiteParse({
-            ocrEnabled: true, dpi: 72, quiet: true, outputFormat: "text",
-            numWorkers, ocrFailureFatal: fatal,
-            ocrEngine: {
-              async recognize(_imageData, width) {
-                calls.push(width);
-                if (width === 72 && numWorkers === 2) {
-                  await secondStarted.promise;
-                }
-                if (width === 73) {
-                  secondStarted.resolve();
-                  if (numWorkers === 2) await thirdStarted.promise;
-                  failed.resolve();
-                  throw new Error("EXPECTED_OCR_PAGE_FAILURE");
-                }
-                if (width === 74) {
-                  thirdActive = true;
-                  thirdStarted.resolve();
-                  try {
-                    await releaseThird.promise;
-                  } finally {
-                    thirdActive = false;
-                    thirdFinished.resolve();
-                  }
-                }
-                return [{
-                  text: `OCR_SUCCESS_${width}`,
-                  bbox: [4, 4, width - 4, 24], confidence: 0.99,
-                }];
+          for (const failAll of [false, true]) {
+            const failureParser = new LiteParse({
+              ocrEnabled: true, dpi: 72, quiet: true, outputFormat: "text",
+              numWorkers, ocrFailureFatal: fatal,
+              ocrEngine: {
+                async recognize(_imageData, width) {
+                  if (failAll || width === 73) throw new Error("EXPECTED_OCR_PAGE_FAILURE");
+                  return [{
+                    text: `OCR_SUCCESS_${width}`,
+                    bbox: [4, 4, width - 4, 24], confidence: 0.99,
+                  }];
+                },
               },
-            },
-          });
-          const settled = failureParser.parse(buildTestPdf(3)).then(
-            (result) => ({ result }), (error) => ({ error }),
-          );
-          try {
-            await withDeadline(failed.promise, "The failing OCR page did not start");
-            if (!fatal) releaseThird.resolve();
-            const outcome = await withDeadline(settled, "OCR failure policy did not settle parse()");
-            if (fatal) {
-              if (!String(outcome.error).includes("EXPECTED_OCR_PAGE_FAILURE")) {
-                throw new Error(`Expected a fatal OCR error with ${numWorkers} worker(s)`);
+            });
+            try {
+              const outcome = await withDeadline(
+                failureParser.parse(buildTestPdf(3)).then(
+                  (result) => ({ result }), (error) => ({ error }),
+                ),
+                "OCR failure policy did not settle parse()",
+              );
+              const label = `numWorkers=${numWorkers} fatal=${fatal} failAll=${failAll}`;
+              if (failAll && fatal) {
+                if (!String(outcome.error).includes("EXPECTED_OCR_PAGE_FAILURE")) {
+                  throw new Error(`Expected a fatal OCR error (${label})`);
+                }
+              } else {
+                if (outcome.error) throw new Error(`Unexpected rejection (${label}): ${outcome.error}`);
+                const pages = outcome.result.pages;
+                if (pages.length !== 3) throw new Error(`Expected 3 pages (${label})`);
+                if (!failAll && (!pages[0].text.includes("OCR_SUCCESS_72") ||
+                    pages[1].text.trim() !== "" || !pages[2].text.includes("OCR_SUCCESS_74"))) {
+                  throw new Error(`Partial OCR failure did not preserve successful pages (${label})`);
+                }
               }
-              if (numWorkers === 1 && calls.join(",") !== "72,73") {
-                throw new Error("Serial OCR started another page after a fatal error");
-              }
-              if (numWorkers === 2 && !thirdActive) {
-                throw new Error("Fatal OCR did not reject while another call was active");
-              }
-            } else {
-              if (outcome.error) throw outcome.error;
-              const pages = outcome.result.pages;
-              if (pages.length !== 3 || !pages[0].text.includes("OCR_SUCCESS_72") ||
-                  pages[1].text.trim() !== "" || !pages[2].text.includes("OCR_SUCCESS_74")) {
-                throw new Error("Nonfatal OCR did not preserve successful pages");
-              }
+            } finally {
+              failureParser.free();
             }
-          } finally {
-            secondStarted.resolve();
-            thirdStarted.resolve();
-            releaseThird.resolve();
-            await withDeadline(settled, "OCR cleanup did not settle parse()");
-            if (calls.includes(74)) {
-              await withDeadline(thirdFinished.promise, "The active OCR call did not finish");
-            }
-            failureParser.free();
+            failureCases += 1;
           }
-          failureCases += 1;
         }
       }
 
@@ -479,7 +416,7 @@
       resultEl.setAttribute("data-ocr-bytes", ocrByteLength);
       resultEl.setAttribute("data-ocr-max-concurrency", maxActiveOcrCalls);
       resultEl.setAttribute("data-ocr-failure-cases", failureCases);
-      resultEl.textContent = `OK: ${pageCount} pages, ${textLength} chars, OCR callback, concurrency, worker limits, grouped completion, ready failure, native text refill, and ${failureCases} failure cases passed`;
+      resultEl.textContent = `OK: ${pageCount} pages, ${textLength} chars, OCR callback, concurrency, worker limits, grouped completion, native text refill, and ${failureCases} failure cases passed`;
     } catch (err) {
       status.textContent = "error";
       errorEl.style.display = "block";

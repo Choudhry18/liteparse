@@ -105,12 +105,9 @@ export interface JsLiteParseConfig {
    */
   renderFormFields?: boolean
   /**
-   * Whether an OCR failure on a page with insufficient native text
-   * stops parsing. Default `true`: report the error instead of silently
-   * returning a page with missing OCR text.
-   * Set `false` to return partial results and keep the available native
-   * text, for example when the application has its own OCR fallback.
-   * Other parsing errors can still stop parsing.
+   * Whether a systemic OCR failure aborts the whole parse (default true).
+   * Set false to keep already-recovered native text and return partial
+   * results when OCR is unavailable, instead of rejecting.
    */
   ocrFailureFatal?: boolean
   /**

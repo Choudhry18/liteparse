@@ -1290,17 +1290,14 @@ async fn test_orientation_correction_rejects_non_cardinal_angle() {
     }
 }
 
-struct PartialFailureEngine {
-    first_started: tokio::sync::Notify,
-    failed: tokio::sync::Notify,
-    release_first: tokio::sync::Notify,
-    first_finished: tokio::sync::Notify,
-    calls: std::sync::Mutex<Vec<u32>>,
+/// Fails recognition for the listed raster widths; succeeds otherwise.
+struct FailingWidthsEngine {
+    fail: Vec<u32>,
 }
 
-impl liteparse::ocr::OcrEngine for PartialFailureEngine {
+impl liteparse::ocr::OcrEngine for FailingWidthsEngine {
     fn name(&self) -> &str {
-        "partial-failure"
+        "failing-widths"
     }
     fn recognize<'a, 'b: 'a, 'c: 'a>(
         &'a self,
@@ -1320,15 +1317,8 @@ impl liteparse::ocr::OcrEngine for PartialFailureEngine {
         >,
     > {
         Box::pin(async move {
-            self.calls.lock().unwrap().push(width);
-            if width == 200 {
-                self.first_started.notify_one();
-                self.release_first.notified().await;
-                self.first_finished.notify_one();
-            } else if width == 201 {
-                self.first_started.notified().await;
-                self.failed.notify_one();
-                return Err("EXPECTED_PARTIAL_OCR_FAILURE".into());
+            if self.fail.contains(&width) {
+                return Err("EXPECTED_OCR_FAILURE".into());
             }
             Ok(vec![liteparse::ocr::OcrResult {
                 text: format!("SUCCESS_{width}"),
@@ -1340,72 +1330,59 @@ impl liteparse::ocr::OcrEngine for PartialFailureEngine {
     }
 }
 
+async fn parse_with_failing_widths(
+    fail: &[u32],
+    fatal: bool,
+) -> Result<liteparse::ParseResult, liteparse::LiteParseError> {
+    LiteParse::new(LiteParseConfig {
+        ocr_enabled: true,
+        num_workers: 2,
+        dpi: 72.0,
+        quiet: true,
+        ocr_failure_fatal: fatal,
+        ..Default::default()
+    })
+    .with_ocr_engine(std::sync::Arc::new(FailingWidthsEngine {
+        fail: fail.to_vec(),
+    }))
+    .parse_input(PdfInput::Bytes(blank_pdf(&[
+        (200, 200),
+        (201, 200),
+        (202, 200),
+    ])))
+    .await
+}
+
+// `ocr_failure_fatal` only aborts when *every* OCR task failed. One failed
+// page among successes must never abort the parse, regardless of the setting
+// or of the order in which concurrent recognitions complete.
 #[tokio::test]
 #[serial]
-async fn test_ocr_partial_failure_policy_with_active_job() {
-    use std::{sync::Arc, time::Duration};
+async fn test_ocr_partial_failure_is_never_fatal() {
     for fatal in [true, false] {
-        let engine = Arc::new(PartialFailureEngine {
-            first_started: tokio::sync::Notify::new(),
-            failed: tokio::sync::Notify::new(),
-            release_first: tokio::sync::Notify::new(),
-            first_finished: tokio::sync::Notify::new(),
-            calls: std::sync::Mutex::new(Vec::new()),
-        });
-        let parser = LiteParse::new(LiteParseConfig {
-            ocr_enabled: true,
-            num_workers: 2,
-            dpi: 72.0,
-            quiet: true,
-            ocr_failure_fatal: fatal,
-            ..Default::default()
-        })
-        .with_ocr_engine(engine.clone());
-        let parse = tokio::spawn(async move {
-            parser
-                .parse_input(PdfInput::Bytes(blank_pdf(&[
-                    (200, 200),
-                    (201, 200),
-                    (202, 200),
-                ])))
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(5), engine.failed.notified())
+        let result = parse_with_failing_widths(&[201], fatal)
             .await
-            .unwrap();
-        if !fatal {
-            engine.release_first.notify_one();
-        }
-        let result = tokio::time::timeout(Duration::from_secs(5), parse).await;
-        // Release the blocking job even if the assertion below fails.
-        engine.release_first.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), engine.first_finished.notified())
-            .await
-            .unwrap();
-        let result = result
-            .expect(if fatal {
-                "fatal OCR failure must return before the blocked job is released"
-            } else {
-                "nonfatal parsing must finish after the blocked job is released"
-            })
-            .unwrap();
-        if fatal {
-            assert!(
-                result
-                    .err()
-                    .expect("parse must fail")
-                    .to_string()
-                    .contains("EXPECTED_PARTIAL_OCR_FAILURE")
-            );
-            assert!(!engine.calls.lock().unwrap().contains(&202));
-        } else {
-            let result = result.unwrap();
-            assert_eq!(result.pages.len(), 3);
-            assert!(result.pages[0].text.contains("SUCCESS_200"));
-            assert!(result.pages[1].text.trim().is_empty());
-            assert!(result.pages[2].text.contains("SUCCESS_202"));
-        }
+            .unwrap_or_else(|e| panic!("fatal={fatal}: one failed page aborted the parse: {e}"));
+        assert_eq!(result.pages.len(), 3);
+        assert!(result.pages[0].text.contains("SUCCESS_200"));
+        assert!(result.pages[1].text.trim().is_empty());
+        assert!(result.pages[2].text.contains("SUCCESS_202"));
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_ocr_systemic_failure_respects_fatal_flag() {
+    let all = [200, 201, 202];
+    match parse_with_failing_widths(&all, true).await {
+        Err(err) => assert!(err.to_string().contains("EXPECTED_OCR_FAILURE")),
+        Ok(_) => panic!("every page failing OCR must abort when fatal"),
+    }
+
+    let result = parse_with_failing_widths(&all, false)
+        .await
+        .expect("non-fatal mode must return partial results");
+    assert_eq!(result.pages.len(), 3);
 }
 
 async fn diagonal_column_count(config: LiteParseConfig) -> usize {

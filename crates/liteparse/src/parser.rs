@@ -798,32 +798,12 @@ impl LiteParse {
             let render_options = ocr_render_options;
             let ocr_input = repaired_input.as_ref().unwrap_or(validated_input);
             let mut scan_start = 0usize;
-            let page_indices: std::collections::HashMap<_, _> = pages
-                .iter()
-                .enumerate()
-                .map(|(index, page)| (page.page_number, index))
-                .collect();
             let mut ocr_tasks =
                 stages::OcrWindow::new(engine, &self.config.ocr_language, self.config.num_workers);
             loop {
+                // Reap completions before deciding whether to render so every
+                // available slot can be refilled immediately.
                 ocr_tasks.complete_ready();
-                // Merge completed results before rendering more pages. If
-                // `ocr_failure_fatal` requires parsing to stop, return before
-                // starting more work. Otherwise, refill the available slots.
-                for outcome in ocr_tasks.take_completed() {
-                    let index = *page_indices.get(&outcome.page_number).ok_or_else(|| {
-                        LiteParseError::Other(format!(
-                            "No page for OCR outcome {}",
-                            outcome.page_number
-                        ))
-                    })?;
-                    stages::merge_ocr(
-                        std::slice::from_mut(&mut pages[index]),
-                        vec![outcome],
-                        self.config.ocr_failure_fatal,
-                        self.config.effective_emit_word_boxes(),
-                    )?;
-                }
 
                 if scan_start >= pages.len() || ocr_tasks.available_capacity() == 0 {
                     if !ocr_tasks.complete_one().await {
@@ -845,6 +825,17 @@ impl LiteParse {
                     ocr_tasks.submit(raster).await;
                 }
             }
+
+            // Merge once, after every page has been recognized:
+            // `ocr_failure_fatal` only applies when *every* OCR task failed,
+            // which can't be decided from a single page's outcome.
+            ocr_tasks
+                .finish_and_merge(
+                    &mut pages,
+                    self.config.ocr_failure_fatal,
+                    self.config.effective_emit_word_boxes(),
+                )
+                .await?;
         }
         let t_ocr = web_time::Instant::now();
         log(&format!(

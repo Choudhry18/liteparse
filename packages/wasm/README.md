@@ -115,10 +115,10 @@ concurrent HTTP requests. Results stay assigned to their source pages when
 jobs finish out of order. Active calls can keep up to `numWorkers` rendered
 page rasters in memory, so use a small value for high-DPI documents.
 
-With `ocrFailureFatal: true` (the default), an OCR failure on a page with
-insufficient native text rejects `parse()`, even if other pages succeed.
-With `ocrFailureFatal: false`, parsing continues with the available text.
-If parsing fails, OCR calls that have already started can continue.
+A failed `recognize` call only affects its own page. With `ocrFailureFatal:
+true` (the default), `parse()` rejects only when every OCR call failed and at
+least one failed page had little native text. If parsing fails, OCR calls that
+have already started can continue.
 
 ## Building from source
 
