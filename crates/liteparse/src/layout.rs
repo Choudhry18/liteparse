@@ -27,9 +27,10 @@ pub struct LayoutCell {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bbox: Option<Rect>,
-    /// Merge spans, present only on `merged_table` cells (and only when > 1).
-    /// A cell absorbed by a neighbour's span is absent from its row entirely,
-    /// matching HTML's occupancy model.
+    /// Merge spans, present only when > 1. In a `merged_table`, a cell that a
+    /// neighbour's span covers is absent from its row (the HTML model). In a
+    /// `table`, the covered cell stays in its row as an empty cell without a
+    /// box, so each row keeps one cell per column.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colspan: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,8 +168,22 @@ impl LayoutBlock {
     }
 }
 
+/// Layout cells for one table row. The row keeps one cell per column, so a
+/// consumer that ignores spans sees the same grid as before. A cell that spans
+/// columns gets `colspan`. A covered cell stays as an empty cell without a box.
 fn cells(row: &[Cell]) -> Vec<LayoutCell> {
-    row.iter().map(LayoutCell::from).collect()
+    let mut out: Vec<LayoutCell> = row.iter().map(LayoutCell::from).collect();
+    let mut head = 0;
+    for (i, cell) in row.iter().enumerate() {
+        if cell.covered && i > 0 {
+            out[i].bbox = None;
+            let span = out[head].colspan.unwrap_or(1) + 1;
+            out[head].colspan = Some(span);
+        } else {
+            head = i;
+        }
+    }
+    out
 }
 
 impl From<&PositionedBlock> for LayoutBlock {

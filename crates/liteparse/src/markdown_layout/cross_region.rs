@@ -405,6 +405,7 @@ fn try_two_col_direct(clusters: &[Cluster], merged_len: usize, tol: f32) -> Opti
                         text,
                         bbox: left_rect,
                         text_item_indices: left_items,
+                        ..Cell::default()
                     },
                     Cell::default(),
                     bold,

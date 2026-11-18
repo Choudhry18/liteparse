@@ -18,6 +18,11 @@ pub struct Cell {
     /// split across columns). May repeat; `LayoutCell` deduplicates.
     #[serde(default)]
     pub text_item_indices: Vec<usize>,
+    /// True when the cell to the left spans over this cell. A covered cell is
+    /// empty and keeps its column position, so column counts stay correct.
+    /// A renderer gives the span to the first cell that is not covered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub covered: bool,
 }
 
 impl Cell {
@@ -26,7 +31,7 @@ impl Cell {
         Cell {
             text: text.into(),
             bbox: Some(bbox),
-            text_item_indices: Vec::new(),
+            ..Cell::default()
         }
     }
 
@@ -37,6 +42,7 @@ impl Cell {
             text: text.into(),
             bbox: Some(bbox),
             text_item_indices,
+            ..Cell::default()
         }
     }
 
@@ -758,6 +764,42 @@ fn escape_html_cell(s: &str) -> String {
     out
 }
 
+/// Convert a `Block::Table` that has covered cells into `SpanCell` rows (the
+/// `Block::MergedTable` form), with the header as the first row. Each cell gets
+/// a colspan of 1 plus the number of covered cells that follow it. Returns
+/// `None` when no cell is covered, so a plain table keeps its plain form. A
+/// covered cell with no cell before it in the row stays a plain empty cell.
+fn table_span_rows(
+    header: Option<&[Cell]>,
+    rows: &[Vec<Cell>],
+) -> Option<(Vec<Vec<SpanCell>>, usize)> {
+    let all = || header.into_iter().chain(rows.iter().map(Vec::as_slice));
+    if !all().any(|row| row.iter().skip(1).any(|c| c.covered)) {
+        return None;
+    }
+    let span_rows = all()
+        .map(|row| {
+            let mut out: Vec<SpanCell> = Vec::with_capacity(row.len());
+            for cell in row {
+                if let (true, Some(head)) = (cell.covered, out.last_mut()) {
+                    head.colspan += 1;
+                    if let Some(b) = &cell.bbox {
+                        Rect::extend(&mut head.bbox, b);
+                    }
+                    continue;
+                }
+                out.push(SpanCell {
+                    bbox: cell.bbox.clone(),
+                    text_item_indices: cell.text_item_indices.clone(),
+                    ..SpanCell::new(cell.text.clone())
+                });
+            }
+            out
+        })
+        .collect();
+    Some((span_rows, usize::from(header.is_some())))
+}
+
 /// True when a merged table degenerates to a plain rectangular grid, in which
 /// case the pipe rendering is both valid and nicer to read.
 fn is_plain_grid(rows: &[Vec<SpanCell>], header_rows: usize) -> bool {
@@ -855,6 +897,10 @@ pub fn render_blocks(blocks: &[PositionedBlock]) -> String {
                 // detector found no header, promote the first body row instead
                 // of synthesizing a blank `|   |   |` header — a visible empty
                 // row reads as sloppy output and carries no information.
+                if let Some((span_rows, header_rows)) = table_span_rows(header.as_deref(), rows) {
+                    render_html_table(&span_rows, header_rows, &mut out);
+                    continue;
+                }
                 let (head, body): (Option<&[Cell]>, &[Vec<Cell>]) = match header {
                     Some(h) => (Some(h.as_slice()), rows.as_slice()),
                     None => match rows.split_first() {

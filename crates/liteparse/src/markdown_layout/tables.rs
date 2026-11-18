@@ -2520,6 +2520,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
                         text,
                         bbox: None,
                         text_item_indices: items.next().unwrap_or_default(),
+                        ..Cell::default()
                     };
                     let left = half(left);
                     let right = half(right);
@@ -3138,6 +3139,7 @@ fn union_header_from_above(
                 text: parts.join(" "),
                 bbox,
                 text_item_indices,
+                ..Cell::default()
             }
         })
         .collect();
@@ -3678,6 +3680,7 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
                     text: parts.join(" "),
                     bbox,
                     text_item_indices,
+                    ..Cell::default()
                 }
             })
             .collect();
@@ -4104,6 +4107,7 @@ impl CellGrid {
                             height: ys[r + 1] - ys[r],
                         }),
                         text_item_indices: Vec::new(),
+                        ..Cell::default()
                     })
                     .collect()
             })
@@ -4459,6 +4463,167 @@ fn should_stop_at_running_prose(
     stop
 }
 
+/// A row band counts as ruled at a column boundary when the vertical rules at
+/// that boundary cover at least this fraction of the band. A rule that ends
+/// on the row's top edge covers none of it; a dashed or inset rule covers most.
+const COLSPAN_MIN_RULE_COVERAGE: f32 = 0.2;
+
+/// True when the text of `span` flows across `boundary`: a word box covers the
+/// boundary, or the gap at the boundary is narrower than half the font height
+/// (a word space). A run that PDFium joined from two cells
+/// ("$ (32,766)   $ (16,634)") has a column gap at the boundary, so it does not
+/// flow across. Without word boxes, the span box decides.
+fn text_flows_across(span: &TextItem, boundary: f32) -> bool {
+    let Some(words) = verified_words(span) else {
+        return true;
+    };
+    let mut ranges: Vec<ProseXRange> = words
+        .into_iter()
+        .filter(|w| w.width > 0.0)
+        .map(|w| (w.x, w.x + w.width))
+        .collect();
+    ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if ranges
+        .iter()
+        .any(|&(x0, x1)| x0 < boundary && boundary < x1)
+    {
+        return true;
+    }
+    let font_height = span
+        .font_height
+        .or(span.font_size)
+        .filter(|h| h.is_finite() && *h > 0.0)
+        .unwrap_or(span.height.max(1.0));
+    ranges
+        .windows(2)
+        .find(|w| w[0].1 <= boundary && boundary <= w[1].0)
+        .is_some_and(|w| w[1].0 - w[0].1 < font_height * 0.5)
+}
+
+/// For each grid row, find the interior column boundaries that are not a cell
+/// edge in that row. `mask[r][c]` is true when column `c` joins column `c - 1`
+/// in row `r`. Index 0 is always false.
+///
+/// Two signals must agree before a boundary merges:
+///   - **No rule in the row.** No raw vertical segment at `xs[c]` covers the
+///     row band. The function reads raw segments because `cluster_v_segments`
+///     unions the y-ranges of rules at one x, which fills the gap that a
+///     spanning row leaves. The function also tests the row band, not the
+///     junction point: a rule that ends on the row's top edge touches that
+///     junction but does not go into the row.
+///   - **Text crosses the boundary.** A span in the row crosses `xs[c]` by
+///     `STRADDLE_MARGIN_PT` on each side, and its words flow across it (see
+///     `text_flows_across`). Without this signal, a table whose dividers rule
+///     only the header band merges every body row.
+///
+/// A drawn rule always wins. A span that crosses a drawn rule is a merged
+/// PDFium run, and `assign_cells` splits it as before.
+///
+/// In a row with a merge, an unruled boundary next to an empty cell also
+/// merges. Thus a spanning row whose text ends before the last column still
+/// spans the full width.
+fn colspan_mask(
+    raw_vs: &[VSeg],
+    lines: &[ProjectedLine],
+    xs: &[f32],
+    ys: &[f32],
+    dbg: bool,
+) -> Vec<Vec<bool>> {
+    const STRADDLE_MARGIN_PT: f32 = 3.0;
+    let n_rows = ys.len() - 1;
+    let n_cols = xs.len() - 1;
+    let mut mask = vec![vec![false; n_cols]; n_rows];
+    if n_cols < 2 {
+        return mask;
+    }
+    let mut crosses = vec![vec![false; n_cols]; n_rows];
+    let mut occupied = vec![vec![false; n_cols]; n_rows];
+    for span in lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .filter(|s| !s.text.trim().is_empty())
+    {
+        let cy = span.y + span.height * 0.5;
+        if cy < ys[0] || cy > ys[n_rows] {
+            continue;
+        }
+        let Some(r) = find_bucket(ys, cy) else {
+            continue;
+        };
+        let (x0, x1) = (
+            span.x + STRADDLE_MARGIN_PT,
+            span.x + span.width - STRADDLE_MARGIN_PT,
+        );
+        for c in 0..n_cols {
+            if x0 < xs[c + 1] && x1 > xs[c] {
+                occupied[r][c] = true;
+            }
+            if c > 0 && x0 < xs[c] && x1 > xs[c] && text_flows_across(span, xs[c]) {
+                crosses[r][c] = true;
+            }
+        }
+    }
+    // Most grids have no text that crosses a boundary. Stop before the rule
+    // lookup, because `raw_vs` holds every vertical stroke on the page.
+    if !crosses.iter().flatten().any(|c| *c) {
+        return mask;
+    }
+    // Put each vertical segment in the bucket of its nearest interior
+    // boundary, in one pass. Segments outside the grid's height are skipped.
+    let mut rules_at: Vec<Vec<(f32, f32)>> = vec![Vec::new(); n_cols];
+    for v in raw_vs {
+        if v.y_max < ys[0] || v.y_min > ys[n_rows] {
+            continue;
+        }
+        let i = xs.partition_point(|&x| x < v.x);
+        let nearest = [i.saturating_sub(1), i]
+            .into_iter()
+            .filter(|&c| (1..n_cols).contains(&c))
+            .min_by(|&a, &b| (xs[a] - v.x).abs().total_cmp(&(xs[b] - v.x).abs()));
+        if let Some(c) = nearest
+            && (xs[c] - v.x).abs() <= TABLE_COL_BOUNDARY_CLUSTER_PT
+        {
+            rules_at[c].push((v.y_min, v.y_max));
+        }
+    }
+    let tol = TABLE_CROSS_TOLERANCE_PT;
+    let ruled = |r: usize, c: usize| {
+        let (lo, hi) = (ys[r] + tol, ys[r + 1] - tol);
+        let band = (hi - lo).max(1.0);
+        let covered: f32 = rules_at[c]
+            .iter()
+            .map(|&(y_min, y_max)| (y_max.min(hi) - y_min.max(lo)).max(0.0))
+            .sum();
+        covered >= band * COLSPAN_MIN_RULE_COVERAGE
+    };
+    for r in 0..n_rows {
+        if !crosses[r].iter().any(|c| *c) {
+            continue;
+        }
+        let unruled: Vec<bool> = (0..n_cols).map(|c| c > 0 && !ruled(r, c)).collect();
+        for c in 1..n_cols {
+            mask[r][c] = unruled[c] && crosses[r][c];
+        }
+        if !mask[r].iter().any(|m| *m) {
+            continue;
+        }
+        for c in 1..n_cols {
+            if unruled[c] && (!occupied[r][c - 1] || !occupied[r][c]) {
+                mask[r][c] = true;
+            }
+        }
+        if dbg {
+            let joins: Vec<f32> = (1..n_cols).filter(|&c| mask[r][c]).map(|c| xs[c]).collect();
+            eprintln!(
+                "[ruled]   colspan row {r} y={:.0}..{:.0}: merge across x={joins:?}",
+                ys[r],
+                ys[r + 1]
+            );
+        }
+    }
+    mask
+}
+
 /// Bin each line's text into the grid cells defined by column boundaries `xs`
 /// and row boundaries `ys`. A projected line frequently spans several ruled
 /// columns (one baseline = one line), so binning whole lines by centroid would
@@ -4474,12 +4639,23 @@ fn assign_cells(
     lines: &[ProjectedLine],
     xs: &[f32],
     ys: &[f32],
+    merged: &[Vec<bool>],
     stop_at_running_prose: bool,
     dbg: bool,
 ) -> Option<(CellGrid, Vec<usize>)> {
     let n_rows = ys.len() - 1;
     let n_cols = xs.len() - 1;
     let mut grid = CellGrid::new(n_rows, n_cols, xs, ys);
+    // The first column of the merged group that holds column `col` in row
+    // `row`. See `colspan_mask`. An empty `merged` means no merges.
+    let head = |row: usize, col: usize| {
+        let joins_left = |c: usize| merged.get(row).and_then(|m| m.get(c)).copied() == Some(true);
+        let mut c = col;
+        while c > 0 && joins_left(c) {
+            c -= 1;
+        }
+        c
+    };
     let mut consumed_indices: Vec<usize> = Vec::new();
     const GRID_X_SLACK_PT: f32 = 6.0;
     // Straddle census: spans that cross an interior column boundary by a
@@ -4625,6 +4801,7 @@ fn assign_cells(
             // No raw text spans (synthetic/OCR lines): old whole-line centroid path.
             let cx = line.bbox.x + line.bbox.width * 0.5;
             if let Some(col) = find_bucket(xs, cx.clamp(xs[0], xs[n_cols])) {
+                let col = head(row, col);
                 let items = line_items_in_reading_order(line);
                 grid.push_text(row, col, &line.text, &items);
                 grid.push_repl(row, col, &line.text, &items);
@@ -4654,11 +4831,22 @@ fn assign_cells(
                     span_straddle += 1;
                 }
             }
-            if c_lo == c_hi {
-                grid.push_text(row, c_lo, &span.text, items);
-                grid.push_repl(row, c_lo, &span.text, items);
+            // A span inside one merged group goes whole into the group's first
+            // cell. The rules say that there is no cell edge to split it at.
+            // `repl` and `row_alpha_spanner` still see every column that the
+            // span covers, so `flatten_header_band` folds a spanning header row
+            // the same way as before.
+            if head(row, c_lo) == head(row, c_hi) {
+                let col = head(row, c_lo);
+                grid.push_text(row, col, &span.text, items);
+                for c in c_lo..=c_hi {
+                    grid.push_repl(row, c, &span.text, items);
+                }
+                if c_lo != c_hi && is_alpha_dominant(&span.text) {
+                    grid.row_alpha_spanner[row] = true;
+                }
                 if !line.all_bold {
-                    grid.is_bold[row][c_lo] = false;
+                    grid.is_bold[row][col] = false;
                 }
                 continue;
             }
@@ -4682,6 +4870,7 @@ fn assign_cells(
             // font it can cut a word or two off from the true boundary.
             if let Some(by_word) = bucket_words_into_columns(span, xs) {
                 for (col, text) in by_word {
+                    let col = head(row, col);
                     grid.push_text(row, col, &text, items);
                     if !line.all_bold {
                         grid.is_bold[row][col] = false;
@@ -4689,15 +4878,16 @@ fn assign_cells(
                 }
             } else if let Some(pieces) = split_span_at_anchors(span, &covered, xs) {
                 for (k, piece) in pieces.iter().enumerate() {
-                    grid.push_text(row, c_lo + k, piece, items);
+                    let col = head(row, c_lo + k);
+                    grid.push_text(row, col, piece, items);
                     if !line.all_bold {
-                        grid.is_bold[row][c_lo + k] = false;
+                        grid.is_bold[row][col] = false;
                     }
                 }
             } else {
                 // No whitespace to split on — assign whole span by center.
                 let cx = (span.x + span.width * 0.5).clamp(xs[0], xs[n_cols]);
-                if let Some(col) = find_bucket(xs, cx) {
+                if let Some(col) = find_bucket(xs, cx).map(|c| head(row, c)) {
                     grid.push_text(row, col, &span.text, items);
                     if !line.all_bold {
                         grid.is_bold[row][col] = false;
@@ -4713,6 +4903,18 @@ fn assign_cells(
             eprintln!("[ruled]   REJECT no-lines-consumed");
         }
         return None;
+    }
+    for row in 0..n_rows {
+        for col in 1..n_cols {
+            let first = head(row, col);
+            if first == col {
+                continue;
+            }
+            grid.text[row][col].covered = true;
+            if let Some(b) = grid.text[row][col].bbox.clone() {
+                Rect::extend(&mut grid.text[row][first].bbox, &b);
+            }
+        }
     }
 
     let straddle_frac = if span_total > 0 {
@@ -4800,6 +5002,7 @@ fn flatten_header_band(
                         text: parts.join(" "),
                         bbox,
                         text_item_indices,
+                        ..Cell::default()
                     }
                 })
                 .collect();
@@ -5229,6 +5432,7 @@ fn extend_to_perpendicular_extent(
 fn build_ruled_table(
     hs: &[HSeg],
     vs: &[VSeg],
+    raw_vs: &[VSeg],
     h_indices: &[usize],
     v_indices: &[usize],
     lines: &[ProjectedLine],
@@ -5239,6 +5443,7 @@ fn build_ruled_table(
     let base = build_ruled_table_from(
         hs,
         vs,
+        raw_vs,
         h_indices,
         v_indices,
         lines,
@@ -5255,6 +5460,7 @@ fn build_ruled_table(
     let retry = build_ruled_table_from(
         hs,
         vs,
+        raw_vs,
         h_indices,
         &v_kept,
         lines,
@@ -5293,6 +5499,7 @@ const STRADDLE_IMPROVEMENT: f32 = 0.05;
 fn build_ruled_table_from(
     hs: &[HSeg],
     vs: &[VSeg],
+    raw_vs: &[VSeg],
     h_indices: &[usize],
     v_kept: &[usize],
     lines: &[ProjectedLine],
@@ -5417,8 +5624,9 @@ fn build_ruled_table_from(
     // Assign text to cells, then reject if no lines landed inside the grid or
     // too many spans straddle interior column boundaries (decorative box, not
     // a table).
+    let merged = colspan_mask(raw_vs, lines, &xs, &ys, dbg);
     let (mut grid, consumed_indices) =
-        assign_cells(lines, &xs, &ys, pass == RuledPass::Global, dbg)?;
+        assign_cells(lines, &xs, &ys, &merged, pass == RuledPass::Global, dbg)?;
     let straddle_frac = grid.straddle_frac;
     grid.spanned = rowspan_mask(hs, h_indices, vs, v_kept, &xs, &ys);
 
@@ -5826,6 +6034,7 @@ fn detect_ruled_tables_impl(
             if let Some(run) = build_ruled_table(
                 hs,
                 &band.vs,
+                raw_vs,
                 &band.h_idx,
                 &band.v_idx,
                 lines,
@@ -6395,7 +6604,7 @@ mod tests {
         let ys = [0.0, 20.0];
 
         assert!(running_prose_sentence_shape(&line));
-        let (_, consumed) = assign_cells(&[line], &xs, &ys, true, false).unwrap();
+        let (_, consumed) = assign_cells(&[line], &xs, &ys, &[], true, false).unwrap();
         assert_eq!(
             consumed,
             [0],
@@ -6451,7 +6660,7 @@ mod tests {
         let ys = [0.0, 20.0, 40.0, 60.0, 80.0];
 
         assert!(should_stop_at_running_prose(&lines[1], &xs, 1, 1, false));
-        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, &[], true, false).unwrap();
         assert_eq!(consumed, [0, 1, 2, 3]);
     }
 
@@ -6467,7 +6676,7 @@ mod tests {
         let xs = [0.0, 100.0, 200.0, 330.0];
         let ys = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0];
 
-        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, &[], true, false).unwrap();
         assert_eq!(consumed, [0]);
     }
 
@@ -6482,7 +6691,7 @@ mod tests {
         let xs = [0.0, 100.0, 200.0, 330.0];
         let ys = [0.0, 20.0, 40.0, 60.0, 80.0];
 
-        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, &[], true, false).unwrap();
         assert_eq!(consumed, [0, 1]);
     }
 
