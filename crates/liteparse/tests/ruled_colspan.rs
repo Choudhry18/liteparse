@@ -388,3 +388,77 @@ async fn joined_cell_run_under_header_only_dividers_still_splits() {
     assert!(md.contains("| A-300 | Rubber seal | 2.10 |"), "{md}");
     assert!(!md.contains("colspan"), "{md}");
 }
+
+/// A 5-column ruled table. The interior rules are drawn only in the rows in
+/// `ruled_rows`. An empty string leaves the cell empty.
+fn five_column_table(rows: &[[&str; 5]], ruled_rows: &[usize]) -> Page {
+    const X5: [f32; 6] = [57.0, 150.0, 250.0, 340.0, 430.0, 520.0];
+    let mut p = Page::new();
+    let n = rows.len();
+    for r in 0..=n {
+        p.line(X5[0], row_y(r).0, X5[5], row_y(r).0);
+    }
+    p.line(X5[0], GRID_TOP, X5[0], row_y(n).0);
+    p.line(X5[5], GRID_TOP, X5[5], row_y(n).0);
+    for &r in ruled_rows {
+        let (y0, y1) = row_y(r);
+        for x in &X5[1..5] {
+            p.line(*x, y0, *x, y1);
+        }
+    }
+    for (r, row) in rows.iter().enumerate() {
+        for (c, s) in row.iter().enumerate().filter(|(_, s)| !s.is_empty()) {
+            p.text(X5[c] + 4.0, row_y(r).0 + 15.0, s, r == 0);
+        }
+    }
+    p
+}
+
+#[tokio::test]
+async fn spanning_label_does_not_join_separate_values_in_its_row() {
+    // Row 2 has no interior rules. Its label spans the first two columns,
+    // and two values sit in columns 2 and 4 with an empty cell between them.
+    let rows = [
+        ["Item", "Note", "2023", "2022", "2021"],
+        ["Revenue", "1", "100", "90", "80"],
+        ["Continuing operations total", "", "55", "", "44"],
+        ["Costs", "2", "40", "35", "30"],
+        ["Tax", "3", "10", "9", "8"],
+    ];
+    let result = parse(five_column_table(&rows, &[0, 1, 3, 4])).await;
+    let md = markdown(&result);
+    assert!(
+        md.contains(
+            "<td colspan=\"2\">Continuing operations total</td>\n<td>55</td>\n<td></td>\n<td>44</td>"
+        ),
+        "the values must stay in their own cells:\n{md}"
+    );
+}
+
+#[tokio::test]
+async fn spanning_label_stops_at_a_cell_with_text() {
+    // Row 2 has no interior rules. Its label spans columns 0-2, and a
+    // footnote marker sits alone in column 4.
+    let rows = [
+        ["Item", "Note", "2023", "2022", "2021"],
+        ["Revenue", "1", "100", "90", "80"],
+        [
+            "Discontinued operations (see note 7 below)",
+            "",
+            "",
+            "",
+            "(a)",
+        ],
+        ["Costs", "2", "40", "35", "30"],
+    ];
+    let result = parse(five_column_table(&rows, &[0, 1, 3])).await;
+    let md = markdown(&result);
+    assert!(
+        md.contains("<td>(a)</td>"),
+        "the marker keeps its own cell:\n{md}"
+    );
+    assert!(
+        !md.contains("below) (a)"),
+        "the marker must not join the label:\n{md}"
+    );
+}

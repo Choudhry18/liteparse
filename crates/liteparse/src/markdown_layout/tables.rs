@@ -4520,9 +4520,10 @@ fn text_flows_across(span: &TextItem, boundary: f32) -> bool {
 /// A drawn rule always wins. A span that crosses a drawn rule is a merged
 /// PDFium run, and `assign_cells` splits it as before.
 ///
-/// In a row with a merge, an unruled boundary next to an empty cell also
-/// merges. Thus a spanning row whose text ends before the last column still
-/// spans the full width.
+/// A merged group then grows across unruled boundaries into the empty cells
+/// next to it, and stops at the first cell with text. Thus a spanning row
+/// whose text ends before the last column still spans the full width, but
+/// the growth never joins two cells that hold text.
 fn colspan_mask(
     raw_vs: &[VSeg],
     lines: &[ProjectedLine],
@@ -4634,9 +4635,20 @@ fn colspan_mask(
         if !mask[r].iter().any(|m| *m) {
             continue;
         }
-        for c in 1..n_cols {
-            if unruled[c] && (!occupied[r][c - 1] || !occupied[r][c]) {
-                mask[r][c] = true;
+        // Grow each merged group across unruled boundaries into the empty
+        // cells next to it. Stop at the first cell that holds text, so that
+        // two separate values are never joined through an empty cell.
+        let seeds = mask[r].clone();
+        for c in (1..n_cols).filter(|&c| seeds[c]) {
+            let mut k = c + 1;
+            while k < n_cols && unruled[k] && !occupied[r][k] {
+                mask[r][k] = true;
+                k += 1;
+            }
+            let mut k = c - 1;
+            while k >= 1 && unruled[k] && !occupied[r][k - 1] {
+                mask[r][k] = true;
+                k -= 1;
             }
         }
         if dbg {
@@ -5013,6 +5025,7 @@ impl HeaderLayout {
 /// top-to-bottom join), so each column carries its full layer chain ("North
 /// America Revenue") — that chain is what header-keyed consumers (and readers)
 /// need. Returns `(header_row, body_start)` or `None`.
+#[allow(clippy::too_many_arguments)]
 fn flatten_header_band(
     cells: &[Vec<Cell>],
     cell_has_text: &[Vec<bool>],
