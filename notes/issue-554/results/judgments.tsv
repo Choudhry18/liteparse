@@ -1,0 +1,36 @@
+#	doc	score_main	score_fixed6	verdict	reason
+1	dense_tables/dense_table_289	0.929	0.000	better	"And you are" spans 4 cols, band labels "12,000" span; scorer loses side-by-side split on HTML
+2	dense_tables/dense_table_290	0.929	0.000	better	same tax-table template as 289
+3	insurance_filing_tables/010b43388a0c67b0_p8	0.790	0.000	better	form band above table reads in order (RATEMAKING DATA, label+value); body identical; colspan in pre-header band confuses scorer
+4	insurance_filing_tables/1fea2f2540c835bf_p1	0.756	0.139	better	Risk Description box kept in reading order; body identical
+5	insurance_filing_tables/f21bd303b0de617f_p20	0.535	0.000	worse	2-row header now repeats, split_repeated_header_tables cuts before the 2nd header row, so each sub-table title + Current/Proposed group row is stranded at the end of the previous table
+6	insurance_filing_tables/02f7022a1f08f606_p8	0.720	0.290	better	CDI File #, EXCLUDED EXPENSE RATIO and a wrapped label kept together; body identical
+7	dense_tables/dense_table_041	0.499	0.103	mixed	H7/H11 group headers correct, but one row glues left table title "H11" with right table value 9/16" across the gutter (cs=10)
+8	insurance_filing_tables/0211a1880172f065_p8	0.745	0.411	better	same template as #3
+9	dense_tables/dense_table_304	0.419	0.146	better	Counties text and Non-Smoker/Smoker group headers span correctly
+10	dense_tables/dense_table_201	0.462	0.198	worse	five sector group labels glued into one 26-col cell (empty-neighbour extension); sector-to-column attribution lost
+11	dense_tables/dense_table_344	0.369	0.128	better	same template as #9
+12	financial_tables/currency-2026-08-13_page1	0.240	0.000	mixed	two text rows fixed; Euro row glues the 19% value with sensitivity prose in one cs=12 cell
+13	forms/filled__ireland--02_Form12--p7__typed	0.618	0.500	mixed	captions far more readable; first chars of two values ("U", "0") glued into caption cells
+14	fillable_forms/740-2025__p3	0.850	0.760	better	line captions kept whole
+15	insurance_filing_tables/fcf941428374b6db_p73	0.000	1.000	better	label/answer text cells kept whole
+16	financial_tables/sl-2026-08-13_page1	0.023	0.861	better	"First Quarter" etc. group headers span 2 cols
+17	insurance_filing_tables/02ea44a8ebe3afda_p7	0.000	0.731	better	wrapped row labels kept whole, values stay in their columns
+18	financial_tables/nem-2026-08-13_page1	0.450	0.990	better	unit headers "Availability (MW)" span 2 cols
+19	insurance_filing_tables/294c274bfc7f6dd8_p7	0.000	0.494	better	same template as #17
+20	financial_tables/pen-2026-08-12_page1	0.488	0.940	better	title and formula rows span the table; x-grid unchanged
+21	dense_tables/dense_table_199	0.462	0.900	better	sector group headers span correctly (same EIA table as #10, other year, rules present)
+22	forms/filled__uk--21_SA102--p2__typed	0.333	0.760	unclear	some captions fixed, middle of form still shredded in both
+23	forms/filled__us--48_Schedule-8812--p1__typed	0.465	0.830	better	line captions whole, values in own cells
+24	forms/filled__ireland--02_Form12--p13__typed	0.286	0.641	better	degenerate 2-row whole-page table no longer emitted
+25	financial_tables/Stellantis-NV-20241231-Annual-Report-2026-08-21_page153	0.705	1.000	better	"Total Payout Percentage" and "Annual Cash Bonus Range" kept whole
+26	insurance_filing_tables/84593c5009dbfb47_p4	0.650	0.950	better	table titles and note rows span the table
+27	financial_tables/aa-2026-08-13_page1	0.000	0.000	worse	values 20 009 and 32 921 glued in one cell; 2 771 spans Not rated + Pooled funds (space thousands separator < half font height)
+28	financial_tables/quaterly-2026-08-13_page1	0.000	0.000	better	label rows kept whole (text is font-encoded in both)
+29	insurance_filing_tables/150bc31d9c681a52_p10	0.000	0.000	better	same template as #3
+30	dense_tables/dense_table_214	0.000	0.000	unclear	header detection changed; both outputs garbled
+T1	financial_tables/qei-2026-08-12_page1	0.052	0.000	worse	Daily and 5D values glued (-1.01 -0.13 cs=4); JCI row glues 3 values
+T2	dense_tables/dense_table_443	0.001	0.000	worse	ratings 4* 2* 3* glued in one cs=6 cell
+T3	dense_tables/dense_table_370	0.536	0.501	worse	six share-count values glued into one cs=3 cell
+T4	dense_tables/dense_table_319	0.683	0.691	mixed	section rows span correctly; some rows glue period + 3 numbers
+T5	dense_tables/dense_table_271	0.000	0.000	worse	percentage values glued (main also poor)

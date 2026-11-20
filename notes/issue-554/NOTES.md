@@ -2,8 +2,9 @@
 
 Work notes for https://github.com/run-llama/liteparse/issues/554.
 Branch: `fix/ruled-colspan-missing-vrule`, based on upstream `main` at `a684a4a` (v2.20.0).
+The code on the branch is **v7** (section 6 gives the history).
 
-**Drop this `notes/` commit before you open a pull request.**
+**Drop the `notes:` commits before you open a pull request.**
 
 ## 1. The problem
 
@@ -11,46 +12,89 @@ A ruled table can have a row where the interior vertical rules stop. That row is
 that spans the columns. The markdown output split each line of that row at the column
 positions of the rows above. The text then came out in the wrong order.
 
+The bug occurs only when all of these conditions are true:
+
+1. The text is inside a ruled grid. The outer border connects to the table rules.
+2. A vertical rule exists at the column position somewhere in the grid, but not in that row.
+3. The text lines are long enough to cross those positions.
+4. The grid passes the gates: the straddle census (45% or less), the running-prose stop, and
+   the density gate. When a gate rejects the grid, the text comes out as paragraphs.
+
+Typical layouts: a section row inside a table, a page frame with a ruled header (the issue),
+a partial merge, and a ruled header plus a ruled footer around a page body.
+
 The cause is in `crates/liteparse/src/markdown_layout/tables.rs`:
 
-- `build_ruled_table_from` uses one set of column boundaries (`xs`) for all rows. It does not
-  look at the y-extent of each vertical rule.
+- `build_ruled_table_from` uses one set of column boundaries (`xs`) for all rows.
 - `assign_cells` splits each span at every boundary that the span crosses.
-- `rowspan_mask` finds cells that merge vertically. No code found cells that merge
-  horizontally.
+- `rowspan_mask` finds vertical merges. No code found horizontal merges.
 - `cluster_v_segments` unions the y-ranges of all rules at one x. This fills the gap that a
   spanning row leaves in a rule. Only the raw segments (`raw_vs`) show the gap.
 
-## 2. What the branch changes
+## 2. The rules on the branch (v7)
 
-| File | Change |
-|---|---|
-| `markdown_layout/tables.rs` | New `colspan_mask` and `text_flows_across`. `assign_cells` puts the text of a merged group into the first cell of the group. `raw_vs` goes through `build_ruled_table` to `build_ruled_table_from`. |
-| `markdown_layout/blocks.rs` | New field `Cell.covered`. Markdown renders a `Block::Table` with covered cells as an HTML `<table>` with `colspan` (`table_span_rows`). |
-| `layout.rs` | The layout JSON keeps `kind: "table"` and one cell per column. The first cell of a group gets `colspan`. A covered cell is an empty cell with no `bbox`. |
-| `markdown_layout/cross_region.rs` | Adds `..Cell::default()` to a `Cell` literal. |
-| `tests/ruled_colspan.rs` | 6 tests with synthetic PDFs. |
+All rules are in `tables.rs`, except for the output rules. Tables without covered cells give
+the same output as `main`.
 
-### The merge rule
+### Merge detection: `colspan_mask`
 
-In row `r`, column `c` joins column `c - 1` only when both conditions are true:
+For each row and each interior boundary `xs[c]`:
 
-1. **No rule in the row.** The raw vertical segments at `xs[c]` cover less than 20% of the row
-   band (`COLSPAN_MIN_RULE_COVERAGE`). The test uses the row band, not the junction point.
-2. **The text flows across the boundary.** A span crosses `xs[c]` by 3pt on each side. Also, a
-   word box covers the boundary, or the gap at the boundary is less than half the font height.
+1. **No rule in the row.** The raw vertical segments within 6pt of the boundary cover less
+   than 20% of the row band (`COLSPAN_MIN_RULE_COVERAGE`). The band is the row minus 3pt at
+   the top and at the bottom.
+2. **The text crosses the boundary.** A span crosses `xs[c]` by 3pt on each side
+   (`STRADDLE_MARGIN_PT`).
+3. **The text flows across the boundary** (`text_flows_across`). A word box covers the
+   boundary, or the gap at the boundary is less than half the font height. Without word boxes,
+   the span box decides.
+4. **No line contradicts the merge.** No line of the row has separate text on both sides of
+   the boundary without flowing across it.
+5. A boundary merges when 1, 2 and 3 are true and 4 is false.
+6. **Growth.** Each merged group grows across unruled boundaries into the empty cells next to
+   it. It stops at the first cell with text.
 
-In a row with a merge, an unruled boundary next to an empty cell also merges. Thus a spanning
-row whose text ends early still spans the full width.
+Performance: the function stops early when no text crosses a boundary. It puts each raw
+segment in the bucket of its nearest boundary, in one pass. It checks only rows with a
+crossing.
 
-The density gate (`passes_density_gate`) counts covered cells as empty, the same as on `main`.
-`repl` and `row_alpha_spanner` still see all the columns of a span, so `flatten_header_band`
-works the same as on `main`.
+### Text placement: `assign_cells`
 
-## 3. Alternatives that were tested
+7. The text of a merged group goes into the first cell of the group, in reading order.
+8. The `repl` grid still receives the text in all covered columns, and `row_alpha_spanner` is
+   set as on `main`. Header folding needs both.
+9. Covered cells get `covered = true`. The box of the first cell grows to cover the group.
 
-The script `make_pdfs.py` makes 14 synthetic cases. A temporary switch ran each rule on the same
-build. A tick means correct output.
+### Table decision: `build_ruled_table_from`
+
+10. The build without merges decides whether the grid becomes a table, the same as on `main`.
+    When `main` accepts a grid, the merged build gives the output. The merged build skips the
+    density gate. When it fails another gate, the unmerged output is used.
+
+### Header passes
+
+11. `HeaderLayout` gives `flatten_header_band` and `merge_stacked_header` a fill value for each
+    row. A covered cell counts as filled when its group holds text. A row whose text is only in
+    spanning cells is a group-label row. Its fill is 0, so it never ends the header band.
+12. `merge_stacked_header` does not apply its height test to group-label rows.
+
+### Output: `blocks.rs` and `layout.rs`
+
+13. `Cell` has the field `covered`. JSON omits it when it is false.
+14. Markdown renders a table with a covered cell as an HTML `<table>` with `colspan`.
+15. The layout JSON keeps `kind: "table"` and one cell per column. The first cell of a group
+    gets `colspan`. A covered cell is an empty cell without a `bbox`.
+
+### Tests: `tests/ruled_colspan.rs`
+
+There are 8 tests with synthetic PDFs. They cover: section rows in four drawing styles, the
+issue frame, a partial merge, dividers in the header only, a text run across a drawn rule, a
+joined run with a column gap, a spanning label next to separate values, and a spanning label
+next to a footnote marker.
+
+## 3. Alternative merge rules that were tested
+
+`make_pdfs.py` makes 14 synthetic cases. A temporary switch ran each rule on the same build.
 
 | Case | Straddle only | Rules only | Junction point | Both (chosen) |
 |---|---|---|---|---|
@@ -61,111 +105,118 @@ build. A tick means correct output.
 | 11 one text run across a drawn rule | **no, merges** | yes | yes | yes |
 | 12-14 plain, rowspan, dashed | yes | yes | yes | yes |
 
-- The junction-point test fails because a rule that ends on the row's top edge touches the
-  junction. When rules are drawn one row at a time, both junctions exist, but the edge does not.
-- Case 07 draws each rule as two long strokes with a gap at the section row. Only `raw_vs`
-  shows that gap.
+The junction-point test fails because a rule that ends on the row's top edge touches the
+junction. When rules are drawn one row at a time, both junctions exist, but the edge does not.
 
 ## 4. Performance
 
-The first version scanned all page strokes for each (row, column). The fix does two things:
-
-- It stops early when no text crosses a boundary.
-- It puts each stroke in the bucket of its nearest boundary, in one pass.
-
-| Stress page (`make_stress.py`) | main | before fix | final |
+| Stress page (`make_stress.py`) | main | first version | v4 and later |
 |---|---|---|---|
 | Ruled table + 40k other strokes | 96-101ms | 99ms | 95-101ms |
 | 30x40 lattice + 40k strokes | 97-104ms | 132ms | 97-105ms |
 | Same lattice, text crosses each row | 97-103ms | 132ms | 103-106ms |
 
-## 5. Benchmark: ParseBench v1
+## 5. Benchmark results
 
-ParseBench v1 has 2,049 documents. The runs used no OCR. Only ParseBench gives a useful result
-for this change:
+### ParseBench v1 (in-sample: the rules were tuned on these documents)
 
-- olmOCR-bench has no published LiteParse runner.
-- The published opendataloader-bench engine scores `result.text` (plain text) from the
-  `liteparse` 1.2.1 Python package. It does not see markdown tables.
+2,049 documents, no OCR. `lit` output is deterministic.
 
-| Category | main | v1 | v2 | v3 | v4 (branch) |
+| Category | main | v1 | v2 | v3 | v4 | v5 | v6 | **v7** |
+|---|---|---|---|---|---|---|---|---|
+| Tables | 0.4581 | 0.4603 | 0.4667 | 0.4658 | 0.4662 | 0.4661 | 0.4671 | **0.4671** |
+| Charts | 0.0123 | 0.0194 | 0.0118 | 0.0123 | 0.0118 | 0.0152 | 0.0152 | 0.0147 |
+| Text content | 0.7060 | 0.7065 | 0.7063 | 0.7061 | 0.7063 | 0.7064 | 0.7062 | 0.7062 |
+| Text formatting | 0.4440 | 0.4430 | 0.4467 | 0.4426 | 0.4467 | 0.4441 | 0.4441 | 0.4441 |
+| Layout | 0.3203 | 0.3112 | 0.3327 | 0.3189 | 0.3327 | 0.3205 | 0.3205 | 0.3205 |
+| **Overall** | 0.3881 | 0.3881 | 0.3929 | 0.3891 | 0.3928 | 0.3905 | 0.3906 | **0.3905** |
+| Documents better / worse | | | 104 / 33 | 47 / 23 | 95 / 26 | 68 / 13 | 66 / 10 | **65 / 10** |
+| Largest loss | | | -0.76 | | -0.76 | -0.32 | -0.14 | **-0.14** |
+
+The layout gain of v2 and v4 comes from rule changes that reject decorative grids. Those
+rules also made 6 tables disappear. v5 and later do not change the table decision, so the
+layout gain is not on the branch. That gain is possible as a separate change.
+
+### ParseBench-2 (held out: not used during development)
+
+An independent reviewer ran this evaluation. The `tables` subset is v1 documents. Also,
+10 `complex_table_headers` pages and 4 `dense_tables` pages are files from v1. Those pages are
+excluded here (`results/overlap.json`). The `insurance_filing_tables` subset has other filings
+than v1, but the same type of document.
+
+| Held-out subset | Pages | main | v6 | **v7** | v7 better / worse |
 |---|---|---|---|---|---|
-| Tables | 0.4581 | 0.4603 | 0.4667 | 0.4658 | **0.4662** |
-| Charts | 0.0123 | 0.0194 | 0.0118 | 0.0123 | 0.0118 |
-| Text content | 0.7060 | 0.7065 | 0.7063 | 0.7061 | 0.7063 |
-| Text formatting | 0.4440 | 0.4430 | 0.4467 | 0.4426 | 0.4467 |
-| Layout | 0.3203 | 0.3112 | 0.3327 | 0.3189 | **0.3327** |
-| **Overall** | 0.3881 | 0.3881 | 0.3929 | 0.3891 | **0.3928** |
-| Documents better / worse | | | 104 / 33 | 47 / 23 | 95 / 26 |
+| complex_table_headers | 139 | 0.0568 | 0.0574 | 0.0571 | 1 / 2 |
+| financial_tables | 319 | 0.2702 | 0.2816 | 0.2831 | 18 / 3 |
+| insurance_filing_tables | 412 | 0.3540 | 0.3656 | 0.3670 | 46 / 15 |
+| dense_tables | 369 | 0.4700 | 0.4678 | 0.4696 | 31 / 13 |
+| forms | 500 | 0.6601 | 0.6686 | 0.6688 | 49 / 6 |
+| fillable_forms | 100 | 0.8623 | 0.8674 | 0.8665 | 10 / 1 |
+| **Tables (4 subsets, equal weight)** | | 0.2877 | 0.2931 | **0.2942** | |
 
-`lit` output is deterministic. Two runs of the `main` binary gave the same output.
+- Per-page change over the 1,239 held-out table pages for v7: **+0.0076**. The 95% bootstrap
+  interval is [+0.0024, +0.0129]. 96 pages are better and 33 are worse.
+- **Glued number cells** (a colspan cell with 2 or more numbers): main 0, v6 62 cells in 14
+  documents, **v7 31 cells in 12 documents**.
+- **Visual check of v6 by the reviewer:** 30 rendered held-out pages gave 22 better, 3 worse,
+  3 mixed and 2 unclear. 7 of the 11 sampled pages that lost more than 0.2 look better on the
+  page. The scorer misread them (`results/judgments.tsv`).
+- **Constant sensitivity** (`results/sensitivity_scores.txt`): the 20% coverage, the gap of
+  half the font height and the 3pt margin are not fragile. The held-out Tables score moves by
+  at most 0.0006 when one constant changes.
 
-### What each version changed
+## 6. Version history
 
-- **v1.** This was the first merge rule. The density gate excused covered cells, and the JSON used `kind: "merged_table"`.
-  Three regressions occurred:
-  - The merge path did not fill `repl` or set `row_alpha_spanner`. `flatten_header_band` then
-    stopped folding headers such as `North America` over `Revenue | Units`. The table metric
-    (TRM) keys on the folded header. Examples: `AZ LIC Rate Tables 2.0.v2_page78` (0.95 to 0.45)
-    and `synthetic_colspan_table_no_borders_page1`.
-  - The density gate excused covered cells. Decorative page grids then became one large table.
-    Example: `AONR32314_page1` (0.59 to 0.07).
-  - The ParseBench LiteParse provider maps only `table` and `grid_fallback` to the Table label.
-    It dropped `merged_table` blocks. The layout score fell, and 2 pages failed.
-- **v2.** This version fixed the three regressions above.
-- **v3.** This was v2 plus a fallback: when a merged grid fails a gate, the build runs again without
-  merges. The score was worse. Many v2 gains come from decorative grids that the gate rejects.
-  The branch does not include the fallback.
-- **v4.** This was v2 plus `text_flows_across`. Example: `USPS 10-k_page49` (1.00 in main, 0.71 in v2,
-  1.00 in v4). PDFium joined two number cells into one run, and v2 merged them.
+- **v1.** This was the first merge rule. The density gate excused covered cells, and the JSON used
+  `kind: "merged_table"`. There were three regressions:
+  - Header folding stopped (`AZ LIC Rate Tables 2.0.v2_page78`: 0.95 to 0.45).
+  - Decorative page grids became one large table (`AONR32314_page1`: 0.59 to 0.07).
+  - ParseBench drops `merged_table` blocks.
+- **v2.** This version fixed the three regressions of v1.
+- **v3.** This was v2 plus a fallback to the scrambled `main` output. It scored worse and was removed.
+- **v4.** This was v2 plus `text_flows_across` (`USPS 10-k_page49` back to 1.00). It is commit `6fdbe7f`.
+- **v5.** In this version, the build without merges decides acceptance. No table disappears now.
+- **v6.** This was v5 plus the split evidence (rule 4) and `HeaderLayout` (rules 11 and 12). It is commit `2be666e`.
+  `SERFF_CA ... page1724` went from -0.32 to +0.05.
+- **v7.** In this version, the growth stops at a cell with text (rule 6). Before, every unruled boundary next to an
+  empty cell merged in a row with a merge. That glued separate values: `qei-2026-08-12_page1`
+  gave `-1.01 -0.13` in one cell. An independent review found this defect.
 
-### Remaining losses in v4
+## 7. The issue PDFs on the branch
 
-`results/compare_v4.txt` has the full list. These are the largest:
+- `frame.pdf` gives a 2-row header table and one `colspan="3"` cell. The body is in reading
+  order.
+- `frame_one_row.pdf` gives the same form, because `main` accepts this grid. This is the "HTML
+  table with a colspan cell" option of the issue. The reporter prefers headings and
+  paragraphs, so see open item 6.
 
-| Document | main | v4 |
-|---|---|---|
-| table/SERFF_CA_random_pages 1_page1551 | 0.7566 | 0.0000 |
-| text/text_simple__yell | 0.6697 | 0.0000 |
-| table/203924_fb04e77929bf4bbc93dbd659653a4f01_page23 | 0.7942 | 0.2136 |
-| layout/dupont_2024sustainabilityreport_p22 | 0.6364 | 0.2424 |
-| table/SERFF_CA_random_pages 1_page1724 | 0.4814 | 0.1621 |
-| text/text_simple__returns | 1.0000 | 0.6867 |
-| layout/2024-Ford-Integrated-Sustainability-and-Financial-Report_Final_p46 | 0.4146 | 0.1220 |
-| table/DS5795A-06_page13 | 0.2200 | 0.0000 |
-| table/FBLB-134215544_page163 | 0.2017 | 0.0000 |
-| table/FBLB-134215544_page99 | 0.1388 | 0.0000 |
+## 8. Open items, by priority
 
-A score of 0.0000 usually means that the table is gone. The merges leave empty covered cells,
-and then the grid fails the density gate. Example: `FBLB-134215544_page163` goes from an
-empty-cell fraction that passes to 0.67. Note that `main` also gives a bad table for that page.
-Nobody looked at `text_simple__yell` or `SERFF_CA ... page1724` yet.
+1. **Glued numbers that remain (31 cells).** The word-space test in `text_flows_across` sees a
+   space in `20 009` (a space as the thousands separator) or a tight numeric column as a word
+   space. Do not add a check on digits: that is a content rule, not a layout rule. A better
+   rule is column alignment. When the words of a crossing row align with the column edges of
+   the rows above and below, the boundary is a real column edge.
+2. **Table segmentation changes in 14 held-out pages.** The table decision is the same as on
+   `main`, but the split into tables changes:
+   - `f21bd303_p20`: with a 2-row header, `split_repeated_header_tables` cuts in the wrong
+     place.
+   - `51abb0b9`: 1 table where `main` gives 5 to 7.
+3. **Text above a table inside the grid becomes a spanning header** over the real columns.
+   This causes most of the large ParseBench-2 losses.
+4. **Title row** (`SERFF_CA ... page96`, -0.14). A full-width title above the real header gives
+   a title header and a body row. `Block::Table` has only one header row.
+5. **Two header lines in one ruled row** (`SERFF_TX ... page1284`, -0.04). The grid cannot
+   separate them, and `main` is also wrong there.
+6. **A long body under a frame** still rejects the whole table (cases 03 and 04). A fix splits the grid at a tall
+   row that spans all columns. `split_component_at_grid_gaps` must then look only at interior
+   verticals.
+7. The group-label rule (rules 11 and 12) comes from one example. Test it on more layouts.
+8. **Possible bug, not tested.** `cluster_h_segments` unions the x-ranges of rules at one y.
+   `rowspan_mask` can then miss a rowspan that has a gap in its rule.
+9. Add tests for side-by-side tables and for form text above a table.
 
-## 6. The issue PDFs on the branch
-
-- `frame.pdf` (2 header rows) gives a 2-row table and one `colspan="3"` cell. The body is in
-  reading order.
-- `frame_one_row.pdf` (1 header row) fails the density gate: 2 of 6 cells are covered. The
-  output is the header as one line, then `# 1. Section`, then the body text in order. The
-  reporter said that this output is the best for them.
-
-## 7. Open items
-
-1. **A long body under a frame still rejects the whole table** (cases 03-04). The straddle
-   census in `assign_cells` counts lines that cross missing rules. The header then becomes one
-   line. A better fix splits the grid at a tall row that spans all columns. For example, the row
-   is 3 or more times the median row height and holds several lines. `split_component_at_grid_gaps`
-   does a similar split, but it looks at all verticals. It must look only at interior verticals.
-   A ruled header and a ruled footer around a page body (`make_mid.py`, `frame_hdr_ftr_*`) need
-   this split.
-2. Find the cause of each loss in section 5.
-3. A 1-row piece after a split cannot be a table, because a table needs 2 rows.
-4. **Possible bug, not tested:** `cluster_h_segments` also unions the x-ranges of rules at one y.
-   `rowspan_mask` can then miss a rowspan that a rule draws in two pieces with a gap.
-5. Before a pull request, run `cargo clippy` in strict mode the same way as CI. The local clippy
-   reports old warnings in `tables.rs`. The branch adds no new warnings.
-
-## 8. How to continue
+## 9. How to continue
 
 ### Build and test
 
@@ -182,9 +233,10 @@ LITEPARSE_DEBUG_RULED=1 target/release/lit parse --no-ocr -q --format markdown f
 ### Synthetic PDFs
 
 ```sh
-python3 notes/issue-554/make_pdfs.py /tmp/pdfs      # 14 cases
-python3 notes/issue-554/make_mid.py /tmp/pdfs_mid   # mid-table and header+footer frames
-python3 notes/issue-554/make_stress.py /tmp/stress  # performance pages
+python3 notes/issue-554/make_pdfs.py /tmp/pdfs              # 14 cases
+python3 notes/issue-554/make_mid.py /tmp/pdfs_mid           # mid-table rows, header + footer
+python3 notes/issue-554/make_stress.py /tmp/stress          # performance pages
+python3 notes/issue-554/make_adversarial.py /tmp/adv notes/issue-554   # reviewer cases a-f
 notes/issue-554/run_all.sh target/release/lit /tmp/pdfs > after.md
 notes/issue-554/timeit.sh target/release/lit /tmp/stress/lattice_40000.pdf 9
 ```
@@ -195,22 +247,38 @@ https://github.com/user-attachments/files/34475858/frame_one_row.pdf.
 
 ### ParseBench
 
-The dataset is 0.59 GB. Build one `lit` binary for `main` and one for the branch. Then run:
+Build one `lit` binary for `main` and one for the branch. Then run each one:
 
 ```sh
 git clone --depth 1 https://github.com/run-llama/ParseBench.git && cd ParseBench && uv sync
-LITEPARSE_BIN=/path/to/lit-main .venv/bin/parse-bench run liteparse_markdown \
-  --open_report=False --output_dir ../out_main --force -m 6
-LITEPARSE_BIN=/path/to/lit-branch .venv/bin/parse-bench run liteparse_markdown \
-  --open_report=False --output_dir ../out_branch --force -m 6
+# v1 (0.59 GB, in-sample):
+LITEPARSE_BIN=/path/to/lit .venv/bin/parse-bench run liteparse_markdown \
+  --open_report=False --output_dir ../out_X --force -m 6
 python3 notes/issue-554/compare_parsebench.py ../out_main ../out_branch
+# ParseBench-2 (held out). Use only the subsets that are not v1:
+LITEPARSE_BIN=/path/to/lit .venv/bin/parse-bench run liteparse_markdown --dataset parsebench-2 \
+  --group complex_table_headers,dense_tables,financial_tables,insurance_filing_tables,forms,fillable_forms \
+  --open_report=False --output_dir ../out2_X --force -m 6
 ```
 
-Each run takes 3 to 4 minutes on an Apple Silicon laptop. Each document's raw `lit` output is in
-`<out>/liteparse_markdown/<category>/<name>.raw.json`. The ground truth is in
-`data/<category>.jsonl` (`expected_markdown`).
+A v1 run takes 3 to 4 minutes on an Apple Silicon laptop. Each document's raw `lit` output is in
+`<out>/liteparse_markdown/<category>/<name>.raw.json`. The v1 ground truth is in
+`data/<category>.jsonl` (`expected_markdown`). `results/overlap.json` marks the ParseBench-2
+pages that are also in v1.
 
-## 9. Fork note
+### Files in `results/`
+
+| File | Content |
+|---|---|
+| `compare_v4.txt`, `compare_v7.txt` | v1 per-document changes, main against v4 and v7 |
+| `heldout_v7.txt` | The held-out table of section 5 |
+| `v2_summary.txt` | ParseBench-2 scores, main against v6 (from the review) |
+| `judgments.tsv` | The reviewer's visual judgments of 35 pages |
+| `glue_scan_variants.txt` | Glued number cells for each variant |
+| `sensitivity_scores.txt` | Held-out scores for each constant variant |
+| `overlap.json` | ParseBench-2 pages that are also in v1 |
+
+## 10. Fork note
 
 A push to `main` of the fork `Choudhry18/liteparse` starts the upstream workflows. On
 2026-11-18, GitHub did not start the jobs because of a billing lock on the account. A push of a
