@@ -1,0 +1,58 @@
+held-out pages: 1239   in-sample tables pages: 500
+
+subset (held out)                 main          v7         v10         v11
+complex_table_headers           0.0568      0.0571      0.0589      0.0578
+financial_tables                0.2702      0.2831      0.2831      0.2803
+insurance_filing_tables         0.3546      0.3676      0.3755      0.3676
+dense_tables                    0.4700      0.4696      0.4696      0.4716
+tables, equal weight            0.2879      0.2944      0.2968      0.2943
+tables (in-sample subset)       0.4310      0.4453      0.4453      0.4446
+
+v7          vs main, held-out per page: +0.0076  95% CI [+0.0025, +0.0127]  up 96 down 33
+v10         vs main, held-out per page: +0.0104  95% CI [+0.0051, +0.0160]  up 102 down 26
+v11         vs main, held-out per page: +0.0075  95% CI [+0.0044, +0.0109]  up 91 down 16
+
+glued number cells v7         :  22 cells on 6 pages
+glued number cells v11        :   3 cells on 2 pages
+   v11 still glued: dense_tables/dense_table_393  ['30 June 2025', '31 December 2024']
+   v11 still glued: insurance_filing_tables/ab7d5a005dc3c5f3_p11  ['2,415,791,748 2,403,142,009 2,327,784,231']
+
+output differs from main on 179 held-out pages
+table count changes main -> v11: 13
+    3 ->  2  dense_tables/dense_table_247  score 0.037 -> 0.037
+    2 ->  1  dense_tables/dense_table_255  score 0.000 -> 0.000
+    7 ->  1  insurance_filing_tables/28a38e3798a00306_p3  score 0.645 -> 0.804
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p1  score 0.662 -> 0.712
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p2  score 0.628 -> 0.709
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p4  score 0.663 -> 0.776
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p5  score 0.649 -> 0.737
+    6 ->  1  insurance_filing_tables/51abb0b9601cd8df_p6  score 0.641 -> 0.691
+    6 ->  1  insurance_filing_tables/51abb0b9601cd8df_p7  score 0.538 -> 0.656
+    5 ->  1  insurance_filing_tables/51abb0b9601cd8df_p8  score 0.651 -> 0.764
+    5 ->  1  insurance_filing_tables/51abb0b9601cd8df_p9  score 0.660 -> 0.610
+    9 ->  7  insurance_filing_tables/ab7d5a005dc3c5f3_p11  score 0.000 -> 0.000
+    1 ->  5  insurance_filing_tables/f21bd303b0de617f_p20  score 0.535 -> 0.830
+
+held-out losses, v11 vs main (with v7 for the same page):
+   -0.430  main 0.720  v7 0.290  v10 0.290  v11 0.290  insurance_filing_tables/02f7022a1f08f606_p8
+   -0.430  main 0.720  v7 0.290  v10 0.290  v11 0.290  insurance_filing_tables/10eeb62c10e2abee_p9
+   -0.401  main 0.499  v7 0.098  v10 0.098  v11 0.098  dense_tables/dense_table_041
+   -0.240  main 0.240  v7 0.000  v10 0.000  v11 0.000  financial_tables/currency-2026-08-13_page1
+   -0.150  main 0.490  v7 0.340  v10 0.340  v11 0.340  insurance_filing_tables/64a4c79de95f6871_p8
+   -0.084  main 0.840  v7 0.756  v10 0.756  v11 0.756  dense_tables/dense_table_074
+   -0.080  main 0.260  v7 0.180  v10 0.180  v11 0.180  complex_table_headers/complex_header_084
+   -0.059  main 0.828  v7 0.769  v10 0.769  v11 0.769  dense_tables/dense_table_233
+   -0.050  main 0.660  v7 0.610  v10 0.610  v11 0.610  insurance_filing_tables/51abb0b9601cd8df_p9
+   -0.035  main 0.035  v7 0.000  v10 0.000  v11 0.000  financial_tables/sampo-2026-08-13_page1
+   -0.024  main 0.814  v7 0.790  v10 0.790  v11 0.790  dense_tables/dense_table_071
+   -0.017  main 0.460  v7 0.443  v10 0.443  v11 0.443  insurance_filing_tables/2c5871845c5862a8_p2
+   -0.011  main 0.950  v7 0.939  v10 0.939  v11 0.939  dense_tables/dense_table_047
+   -0.006  main 0.006  v7 0.000  v10 0.000  v11 0.000  financial_tables/r-2026-08-12_page3
+   -0.004  main 0.080  v7 0.150  v10 0.150  v11 0.076  dense_tables/dense_table_348
+   -0.001  main 0.001  v7 0.000  v10 0.000  v11 0.000  dense_tables/dense_table_443
+
+in-sample tables subset, v11 vs main losses:
+   -0.257  main 0.590  v7 0.333  v10 0.333  v11 0.333  tables/FBLB-134215544_page114
+   -0.200  main 0.200  v7 0.000  v10 0.000  v11 0.000  tables/Coca Cola 10-k_page48
+   -0.040  main 0.830  v7 0.791  v10 0.791  v11 0.791  tables/SERFF_TX_random_pages 1_page847
+   -0.015  main 0.255  v7 0.240  v10 0.240  v11 0.240  tables/SERFF_CA_random_pages 1_page844

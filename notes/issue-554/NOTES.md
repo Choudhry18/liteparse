@@ -2,7 +2,11 @@
 
 Work notes for https://github.com/run-llama/liteparse/issues/554.
 Branch: `fix/ruled-colspan-missing-vrule`, based on upstream `main` at `a684a4a` (v2.20.0).
-The code on the branch is **v10** (section 6 gives the history).
+The code on the branch is **v11** (section 6 gives the history).
+
+**Read this before you build on v11.** v11 gives up a large part of the v10 gains to fix pages
+that `main` also parsed wrongly. v10 has the higher average score (section 5). To return to v10,
+revert the v11 commit (`git log` shows it as "drop merges above the table's header band").
 A persistent worktree for this branch is at `~/Desktop/Choudhry/liteparse-554`. Do not work
 in `/tmp`: macOS deletes files there that are older than 3 days.
 
@@ -33,7 +37,7 @@ The cause is in `crates/liteparse/src/markdown_layout/tables.rs`:
 - `cluster_v_segments` unions the y-ranges of all rules at one x. This fills the gap that a
   spanning row leaves in a rule. Only the raw segments (`raw_vs`) show the gap.
 
-## 2. The rules on the branch (v10)
+## 2. The rules on the branch (v11)
 
 All rules are in `tables.rs`, except for the output rules. Tables without covered cells give
 the same output as `main`.
@@ -61,6 +65,13 @@ For each row and each interior boundary `xs[c]`:
    number only as a digit-group pair: the gap is at most half the font size, the left part
    ends in 1 to 3 digits, and the right part is exactly 3 digits ("10 000"). The words come
    from the word boxes, or from the span split at whitespace.
+6b. **No merges above the header band** (`drop_merges_above_header`, v11). The column header
+   is the first row without merges that fills at least 90% of the columns. From that row up,
+   unmerged rows and group-label rows belong to the header band. The first merged row that is
+   not a group label ends the band. That row and all rows above it keep no merges, so they read
+   the same as on `main`. **Weakness:** a header that leaves the row-label columns empty does
+   not fill 90% of the columns. Then the rule finds the header too far down, and it drops
+   correct merges in body rows (section 5).
 
 Performance: the function stops early when no text crosses a boundary. It puts each raw
 segment in the bucket of its nearest boundary, in one pass. It checks only rows with a
@@ -104,7 +115,8 @@ crossing.
 
 ### Tests: `tests/ruled_colspan.rs`
 
-There are 10 tests with synthetic PDFs. They cover: section rows in four drawing styles, the
+There are 11 tests with synthetic PDFs. The 11th (v11) is a form title above the column
+header (rule 6b). They cover: section rows in four drawing styles, the
 issue frame, a partial merge, dividers in the header only, a text run across a drawn rule, a
 joined run with a column gap, a spanning label next to separate values, a spanning label next
 to a footnote marker, a repeated group header (rules 16 and 17), and right-aligned numbers
@@ -222,6 +234,37 @@ a clean held-out set, and the v10 numbers are a little optimistic.
 | v9 without the glue guard | +0.0044 | [-0.0003, +0.0097] | 95 / 52 | 0.4475 |
 | v9, glue guard without alignment | +0.0040 | [-0.0009, +0.0093] | 93 / 51 | |
 
+### v11: no merges above the header band (2026-11-24, `results/compare_v11.txt`)
+
+v11 is v10 plus rule 6b.
+
+| | main | v7 | v10 | **v11** |
+|---|---|---|---|---|
+| Held-out Tables (4 subsets, equal weight) | 0.2879 | 0.2944 | **0.2968** | 0.2943 |
+| Per-page change vs main | | +0.0076 | **+0.0104** | +0.0075 |
+| 95% CI | | [+0.0025, +0.0127] | [+0.0051, +0.0160] | [+0.0044, +0.0109] |
+| Pages better / worse | | 96 / 33 | 102 / 26 | 91 / **16** |
+| Largest loss | | -0.93 | -0.93 | **-0.43** |
+| In-sample `tables` subset | 0.4310 | 0.4453 | 0.4453 | 0.4446 |
+| In-sample pages worse than main | | 9 | 9 | 4 |
+
+**v11 is a trade-off, not an improvement.** It gives up a large part of the v10 gains to fix
+pages that `main` also parsed wrongly:
+
+- **It removes or reduces 11 v10 losses (+4.38 in total).** Examples: `dense_table_289` and
+  `dense_table_290` (0 to 0.93), `010b43388a0c67b0_p8` (0 to 0.79), `1fea2f2540c835bf_p1`
+  (0.14 to 0.76). On these pages, `main` also did not read the form text above the table: it
+  cut the text into pieces. v11 gives the same pieces again. The score goes up because the
+  scorer skips the pieces and finds the real header row.
+- **It gives up or reduces 38 v10 gains (-8.03 in total).** Examples: four insurance pages
+  (0.73 to 0.02, `main` 0.00), `qei-2026-08-12_page1` (0.49 to 0.06), several dense tables
+  (0.95 to 1.00 back to `main` at 0.75 to 0.77).
+- **The cause of most lost gains is the weakness of rule 6b.** For example, the header of
+  `02f7022a1f08f606_p7` ("2nd Prior Calendar Year | 1st Prior ... | Most Recent ...") fills only
+  3 of 7 columns. The rule finds the header too far down. Thus it drops the correct merges of
+  the body rows ("Countrywide direct earned premium for lines of business subject to
+  Proposition 103 ($):" over 4 columns), and these rows are cut into pieces again.
+
 ## 6. Version history
 
 - **v1.** This was the first merge rule. The density gate excused covered cells, and the JSON used
@@ -249,7 +292,11 @@ a clean held-out set, and the v10 numbers are a little optimistic.
   other pages it cut real header and data rows (`dense_table_411`: 0.68 to 0.05). The v8 rule
   had one more defect: a column header with an empty first cell was not dense, so the rule also
   cut group-label headers. v9 fixed that defect.
-- **v10.** This is v9 without the form-band cut (see the ablation in section 5).
+- **v10.** This is v9 without the form-band cut (see the ablation in section 5). It is commit
+  `ef9b90a`, and it has the best average score.
+- **v11.** This is v10 plus rule 6b: no merges above the header band. It has fewer and smaller
+  losses, but it gives up many gains (section 5). v11 does not cut rows from the table, so the
+  affected rows read the same as on `main`.
 
 ## 7. The issue PDFs on the branch
 
@@ -261,13 +308,22 @@ a clean held-out set, and the v10 numbers are a little optimistic.
 
 ## 8. Open items, by priority
 
-1. **Form fields above a table inside the grid** (the largest remaining losses, for example
-   `010b43388a0c67b0_p8`: 0.79 in `main`, 0 in v10). The form shares the table's grid, so the
-   rows above the real header ("RATEMAKING DATA", "Completed by: ...") are table rows. The
-   merges make them spanning cells at the top, and the real header becomes a body row. The v9
-   form-band cut fixed these pages but hurt more pages (section 6). A rule that works must find
-   where the table starts with a narrower signal, for example label-and-value pairs or a
-   full-width title row.
+1. **Form fields above a table inside the grid** (`010b43388a0c67b0_p8`: 0.79 in `main`, 0 in
+   v10, 0.79 in v11). The form shares the table's grid, so the rows above the real header
+   ("RATEMAKING DATA", "Completed by: ...") are table rows. In v10, the merges make them
+   spanning cells at the top, and the real header becomes a body row. `main` also did not read
+   these rows: it cut them into pieces, but the scorer skips the pieces. Two attempts failed:
+   - The v9 form-band cut cut real rows on other pages (section 6).
+   - v11 (rule 6b) drops merges above the header, but it finds the header with a 90% fill test.
+     That test fails on headers with empty row-label columns, so v11 also drops correct body
+     merges (section 5).
+
+   **Next idea (1b):** find the form band from the top down, not by a search for the header.
+   From row 0, drop merges only while the rows look like form content: full-width titles,
+   label-and-value rows, empty rows. Stop at the first group-label row, or at the first row
+   that has the column structure of the table body. This keeps body rows safe, because the
+   walk stops before them. Another idea is to split the grid where the set of drawn vertical
+   rules changes, because form fields usually have their own boxes.
 2. **Side-by-side tables in one grid** (`dense_table_289`, `dense_table_290`: 0.93 to 0). The
    output is more faithful, but the HTML form stops the scorer from splitting the two tables.
 3. **Text glued across a gap** (`dense_table_041`, `currency-2026-08-13_page1`). Rule 6a looks
@@ -285,8 +341,9 @@ a clean held-out set, and the v10 numbers are a little optimistic.
 9. **Possible bug, not tested.** `cluster_h_segments` unions the x-ranges of rules at one y.
    `rowspan_mask` can then miss a rowspan that has a gap in its rule.
 10. Add tests for side-by-side tables and for form text above a table.
-11. Do an independent check of v10 on documents that no version used, because the v8 to v10
+11. Do an independent check on documents that no version used, because the v8 to v11
     decisions used ParseBench-2.
+12. Decide between v10 and v11 before the pull request, or replace rule 6b with idea 1b.
 
 ## 9. How to continue
 
@@ -358,6 +415,7 @@ pages that are also in v1.
 | `overlap.json` | ParseBench-2 pages that are also in v1 |
 | `compare_v10.txt` | ParseBench-2 (2026-11-24): main, v7 and v10, the glue scan, the table-count changes and each loss |
 | `ablation.txt` | The ablation table of section 5 |
+| `compare_v11.txt` | ParseBench-2 (2026-11-24): main, v7, v10 and v11, the glue scan, the table-count changes and each loss |
 
 The repository ignores `*.txt`. Add result files with `git add -f`.
 
