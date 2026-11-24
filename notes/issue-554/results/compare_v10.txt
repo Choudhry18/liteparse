@@ -1,0 +1,72 @@
+held-out pages: 1239   in-sample tables pages: 500
+
+subset (held out)                 main          v7         v10
+complex_table_headers           0.0568      0.0571      0.0589
+financial_tables                0.2702      0.2831      0.2831
+insurance_filing_tables         0.3546      0.3676      0.3755
+dense_tables                    0.4700      0.4696      0.4696
+tables, equal weight            0.2879      0.2944      0.2968
+tables (in-sample subset)       0.4310      0.4453      0.4453
+
+v7          vs main, held-out per page: +0.0076  95% CI [+0.0025, +0.0127]  up 96 down 33
+v10         vs main, held-out per page: +0.0104  95% CI [+0.0051, +0.0160]  up 102 down 26
+
+glued number cells v7         :  22 cells on 6 pages
+glued number cells v10        :   3 cells on 2 pages
+   v10 still glued: dense_tables/dense_table_393  ['30 June 2025', '31 December 2024']
+   v10 still glued: insurance_filing_tables/ab7d5a005dc3c5f3_p11  ['2,415,791,748 2,403,142,009 2,327,784,231']
+
+output differs from main on 211 held-out pages
+table count changes main -> v10: 13
+    3 ->  2  dense_tables/dense_table_247  score 0.037 -> 0.037
+    2 ->  1  dense_tables/dense_table_255  score 0.000 -> 0.000
+    7 ->  1  insurance_filing_tables/28a38e3798a00306_p3  score 0.645 -> 0.804
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p1  score 0.662 -> 0.712
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p2  score 0.628 -> 0.709
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p4  score 0.663 -> 0.776
+    7 ->  1  insurance_filing_tables/51abb0b9601cd8df_p5  score 0.649 -> 0.737
+    6 ->  1  insurance_filing_tables/51abb0b9601cd8df_p6  score 0.641 -> 0.691
+    6 ->  1  insurance_filing_tables/51abb0b9601cd8df_p7  score 0.538 -> 0.656
+    5 ->  1  insurance_filing_tables/51abb0b9601cd8df_p8  score 0.651 -> 0.764
+    5 ->  1  insurance_filing_tables/51abb0b9601cd8df_p9  score 0.660 -> 0.610
+    9 ->  7  insurance_filing_tables/ab7d5a005dc3c5f3_p11  score 0.000 -> 0.000
+    1 ->  5  insurance_filing_tables/f21bd303b0de617f_p20  score 0.535 -> 0.830
+
+held-out losses, v10 vs main (with v7 for the same page):
+   -0.929  main 0.929  v7 0.000  v10 0.000  dense_tables/dense_table_289
+   -0.929  main 0.929  v7 0.000  v10 0.000  dense_tables/dense_table_290
+   -0.790  main 0.790  v7 0.000  v10 0.000  insurance_filing_tables/010b43388a0c67b0_p8
+   -0.617  main 0.756  v7 0.139  v10 0.139  insurance_filing_tables/1fea2f2540c835bf_p1
+   -0.430  main 0.720  v7 0.290  v10 0.290  insurance_filing_tables/02f7022a1f08f606_p8
+   -0.430  main 0.720  v7 0.290  v10 0.290  insurance_filing_tables/10eeb62c10e2abee_p9
+   -0.401  main 0.499  v7 0.098  v10 0.098  dense_tables/dense_table_041
+   -0.333  main 0.745  v7 0.411  v10 0.411  insurance_filing_tables/0211a1880172f065_p8
+   -0.273  main 0.419  v7 0.146  v10 0.146  dense_tables/dense_table_304
+   -0.241  main 0.369  v7 0.128  v10 0.128  dense_tables/dense_table_344
+   -0.240  main 0.240  v7 0.000  v10 0.000  financial_tables/currency-2026-08-13_page1
+   -0.150  main 0.490  v7 0.340  v10 0.340  insurance_filing_tables/64a4c79de95f6871_p8
+   -0.130  main 0.544  v7 0.414  v10 0.414  insurance_filing_tables/fa15a92da8391dd8_p26
+   -0.084  main 0.840  v7 0.756  v10 0.756  dense_tables/dense_table_074
+   -0.080  main 0.260  v7 0.180  v10 0.180  complex_table_headers/complex_header_084
+   -0.067  main 0.815  v7 0.747  v10 0.747  dense_tables/dense_table_246
+   -0.059  main 0.828  v7 0.769  v10 0.769  dense_tables/dense_table_233
+   -0.050  main 0.660  v7 0.610  v10 0.610  insurance_filing_tables/51abb0b9601cd8df_p9
+   -0.050  main 0.850  v7 0.800  v10 0.800  insurance_filing_tables/4ef83fb72676cd65_p5
+   -0.035  main 0.035  v7 0.000  v10 0.000  financial_tables/sampo-2026-08-13_page1
+   -0.024  main 0.814  v7 0.790  v10 0.790  dense_tables/dense_table_071
+   -0.017  main 0.460  v7 0.443  v10 0.443  insurance_filing_tables/2c5871845c5862a8_p2
+   -0.011  main 0.950  v7 0.939  v10 0.939  dense_tables/dense_table_047
+   -0.006  main 0.006  v7 0.000  v10 0.000  financial_tables/r-2026-08-12_page3
+   -0.001  main 0.001  v7 0.000  v10 0.000  dense_tables/dense_table_443
+   -0.001  main 0.302  v7 0.301  v10 0.301  dense_tables/dense_table_272
+
+in-sample tables subset, v10 vs main losses:
+   -0.257  main 0.590  v7 0.333  v10 0.333  tables/FBLB-134215544_page114
+   -0.244  main 0.467  v7 0.222  v10 0.222  tables/Kimco-Realty-2023-Annual-Report-Web_page11
+   -0.200  main 0.200  v7 0.000  v10 0.000  tables/Coca Cola 10-k_page48
+   -0.172  main 0.172  v7 0.000  v10 0.000  tables/SERFF_CA_random_pages 1_page1261
+   -0.150  main 0.244  v7 0.094  v10 0.094  tables/SERFF_TX_random_pages 1_page706
+   -0.053  main 0.204  v7 0.151  v10 0.151  tables/test_page1
+   -0.040  main 0.830  v7 0.791  v10 0.791  tables/SERFF_TX_random_pages 1_page847
+   -0.015  main 0.255  v7 0.240  v10 0.240  tables/SERFF_CA_random_pages 1_page844
+   -0.014  main 0.283  v7 0.269  v10 0.269  tables/SERFF_CA_random_pages 1_page1878

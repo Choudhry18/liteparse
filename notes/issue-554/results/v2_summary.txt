@@ -1,0 +1,10 @@
+subset                        n    main  fixed6    delta md_diff   up down  | new-only:    n    main  fixed6    delta
+tables                      500  0.4310  0.4452  +0.0142      73   40    9  |             51  0.2008  0.2008  +0.0000   failed 0/0
+complex_table_headers       149  0.0538  0.0544  +0.0006       8    1    2  |            139  0.0568  0.0574  +0.0007   failed 0/0
+financial_tables            319  0.2702  0.2816  +0.0114      49   17    4  |            319  0.2702  0.2816  +0.0114   failed 0/0
+insurance_filing_tables     412  0.3540  0.3656  +0.0116      83   45   15  |            412  0.3540  0.3656  +0.0116   failed 0/0
+dense_tables                373  0.4670  0.4648  -0.0022      71   28   17  |            369  0.4700  0.4678  -0.0022   failed 0/0
+forms                       500  0.6601  0.6686  +0.0084      91   49    7  |            500  0.6601  0.6686  +0.0084   failed 0/0
+fillable_forms              100  0.8623  0.8674  +0.0051      22   10    1  |            100  0.8623  0.8674  +0.0051   failed 0/0
+Tables dimension (weighted): 0.3586 -> 0.3684 (+0.0098)
+Forms dimension (weighted):  0.6854 -> 0.6934 (+0.0080)

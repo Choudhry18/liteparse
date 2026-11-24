@@ -1,0 +1,16 @@
+ParseBench-2, held-out pages only (overlap.json "new"), no OCR. ParseBench clone d7efdbc.
+v7 = v6 scores, with the 338 pages where the contiguous growth changes output
+replaced by their v7 scores (v7 output equals the reviewer's REVIEW_CONTIG variant
+on all 338 pages, checked by md5 of the markdown).
+
+subset                      n    main      v6      v7   up/down v7 vs main
+complex_table_headers     139  0.0568  0.0574  0.0571   1/2
+financial_tables          319  0.2702  0.2816  0.2831   18/3
+insurance_filing_tables   412  0.3540  0.3656  0.3670   46/15
+dense_tables              369  0.4700  0.4678  0.4696   31/13
+forms                     500  0.6601  0.6686  0.6688   49/6
+fillable_forms            100  0.8623  0.8674  0.8665   10/1
+tables (4 held-out subsets, equal weight): main 0.2877  v6 0.2931  v7 0.2942
+per-page delta v7 vs main over 1239 held-out table pages: +0.0076
+  95% bootstrap CI [+0.0024, +0.0129], up 96, down 33
+glued numeric colspan cells: main 0, v6 62 (14 docs), v7 31 (12 docs)

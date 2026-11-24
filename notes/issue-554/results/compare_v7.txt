@@ -1,0 +1,84 @@
+category           before    after    delta   docs  failed(b/a)
+table              0.4581   0.4671  +0.0090    503  0/0
+chart              0.0123   0.0147  +0.0025    568  0/0
+text_content       0.7060   0.7062  +0.0003    506  0/0
+text_formatting    0.4440   0.4441  +0.0001    476  0/0
+layout             0.3203   0.3205  +0.0002    500  50/50
+overall (mean)     0.3881   0.3905  +0.0024
+
+75 examples changed:
+  table           0.7437 -> 0.6000  -0.1437  table/SERFF_CA_random_pages 1_page96
+  table           0.5805 -> 0.5444  -0.0360  table/SERFF_TX_random_pages 1_page1284
+  table           0.2898 -> 0.2586  -0.0312  table/SERFF_TX_random_pages 1_page402
+  table           0.1461 -> 0.1335  -0.0126  table/Kimco-Realty-2023-Annual-Report-Web_page11
+  table           0.2373 -> 0.2259  -0.0113  table/SERFF_TX_random_pages 1_page649
+  text_content    0.9339 -> 0.9259  -0.0080  text/text_multilang__french2
+  table           0.0357 -> 0.0322  -0.0035  table/SERFF_TX_random_pages 1_page1124
+  table           0.0236 -> 0.0223  -0.0013  table/FBLB-134215544_page62
+  table           0.0676 -> 0.0663  -0.0012  table/blackrock-funds-i-icav-annual-report-2022_page25
+  table           0.1127 -> 0.1127  -0.0000  table/222876fb_page5
+  table           0.0347 -> 0.0348  +0.0001  table/SERFF_TX_random_pages 1_page1057
+  table           0.0067 -> 0.0069  +0.0001  table/SERFF_CA_random_pages 1_page22
+  table           0.1001 -> 0.1005  +0.0005  table/SERFF_CA_random_pages 1_page2467
+  text_content    0.4580 -> 0.4587  +0.0007  text/text_multicolumns__3colchinese
+  text_content    0.7290 -> 0.7306  +0.0016  text/text_dense__livingWord
+  table           0.2468 -> 0.2490  +0.0023  table/FBLB-134215544_page154
+  table           0.1012 -> 0.1042  +0.0030  table/Coca Cola 10-k_page51
+  text_content    0.7646 -> 0.7677  +0.0032  text/text_multicolumns__delays
+  table           0.7770 -> 0.7808  +0.0038  table/SERFF_CA_random_pages 1_page1201
+  layout          0.0000 -> 0.0051  +0.0051  layout/076523s007lbl_p2
+  table           0.1895 -> 0.1948  +0.0053  table/walmart-earnings-release-fy24-q4_page13
+  table           0.0729 -> 0.0792  +0.0063  table/FBLB-134215544_page5
+  table           0.4490 -> 0.4583  +0.0094  table/SERFF_CA_random_pages 1_page1261
+  table           0.6934 -> 0.7028  +0.0094  table/FBLB-134215544_page115
+  table           0.2658 -> 0.2754  +0.0096  table/FBLB-134215544_page114
+  text_content    0.8083 -> 0.8191  +0.0107  text/text_multicolumns__greek
+  table           0.3974 -> 0.4103  +0.0128  table/AZ LIC Rate Tables 2.0.v2_page47
+  table           0.3012 -> 0.3151  +0.0138  table/222876fb_page3
+  table           0.1159 -> 0.1298  +0.0139  table/Apple 10-k_page51
+  table           0.6498 -> 0.6639  +0.0141  table/FBLB-134215544_page18
+  table           0.4391 -> 0.4565  +0.0174  table/SERFF_CA_random_pages 1_page1878
+  table           0.3313 -> 0.3529  +0.0217  table/DS5795A-06_page15
+  table           0.4241 -> 0.4460  +0.0218  table/SERFF_TX_random_pages 1_page1051
+  text_formatting 0.0945 -> 0.1182  +0.0236  text/text_multicolumns__elpais
+  table           0.2017 -> 0.2258  +0.0241  table/FBLB-134215544_page163
+  table           0.6046 -> 0.6295  +0.0249  table/0000027_page1
+  table           0.4211 -> 0.4472  +0.0261  table/Coca Cola 10-k_page30
+  table           0.7115 -> 0.7394  +0.0279  table/SERFF_TX_random_pages 1_page824
+  text_content    0.8539 -> 0.8885  +0.0346  text/text_multicolumns__lotofcol
+  text_content    0.7323 -> 0.7704  +0.0381  text/text_multicolumns__elpais
+  table           0.1388 -> 0.1782  +0.0394  table/FBLB-134215544_page99
+  table           0.4814 -> 0.5276  +0.0462  table/SERFF_CA_random_pages 1_page1724
+  text_content    0.8395 -> 0.8955  +0.0560  text/text_multicolumns__article
+  table           0.9130 -> 0.9696  +0.0567  table/synthetic_invoice_page1
+  table           0.1111 -> 0.1725  +0.0615  table/637951191e7b35ae07dbd4c76a2e6690c370_pg2_pg1_page1
+  table           0.0359 -> 0.1047  +0.0688  table/Home Depot 10-k unrestricted_page72
+  table           0.6331 -> 0.7041  +0.0711  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page27
+  table           0.3750 -> 0.4500  +0.0750  table/Victoria Secret 10-k_page5
+  layout          0.0800 -> 0.1600  +0.0800  layout/fh_2025_004e_p6
+  table           0.7477 -> 0.8333  +0.0856  table/AONR32314_page2
+  table           0.4028 -> 0.4944  +0.0917  table/AZ LIC Rate Tables 2.0.v2_page105
+  table           0.3162 -> 0.4085  +0.0923  table/hard_page2
+  chart           0.0000 -> 0.1000  +0.1000  chart/Goldman_Sachs_BUY_report_p10
+  table           0.7566 -> 0.8567  +0.1001  table/SERFF_CA_random_pages 1_page1551
+  table           0.4522 -> 0.5708  +0.1186  table/SERFF_TX_random_pages 1_page847
+  table           0.2932 -> 0.4166  +0.1233  table/Coca Cola 10-k_page48
+  table           0.8754 -> 0.9998  +0.1244  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page21
+  table           0.8606 -> 1.0000  +0.1394  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page22
+  table           0.8572 -> 0.9996  +0.1424  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page11
+  table           0.4845 -> 0.6287  +0.1441  table/AZ LIC Rate Tables 2.0.v2_page48
+  table           0.8539 -> 0.9999  +0.1461  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page25
+  table           0.8032 -> 0.9560  +0.1529  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page26
+  table           0.7128 -> 0.8712  +0.1584  table/222876fb_page2
+  table           0.7184 -> 0.8936  +0.1752  table/DS5795A-06_page5
+  table           0.7942 -> 1.0000  +0.2058  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page23
+  table           0.7893 -> 1.0000  +0.2107  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page24
+  table           0.5234 -> 0.7427  +0.2193  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page28
+  table           0.7617 -> 0.9998  +0.2381  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page13
+  table           0.7048 -> 0.9438  +0.2389  table/Low-Back-Guideline (1)_page2
+  chart           0.2500 -> 0.5000  +0.2500  chart/Digital_News-Report_2022_p55
+  table           0.5044 -> 0.7691  +0.2647  table/SERFF_TX_random_pages 1_page159
+  chart           0.0000 -> 0.3000  +0.3000  chart/Visa-Fiscal-2025-Annual-Report_p10
+  table           0.1633 -> 0.4922  +0.3290  table/test_page1
+  table           0.3217 -> 0.8999  +0.5782  table/203924_fb04e77929bf4bbc93dbd659653a4f01_page12
+  chart           0.0000 -> 0.7500  +0.7500  chart/ac8b3538-en_p143

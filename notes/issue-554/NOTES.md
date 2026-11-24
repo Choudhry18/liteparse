@@ -2,7 +2,9 @@
 
 Work notes for https://github.com/run-llama/liteparse/issues/554.
 Branch: `fix/ruled-colspan-missing-vrule`, based on upstream `main` at `a684a4a` (v2.20.0).
-The code on the branch is **v7** (section 6 gives the history).
+The code on the branch is **v10** (section 6 gives the history).
+A persistent worktree for this branch is at `~/Desktop/Choudhry/liteparse-554`. Do not work
+in `/tmp`: macOS deletes files there that are older than 3 days.
 
 **Drop the `notes:` commits before you open a pull request.**
 
@@ -31,7 +33,7 @@ The cause is in `crates/liteparse/src/markdown_layout/tables.rs`:
 - `cluster_v_segments` unions the y-ranges of all rules at one x. This fills the gap that a
   spanning row leaves in a rule. Only the raw segments (`raw_vs`) show the gap.
 
-## 2. The rules on the branch (v7)
+## 2. The rules on the branch (v10)
 
 All rules are in `tables.rs`, except for the output rules. Tables without covered cells give
 the same output as `main`.
@@ -53,6 +55,12 @@ For each row and each interior boundary `xs[c]`:
 5. A boundary merges when 1, 2 and 3 are true and 4 is false.
 6. **Growth.** Each merged group grows across unruled boundaries into the empty cells next to
    it. It stops at the first cell with text.
+6a. **Numeric glue guard** (`unmerge_glued_numbers`, v10). A merged group is cancelled when it
+   holds two neighbouring numbers on one line that are separate, and both numbers align with a
+   number in another row of the grid (left or right edges within 2.5pt). Two numbers are one
+   number only as a digit-group pair: the gap is at most half the font size, the left part
+   ends in 1 to 3 digits, and the right part is exactly 3 digits ("10 000"). The words come
+   from the word boxes, or from the span split at whitespace.
 
 Performance: the function stops early when no text crosses a boundary. It puts each raw
 segment in the bucket of its nearest boundary, in one pass. It checks only rows with a
@@ -85,12 +93,22 @@ crossing.
 15. The layout JSON keeps `kind: "table"` and one cell per column. The first cell of a group
     gets `colspan`. A covered cell is an empty cell without a `bbox`.
 
+### Repeated-header split: `split_repeated_header_tables` in `blocks.rs` (v10)
+
+16. A group-label row (`is_group_label_row`: it has covered cells, and each filled cell after
+    the first column spans columns) moves with a repeated header row below it, the same as a
+    title row. Before, the cut came between the group labels and their column header.
+17. A part that starts with a group-label row and its column header gets one folded header
+    row (`fold_group_header`): "Current Base Rates F.R", the same form as
+    `flatten_header_band`.
+
 ### Tests: `tests/ruled_colspan.rs`
 
-There are 8 tests with synthetic PDFs. They cover: section rows in four drawing styles, the
+There are 10 tests with synthetic PDFs. They cover: section rows in four drawing styles, the
 issue frame, a partial merge, dividers in the header only, a text run across a drawn rule, a
-joined run with a column gap, a spanning label next to separate values, and a spanning label
-next to a footnote marker.
+joined run with a column gap, a spanning label next to separate values, a spanning label next
+to a footnote marker, a repeated group header (rules 16 and 17), and right-aligned numbers
+that header-only rules cut through (rule 6a).
 
 ## 3. Alternative merge rules that were tested
 
@@ -165,6 +183,45 @@ than v1, but the same type of document.
   half the font height and the 3pt margin are not fragile. The held-out Tables score moves by
   at most 0.0006 when one constant changes.
 
+### ParseBench-2 again, for v8 to v10 (2026-11-24)
+
+These runs use a newer ParseBench clone (`63e926f`), so the numbers differ a little from the
+table above. `main`, v7 and v10 were all scored with this clone. The v1 data was not available,
+so the in-sample check uses the ParseBench-2 `tables` subset (v1 documents).
+
+**Caution:** the v8 to v10 decisions used these held-out results. Thus ParseBench-2 is no longer
+a clean held-out set, and the v10 numbers are a little optimistic.
+
+| | main | v7 | **v10** |
+|---|---|---|---|
+| Held-out Tables (4 subsets, equal weight) | 0.2879 | 0.2944 | **0.2968** |
+| complex_table_headers | 0.0568 | 0.0571 | 0.0589 |
+| financial_tables | 0.2702 | 0.2831 | 0.2831 |
+| insurance_filing_tables | 0.3546 | 0.3676 | 0.3755 |
+| dense_tables | 0.4700 | 0.4696 | 0.4696 |
+| In-sample `tables` subset | 0.4310 | 0.4453 | 0.4453 |
+| Per-page change vs main (1,239 held-out pages) | | +0.0076 | **+0.0104**, 95% CI [+0.0051, +0.0160] |
+| Pages better / worse | | 96 / 33 | **102 / 26** |
+| Glued number cells (4 table subsets) | 0 | 22 on 6 pages | **3 on 2 pages** |
+| Pages with another table count than main | | 12 | 13 |
+
+- On each page where v10 scores lower than `main`, v10 has the same score as v7. Thus v10 adds
+  no new loss.
+- The 3 glued cells that remain do not come from a merge. `dense_table_393` has date headers
+  ("30 June 2025"), which the scan reads as numbers. `ab7d5a005dc3c5f3_p11` has a grid with only
+  2 columns, and `main` also puts the 3 values in one cell.
+
+**Ablation (`results/ablation.txt`).** v9 had three new changes. Each run removes one of them:
+
+| Run | Held-out per page vs main | 95% CI | Better / worse | In-sample |
+|---|---|---|---|---|
+| v7 | +0.0076 | [+0.0028, +0.0126] | 96 / 33 | 0.4453 |
+| v9 (all three) | +0.0044 | [-0.0004, +0.0101] | 95 / 51 | 0.4475 |
+| v9 without the form-band cut (= v10) | **+0.0104** | [+0.0048, +0.0158] | **102 / 26** | 0.4453 |
+| v9 without the group-label split | +0.0039 | [-0.0015, +0.0093] | 95 / 51 | 0.4475 |
+| v9 without the glue guard | +0.0044 | [-0.0003, +0.0097] | 95 / 52 | 0.4475 |
+| v9, glue guard without alignment | +0.0040 | [-0.0009, +0.0093] | 93 / 51 | |
+
 ## 6. Version history
 
 - **v1.** This was the first merge rule. The density gate excused covered cells, and the JSON used
@@ -180,7 +237,19 @@ than v1, but the same type of document.
   `SERFF_CA ... page1724` went from -0.32 to +0.05.
 - **v7.** In this version, the growth stops at a cell with text (rule 6). Before, every unruled boundary next to an
   empty cell merged in a row with a merge. That glued separate values: `qei-2026-08-12_page1`
-  gave `-1.01 -0.13` in one cell. An independent review found this defect.
+  gave `-1.01 -0.13` in one cell. An independent review found this defect. It is commit `8164c9c`.
+- **v8 and v9.** These versions added three rules:
+  - The numeric glue guard (rule 6a).
+  - The group-label split and the folded header (rules 16 and 17). `f21bd303b0de617f_p20` went
+    from 0.54 to 0.83.
+  - A form-band cut. The rows above the first dense row without merges left the table when one
+    of their merged rows was not a group label.
+
+  The form-band cut fixed the Ratemaking pages (`010b43388a0c67b0_p8`: 0.79 to 0.90). But on many
+  other pages it cut real header and data rows (`dense_table_411`: 0.68 to 0.05). The v8 rule
+  had one more defect: a column header with an empty first cell was not dense, so the rule also
+  cut group-label headers. v9 fixed that defect.
+- **v10.** This is v9 without the form-band cut (see the ablation in section 5).
 
 ## 7. The issue PDFs on the branch
 
@@ -188,33 +257,36 @@ than v1, but the same type of document.
   order.
 - `frame_one_row.pdf` gives the same form, because `main` accepts this grid. This is the "HTML
   table with a colspan cell" option of the issue. The reporter prefers headings and
-  paragraphs, so see open item 6.
+  paragraphs, so see open item 7.
 
 ## 8. Open items, by priority
 
-1. **Glued numbers that remain (31 cells).** The word-space test in `text_flows_across` sees a
-   space in `20 009` (a space as the thousands separator) or a tight numeric column as a word
-   space. Do not add a check on digits: that is a content rule, not a layout rule. A better
-   rule is column alignment. When the words of a crossing row align with the column edges of
-   the rows above and below, the boundary is a real column edge.
-2. **Table segmentation changes in 14 held-out pages.** The table decision is the same as on
-   `main`, but the split into tables changes:
-   - `f21bd303_p20`: with a 2-row header, `split_repeated_header_tables` cuts in the wrong
-     place.
-   - `51abb0b9`: 1 table where `main` gives 5 to 7.
-3. **Text above a table inside the grid becomes a spanning header** over the real columns.
-   This causes most of the large ParseBench-2 losses.
-4. **Title row** (`SERFF_CA ... page96`, -0.14). A full-width title above the real header gives
+1. **Form fields above a table inside the grid** (the largest remaining losses, for example
+   `010b43388a0c67b0_p8`: 0.79 in `main`, 0 in v10). The form shares the table's grid, so the
+   rows above the real header ("RATEMAKING DATA", "Completed by: ...") are table rows. The
+   merges make them spanning cells at the top, and the real header becomes a body row. The v9
+   form-band cut fixed these pages but hurt more pages (section 6). A rule that works must find
+   where the table starts with a narrower signal, for example label-and-value pairs or a
+   full-width title row.
+2. **Side-by-side tables in one grid** (`dense_table_289`, `dense_table_290`: 0.93 to 0). The
+   output is more faithful, but the HTML form stops the scorer from splitting the two tables.
+3. **Text glued across a gap** (`dense_table_041`, `currency-2026-08-13_page1`). Rule 6a looks
+   only at numbers.
+4. **Table segmentation changes in 13 held-out pages.** 9 score higher, and 1 is lower
+   (`51abb0b9601cd8df_p9`: 0.66 to 0.61).
+5. **Title row** (`SERFF_CA ... page96`, -0.14). A full-width title above the real header gives
    a title header and a body row. `Block::Table` has only one header row.
-5. **Two header lines in one ruled row** (`SERFF_TX ... page1284`, -0.04). The grid cannot
+6. **Two header lines in one ruled row** (`SERFF_TX ... page1284`, -0.04). The grid cannot
    separate them, and `main` is also wrong there.
-6. **A long body under a frame** still rejects the whole table (cases 03 and 04). A fix splits the grid at a tall
+7. **A long body under a frame** still rejects the whole table (cases 03 and 04). A fix splits the grid at a tall
    row that spans all columns. `split_component_at_grid_gaps` must then look only at interior
    verticals.
-7. The group-label rule (rules 11 and 12) comes from one example. Test it on more layouts.
-8. **Possible bug, not tested.** `cluster_h_segments` unions the x-ranges of rules at one y.
+8. The group-label rule (rules 11 and 12) comes from one example. Test it on more layouts.
+9. **Possible bug, not tested.** `cluster_h_segments` unions the x-ranges of rules at one y.
    `rowspan_mask` can then miss a rowspan that has a gap in its rule.
-9. Add tests for side-by-side tables and for form text above a table.
+10. Add tests for side-by-side tables and for form text above a table.
+11. Do an independent check of v10 on documents that no version used, because the v8 to v10
+    decisions used ParseBench-2.
 
 ## 9. How to continue
 
@@ -261,6 +333,12 @@ LITEPARSE_BIN=/path/to/lit .venv/bin/parse-bench run liteparse_markdown --datase
   --open_report=False --output_dir ../out2_X --force -m 6
 ```
 
+After the first download, add `--input_dir <ParseBench>/data_parsebench-2` to a ParseBench-2
+run. Without it, the harness checks the dataset on Hugging Face again, and it can stop with
+HTTP 429 (rate limit). The ParseBench-2 download is the full dataset (about 1.6 GB), even with
+`--group`. Newer clones of ParseBench do not keep each document's output; run `lit` on the PDF
+to see the markdown. `compare_v10.py` and `ablate.py` read the newer output.
+
 A v1 run takes 3 to 4 minutes on an Apple Silicon laptop. Each document's raw `lit` output is in
 `<out>/liteparse_markdown/<category>/<name>.raw.json`. The v1 ground truth is in
 `data/<category>.jsonl` (`expected_markdown`). `results/overlap.json` marks the ParseBench-2
@@ -270,13 +348,18 @@ pages that are also in v1.
 
 | File | Content |
 |---|---|
-| `compare_v4.txt`, `compare_v7.txt` | v1 per-document changes, main against v4 and v7 |
+| `compare_v7.txt` | v1 per-document changes, main against v7 (the v4 list was lost) |
+| `compare_v9.txt` | ParseBench-2 (2026-11-24): main, v7, v9 and v9 without alignment |
 | `heldout_v7.txt` | The held-out table of section 5 |
 | `v2_summary.txt` | ParseBench-2 scores, main against v6 (from the review) |
 | `judgments.tsv` | The reviewer's visual judgments of 35 pages |
 | `glue_scan_variants.txt` | Glued number cells for each variant |
 | `sensitivity_scores.txt` | Held-out scores for each constant variant |
 | `overlap.json` | ParseBench-2 pages that are also in v1 |
+| `compare_v10.txt` | ParseBench-2 (2026-11-24): main, v7 and v10, the glue scan, the table-count changes and each loss |
+| `ablation.txt` | The ablation table of section 5 |
+
+The repository ignores `*.txt`. Add result files with `git add -f`.
 
 ## 10. Fork note
 
