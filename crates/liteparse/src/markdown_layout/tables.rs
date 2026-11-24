@@ -4664,7 +4664,49 @@ fn colspan_mask(
             );
         }
     }
+    drop_merges_above_header(&mut mask, &occupied, dbg);
     mask
+}
+
+/// Drop the merges in the rows above a table's header band.
+///
+/// A form often draws its fields and titles in the same grid as the table
+/// below them ("RATEMAKING DATA", "Completed by: ..."). Those rows are not
+/// table rows, and a merge there puts a form field in the place of the
+/// column header. The column header is the first dense row without merges.
+/// Above it, unmerged rows and group-label rows belong to the header band.
+/// The first merged row that is not a group label ends the band: that row
+/// and all rows above it keep no merges, so they read as before
+/// `colspan_mask` existed.
+fn drop_merges_above_header(mask: &mut [Vec<bool>], occupied: &[Vec<bool>], dbg: bool) {
+    let n_rows = mask.len();
+    let Some(n_cols) = mask.first().map(|m| m.len()) else {
+        return;
+    };
+    let merged = |m: &[Vec<bool>], r: usize| m[r].iter().any(|x| *x);
+    let fill = |r: usize| occupied[r].iter().filter(|o| **o).count() as f32 / n_cols as f32;
+    let Some(header) = (0..n_rows).find(|&r| !merged(mask, r) && fill(r) >= TABLE_ROW_MIN_FILL)
+    else {
+        return;
+    };
+    let group_label = |m: &[Vec<bool>], r: usize| {
+        let in_group = |c: usize| m[r][c] || (c + 1 < n_cols && m[r][c + 1]);
+        !m[r][1..].iter().all(|x| *x) && (1..n_cols).all(|c| !occupied[r][c] || in_group(c))
+    };
+    let Some(end) = (0..header)
+        .rev()
+        .find(|&r| merged(mask, r) && !group_label(mask, r))
+    else {
+        return;
+    };
+    for row in mask.iter_mut().take(end + 1) {
+        row.fill(false);
+    }
+    if dbg {
+        eprintln!(
+            "[ruled]   colspan: no merges in rows 0..={end}, above the header band of row {header}"
+        );
+    }
 }
 
 /// One word of a grid row, for the numeric glue guard.

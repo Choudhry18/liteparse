@@ -583,3 +583,43 @@ async fn numbers_aligned_in_columns_do_not_glue_into_one_cell() {
         assert!(!md.contains(pair), "{pair} must not share a cell:\n{md}");
     }
 }
+
+#[tokio::test]
+async fn form_title_above_the_column_header_does_not_merge() {
+    // Row 0 is a full-width form title with no interior rules. Rows 1 to 3
+    // are form fields and row 4 the column header. Four rows above the
+    // header are too many for header folding, so without the rule the title
+    // stays a cell that spans the table. Merges above the header band are
+    // dropped, so these rows read the same as on main.
+    let rows: Rows = &[
+        None,
+        Some(["Completed by:", "", "Jane Doe"]),
+        Some(["Date completed:", "", "6/4/2024"]),
+        Some(["Line of business:", "", "Personal auto"]),
+        Some(["Line", "Description", "Amount"]),
+        Some(["(1)", "Written premium", "20,057"]),
+        Some(["(2)", "Earned premium", "19,880"]),
+        Some(["(3)", "Exposure units", "5,472"]),
+    ];
+    let mut p = Page::new();
+    grid_hlines_and_frame(&mut p, rows.len());
+    for r in 1..rows.len() {
+        let (y0, y1) = row_y(r);
+        for x in [XS[1], XS[2]] {
+            p.line(x, y0, x, y1);
+        }
+    }
+    grid_text(
+        &mut p,
+        rows,
+        "RATEMAKING DATA FOR THE PERSONAL AUTO PROGRAM FILING",
+    );
+
+    let result = parse(p).await;
+    let md = markdown(&result);
+    assert!(
+        !md.contains("colspan"),
+        "no merge above the header band:\n{md}"
+    );
+    assert!(md.contains("| (1) | Written premium | 20,057 |"), "{md}");
+}
