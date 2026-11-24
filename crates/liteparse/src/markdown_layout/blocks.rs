@@ -466,7 +466,8 @@ pub fn split_repeated_header_tables(blocks: Vec<PositionedBlock>) -> Vec<Positio
                     .iter()
                     .map(|r| r.iter().map(|c| c.as_str()).collect())
                     .collect();
-                let cuts = repeated_header_cuts(&texts, &vec![false; all.len()]);
+                let group_rows: Vec<bool> = all.iter().map(|r| is_group_label_row(r)).collect();
+                let cuts = repeated_header_cuts(&texts, &vec![false; all.len()], &group_rows);
                 if cuts.is_empty() {
                     let mut it = all.into_iter();
                     let header = if had_header { it.next() } else { None };
@@ -484,6 +485,20 @@ pub fn split_repeated_header_tables(blocks: Vec<PositionedBlock>) -> Vec<Positio
                     let seg: Vec<Vec<Cell>> = all[start..end].to_vec();
                     let bbox = union_cells(seg.iter().flatten().filter_map(|c| c.bbox.as_ref()))
                         .or(pb.bbox.clone());
+                    // A part that starts with a group-label row and its column
+                    // header gets one folded header row.
+                    if seg.len() >= 3 && group_rows[start] && !group_rows[start + 1] {
+                        let header = fold_group_header(&seg[0], &seg[1]);
+                        out.push(PositionedBlock::new(
+                            Block::Table {
+                                header: Some(header),
+                                rows: seg[2..].to_vec(),
+                            },
+                            bbox,
+                        ));
+                        start = end;
+                        continue;
+                    }
                     let mut it = seg.into_iter();
                     let header = if k > 0 || had_header { it.next() } else { None };
                     out.push(PositionedBlock::new(
@@ -511,7 +526,7 @@ pub fn split_repeated_header_tables(blocks: Vec<PositionedBlock>) -> Vec<Positio
                     .iter()
                     .map(|r| r.iter().map(|c| c.text.as_str()).collect())
                     .collect();
-                let cuts = repeated_header_cuts(&texts, &spanned);
+                let cuts = repeated_header_cuts(&texts, &spanned, &vec![false; rows.len()]);
                 if cuts.is_empty() {
                     out.push(PositionedBlock::new(
                         Block::MergedTable { rows, header_rows },
@@ -603,7 +618,55 @@ fn nonempty<'a>(cells: impl Iterator<Item = &'a str>) -> usize {
 
 /// Row indices where a new table starts (see [`split_repeated_header_tables`]); a row with
 /// `blocked[i]` (inside a row span) is never a cut.
-fn repeated_header_cuts(rows: &[Vec<&str>], blocked: &[bool]) -> Vec<usize> {
+/// True for a row of group labels: it has covered cells, and each filled cell
+/// after the first column spans columns ("Table 1-2 | Current Base Rates
+/// (4 columns) | | Proposed Base Rates (4 columns)").
+fn is_group_label_row(row: &[Cell]) -> bool {
+    row.iter().any(|c| c.covered)
+        && (1..row.len())
+            .all(|c| row[c].text.trim().is_empty() || row.get(c + 1).is_some_and(|n| n.covered))
+}
+
+/// Fold a group-label row and the column header below it into one header
+/// row. Each column gets its group label and then its own label, the same as
+/// `flatten_header_band` ("Current Base Rates F.R").
+fn fold_group_header(groups: &[Cell], labels: &[Cell]) -> Vec<Cell> {
+    let mut group_text = String::new();
+    (0..labels.len().max(groups.len()))
+        .map(|c| {
+            let g = groups.get(c);
+            if let Some(g) = g.filter(|g| !g.covered) {
+                group_text = g.text.trim().to_string();
+            }
+            let label = labels.get(c).map(|l| l.text.trim()).unwrap_or("");
+            let mut parts: Vec<&str> = Vec::new();
+            if !group_text.is_empty() {
+                parts.push(&group_text);
+            }
+            if !label.is_empty() && parts.last() != Some(&label) {
+                parts.push(label);
+            }
+            let mut bbox = None;
+            for cell in [g, labels.get(c)].into_iter().flatten() {
+                if let Some(b) = &cell.bbox {
+                    Rect::extend(&mut bbox, b);
+                }
+            }
+            let mut text_item_indices = Vec::new();
+            for cell in [g, labels.get(c)].into_iter().flatten() {
+                text_item_indices.extend_from_slice(&cell.text_item_indices);
+            }
+            Cell {
+                text: parts.join(" "),
+                bbox,
+                text_item_indices,
+                ..Cell::default()
+            }
+        })
+        .collect()
+}
+
+fn repeated_header_cuts(rows: &[Vec<&str>], blocked: &[bool], group_rows: &[bool]) -> Vec<usize> {
     // a header row: three or more filled cells, mostly words (a repeated data row such as a
     // regression table's reference category, "Non-snacker | 1.00 | 1.00", is no header)
     let numeric = |c: &str| {
@@ -637,8 +700,10 @@ fn repeated_header_cuts(rows: &[Vec<&str>], blocked: &[bool]) -> Vec<usize> {
         {
             continue;
         }
-        // the title row above moves with the repeated header
-        let cut = if i - 1 > seg_start && nonempty(rows[i - 1].iter().copied()) == 1 {
+        // the title row or group-label row above moves with the repeated header
+        let cut = if i - 1 > seg_start
+            && (nonempty(rows[i - 1].iter().copied()) == 1 || group_rows[i - 1])
+        {
             i - 1
         } else {
             i

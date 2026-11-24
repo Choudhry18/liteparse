@@ -4538,6 +4538,8 @@ fn colspan_mask(
     if n_cols < 2 {
         return mask;
     }
+    // The words of each row, for the numeric glue guard below.
+    let mut row_words: Vec<Vec<RowWord>> = vec![Vec::new(); n_rows];
     let mut crosses = vec![vec![false; n_cols]; n_rows];
     // `splits[r][c]`: one line of row `r` has text on both sides of `xs[c]`,
     // and none of that text flows across it. That line sees `xs[c]` as a
@@ -4545,7 +4547,7 @@ fn colspan_mask(
     // row crosses it (two header lines in one ruled row, for example).
     let mut splits = vec![vec![false; n_cols]; n_rows];
     let mut occupied = vec![vec![false; n_cols]; n_rows];
-    for line in lines {
+    for (line_idx, line) in lines.iter().enumerate() {
         // Per row of this line: the columns it has text in, and the
         // boundaries its text flows across.
         let mut line_occ: Vec<(usize, Vec<bool>, Vec<bool>)> = Vec::new();
@@ -4557,6 +4559,7 @@ fn colspan_mask(
             let Some(r) = find_bucket(ys, cy) else {
                 continue;
             };
+            row_words[r].extend(RowWord::from_span(span, line_idx));
             let i = match line_occ.iter().position(|(row, ..)| *row == r) {
                 Some(i) => i,
                 None => {
@@ -4651,6 +4654,7 @@ fn colspan_mask(
                 k -= 1;
             }
         }
+        unmerge_glued_numbers(&mut mask[r], r, xs, &row_words, dbg);
         if dbg {
             let joins: Vec<f32> = (1..n_cols).filter(|&c| mask[r][c]).map(|c| xs[c]).collect();
             eprintln!(
@@ -4661,6 +4665,172 @@ fn colspan_mask(
         }
     }
     mask
+}
+
+/// One word of a grid row, for the numeric glue guard.
+#[derive(Clone)]
+struct RowWord {
+    x0: f32,
+    x1: f32,
+    text: String,
+    /// Index of the projected line, so that only neighbours on one line pair.
+    line: usize,
+    /// The height of the word's span, used as the font size.
+    em: f32,
+}
+
+impl RowWord {
+    /// The words of a span: its word boxes, or, without them, its
+    /// whitespace-separated tokens at positions in proportion to the text.
+    fn from_span(span: &TextItem, line: usize) -> Vec<RowWord> {
+        let em = span.height.max(1.0);
+        if let Some(words) = verified_words(span) {
+            return words
+                .into_iter()
+                .map(|w| RowWord {
+                    x0: w.x,
+                    x1: w.x + w.width,
+                    text: w.text.trim().to_string(),
+                    line,
+                    em,
+                })
+                .collect();
+        }
+        let text = span.text.as_str();
+        let n_chars = text.chars().count().max(1) as f32;
+        let mut out = Vec::new();
+        let mut start: Option<usize> = None;
+        let chars: Vec<char> = text.chars().collect();
+        for i in 0..=chars.len() {
+            let blank = i == chars.len() || chars[i].is_whitespace();
+            match (start, blank) {
+                (None, false) => start = Some(i),
+                (Some(s), true) => {
+                    out.push(RowWord {
+                        x0: span.x + span.width * s as f32 / n_chars,
+                        x1: span.x + span.width * i as f32 / n_chars,
+                        text: chars[s..i].iter().collect(),
+                        line,
+                        em,
+                    });
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// True for a number token: "1,234", "-0.94", "(5.1)", "$12", "45%", "4*".
+    fn is_number(&self) -> bool {
+        let t = self
+            .text
+            .trim_start_matches(['-', '+', '(', '\u{2212}', '\u{2013}'])
+            .trim_start_matches(['$', '\u{20ac}', '\u{a3}', '\u{a5}'])
+            .trim_end_matches([')', '%', '*']);
+        !t.is_empty()
+            && t.chars().any(|c| c.is_ascii_digit())
+            && t.chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == '.')
+    }
+}
+
+/// True when `b` continues the number `a` after a digit-group space, as in
+/// "10 000": the gap is at most half the font size, `a` ends in 1 to 3
+/// digits, and `b` is a group of exactly 3 digits (with an optional decimal
+/// part).
+fn is_digit_group_pair(a: &RowWord, b: &RowWord) -> bool {
+    let gap = b.x0 - a.x1;
+    let head = a
+        .text
+        .trim_start_matches(['-', '+', '(', '$', '\u{20ac}', '\u{a3}', '\u{2212}']);
+    let tail_digits = head
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    let group = b.text.trim_end_matches([')', '%']);
+    let (int, frac) = group.split_once(['.', ',']).unwrap_or((group, ""));
+    gap <= 0.5 * a.em.max(b.em)
+        && (1..=3).contains(&tail_digits)
+        && tail_digits == head.chars().count()
+        && int.len() == 3
+        && int.chars().all(|c| c.is_ascii_digit())
+        && frac.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Cancel each merged group of row `r` that would put two separate numbers
+/// into one cell.
+///
+/// Two neighbouring number words on one line are separate unless they form a
+/// digit-group pair ("10 000"). A separation counts when both numbers align
+/// with a number in another row of the grid: the left or the right edges agree
+/// within `ALIGN_PT`. That is the column structure the drawn rules do not show.
+/// Such a group was a merge of real columns, so its boundaries stay cell edges.
+fn unmerge_glued_numbers(
+    row_mask: &mut [bool],
+    r: usize,
+    xs: &[f32],
+    row_words: &[Vec<RowWord>],
+    dbg: bool,
+) {
+    const ALIGN_PT: f32 = 2.5;
+    let n_cols = row_mask.len();
+    let aligned = |w: &RowWord| {
+        row_words
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| *row != r)
+            .any(|(_, words)| {
+                words.iter().any(|o| {
+                    o.is_number()
+                        && ((o.x1 - w.x1).abs() <= ALIGN_PT || (o.x0 - w.x0).abs() <= ALIGN_PT)
+                })
+            })
+    };
+    let mut c = 1;
+    while c < n_cols {
+        if !row_mask[c] {
+            c += 1;
+            continue;
+        }
+        // The group covers columns g0..=g1.
+        let g0 = c - 1;
+        let mut g1 = c;
+        while g1 + 1 < n_cols && row_mask[g1 + 1] {
+            g1 += 1;
+        }
+        let (lo, hi) = (xs[g0], xs[g1 + 1]);
+        let mut words: Vec<&RowWord> = row_words[r]
+            .iter()
+            .filter(|w| {
+                let cx = (w.x0 + w.x1) * 0.5;
+                cx >= lo && cx <= hi
+            })
+            .collect();
+        words.sort_by(|a, b| a.line.cmp(&b.line).then(a.x0.total_cmp(&b.x0)));
+        let glued = words.windows(2).find(|p| {
+            let (a, b) = (p[0], p[1]);
+            a.line == b.line
+                && a.is_number()
+                && b.is_number()
+                && !is_digit_group_pair(a, b)
+                && aligned(a)
+                && aligned(b)
+        });
+        if let Some(p) = glued {
+            if dbg {
+                eprintln!(
+                    "[ruled]   colspan row {r}: unmerge columns {g0}..={g1}, separate numbers {:?} {:?}",
+                    p[0].text, p[1].text
+                );
+            }
+            for m in &mut row_mask[g0 + 1..=g1] {
+                *m = false;
+            }
+        }
+        c = g1 + 1;
+    }
 }
 
 /// Bin each line's text into the grid cells defined by column boundaries `xs`

@@ -462,3 +462,124 @@ async fn spanning_label_stops_at_a_cell_with_text() {
         "the marker must not join the label:\n{md}"
     );
 }
+
+#[tokio::test]
+async fn repeated_group_header_splits_above_its_group_labels() {
+    // Two stacked sub-tables in one grid. Each starts with a group-label row
+    // ("Current Rates" over columns 1-2, "Proposed Rates" over columns 3-4)
+    // and a repeated "Low | High" header row.
+    const X5: [f32; 6] = [57.0, 150.0, 250.0, 340.0, 430.0, 520.0];
+    let rows: [[&str; 5]; 8] = [
+        ["Table A: Metals", "", "", "", ""],
+        ["", "Low", "High", "Low", "High"],
+        ["Machine shops", "0.0450", "0.0480", "0.0413", "0.0441"],
+        ["Sheet metal", "0.0490", "0.0550", "0.0450", "0.0505"],
+        ["Table B: Woods", "", "", "", ""],
+        ["", "Low", "High", "Low", "High"],
+        ["Furniture", "0.0780", "0.0870", "0.0716", "0.0799"],
+        ["Upholstery", "0.0900", "0.1000", "0.0826", "0.0918"],
+    ];
+    let group_rows = [0, 4];
+    let mut p = Page::new();
+    let n = rows.len();
+    for r in 0..=n {
+        p.line(X5[0], row_y(r).0, X5[5], row_y(r).0);
+    }
+    for x in [X5[0], X5[1], X5[3], X5[5]] {
+        p.line(x, GRID_TOP, x, row_y(n).0);
+    }
+    for r in (0..n).filter(|r| !group_rows.contains(r)) {
+        let (y0, y1) = row_y(r);
+        for x in [X5[2], X5[4]] {
+            p.line(x, y0, x, y1);
+        }
+    }
+    for (r, row) in rows.iter().enumerate() {
+        let baseline = row_y(r).0 + 15.0;
+        for (c, s) in row.iter().enumerate().filter(|(_, s)| !s.is_empty()) {
+            p.text(X5[c] + 4.0, baseline, s, false);
+        }
+        if group_rows.contains(&r) {
+            // "Current" (36pt) and "Proposed" (43pt) each cover a missing rule.
+            p.text(220.0, baseline, "Current Rates", false);
+            p.text(400.0, baseline, "Proposed Rates", false);
+        }
+    }
+
+    let result = parse(p).await;
+    let md = markdown(&result);
+    assert!(
+        md.contains("| Table A: Metals | Current Rates Low | Current Rates High | Proposed Rates Low | Proposed Rates High |"),
+        "the first part has one folded header:\n{md}"
+    );
+    assert!(
+        md.contains("| Table B: Woods | Current Rates Low | Current Rates High | Proposed Rates Low | Proposed Rates High |"),
+        "the second part starts at its group labels:\n{md}"
+    );
+}
+
+#[tokio::test]
+async fn numbers_aligned_in_columns_do_not_glue_into_one_cell() {
+    // Interior rules exist only in the header row, and two of them cut
+    // through the right-aligned numbers of the body. Each number crosses a
+    // boundary, but the numbers of all rows align: they are separate columns.
+    const XG: [f32; 8] = [57.0, 140.0, 200.0, 250.0, 320.0, 390.0, 460.0, 538.0];
+    let header = ["Index", "Last", "1D", "1M", "3M", "6M", "YTD"];
+    let body = [
+        [
+            "JCI Index",
+            "7,097",
+            "-0.94",
+            "-0.56",
+            "-13.82",
+            "-16.88",
+            "-12.37",
+        ],
+        [
+            "Dow Jones",
+            "8,123",
+            "-1.29",
+            "-6.30",
+            "-3.36",
+            "-4.50",
+            "-2.65",
+        ],
+        [
+            "Nikkei", "9,456", "-0.38", "-1.27", "-5.10", "-3.40", "-6.80",
+        ],
+        ["FTSE", "6,789", "-0.51", "-2.48", "-7.73", "-1.92", "-3.05"],
+    ];
+    let n = body.len() + 1;
+    let mut p = Page::new();
+    for r in 0..=n {
+        p.line(XG[0], row_y(r).0, XG[7], row_y(r).0);
+    }
+    p.line(XG[0], GRID_TOP, XG[0], row_y(n).0);
+    p.line(XG[7], GRID_TOP, XG[7], row_y(n).0);
+    for x in &XG[1..7] {
+        p.line(*x, GRID_TOP, *x, GRID_TOP + PITCH);
+    }
+    for (c, s) in header.iter().enumerate() {
+        p.text(XG[c] + 4.0, GRID_TOP + 15.0, s, true);
+    }
+    for (r, row) in body.iter().enumerate() {
+        let baseline = row_y(r + 1).0 + 15.0;
+        p.text(XG[0] + 6.0, baseline, row[0], false);
+        // Helvetica 10pt: "7,097" is 25.0pt wide, "-0.94" is 22.8pt wide.
+        // Right edges at 206 and 262 put them across x=200 and x=250.
+        p.text(206.0 - 25.0, baseline, row[1], false);
+        p.text(262.0 - 22.8, baseline, row[2], false);
+        // The other values sit inside their columns (x=302 is right of the
+        // second number, as on the page this test copies).
+        p.text(302.0, baseline, row[3], false);
+        for (c, s) in row.iter().enumerate().skip(4) {
+            p.text(XG[c] + 8.0, baseline, s, false);
+        }
+    }
+
+    let result = parse(p).await;
+    let md = markdown(&result);
+    for pair in ["7,097 -0.94", "8,123 -1.29", "9,456 -0.38", "6,789 -0.51"] {
+        assert!(!md.contains(pair), "{pair} must not share a cell:\n{md}");
+    }
+}
