@@ -327,7 +327,7 @@ Versions that did not stay:
   `merge_continuation_rows` passes its "half of the rows have a first cell" test, and it joins
   separate rows. Also, "2 2/3*" share a cell across a rule that a comment connector hides.
 - **Boxes above the table** (`010b43388a0c67b0_p8` and others): this is a `main` bug. See
-  section 8, item 1.
+  section 8, item 7.
 
 ### The other ParseBench-2 subsets (2026-11-25, `results/compare_other.txt`)
 
@@ -345,11 +345,11 @@ The markdown changes on 206 pages outside the table subsets.
   now whole as an "invented value" (for example REFUND on `740-2025__p3`).
 - **2 pages: neutral** (`singapore--02_FormV39A--p1`, `clinical-trial-results-ebc_p3`).
 - **8 pages: broken on `main` too, broken in a different way on the branch.** These are out of
-  scope. They are `main` bugs in form grids, for a later pull request (section 8, item 14).
+  scope. They are `main` bugs in form grids, for a later pull request (section 8, item 8).
 - **1 page where `main` is right and the branch is wrong:** `canada--37_ISP-1610--p1`.
   `main` gives `Is this your first request? Yes ✓ | No ...`. On the branch, the table ends
   before that row, the row prints as text, and the ✓ moves to the line "date of first request".
-  This is out of scope for this pull request (section 8, item 15).
+  This is out of scope for this pull request (section 8, item 12).
 
 ## 6. Version history
 
@@ -394,9 +394,22 @@ The markdown changes on 206 pages outside the table subsets.
   table with a colspan cell" option of the issue. The reporter prefers headings and
   paragraphs, so see open item 7.
 
-## 8. Open items, by priority
+## 8. Open items
 
-1. **Boxes above a table join the grid (a `main` bug, for a later pull request).** Small boxes
+### A. Before this pull request
+
+1. Done: v17 is commit `7967abe` on the fork. The `notes:` commits come after it.
+2. Drop the `notes:` commits from the branch.
+3. Get a code review of the v12 to v17 changes. No one other than the author has read them.
+4. Optional: run olmOCR-bench and opendataloader-bench (`run_benchmarks.sh --liteparse-only`).
+   The project publishes all three benchmarks, and only ParseBench ran for this branch.
+5. Optional: an independent check on documents that no version used. The v8 to v17 decisions
+   used ParseBench-2, so it is not a clean held-out test.
+6. The PR text is in `PR_DRAFT.md`.
+
+### B. `main` bugs for later pull requests
+
+7. **Boxes above a table join the grid.** Small boxes
    above a table (the grey "CDI File #" box, an input box) have an edge at the same x as the
    table's border. `cluster_v_segments` joins all vertical segments at one x into one line,
    across any gap. `split_component_at_grid_gaps` finds the cut, but it keeps the grid whole
@@ -406,29 +419,7 @@ The markdown changes on 206 pages outside the table subsets.
    `results/vgap_classified.txt`). Fix: when the small part is at the top or bottom edge of the
    grid, remove it and keep the cut. `1fea2f2540c835bf_p1` is a related case with a gap of
    only 10pt, below the 30pt minimum.
-2. **Side-by-side tables in one grid** (`dense_table_289`, `dense_table_290`: 0.93 to 0). The
-   output is more faithful, but the HTML form stops the scorer from splitting the two tables.
-3. **Text glued across a gap** (`dense_table_041`, `currency-2026-08-13_page1`). Rule 6a looks
-   only at numbers.
-4. **Table segmentation changes in 13 held-out pages.** 9 score higher, and 1 is lower
-   (`51abb0b9601cd8df_p9`: 0.66 to 0.61).
-5. **Title row** (`SERFF_CA ... page96`, -0.14). A full-width title above the real header gives
-   a title header and a body row. `Block::Table` has only one header row.
-6. **Two header lines in one ruled row** (`SERFF_TX ... page1284`, -0.04). The grid cannot
-   separate them, and `main` is also wrong there.
-7. **A long body under a frame** still rejects the whole table (cases 03 and 04). A fix splits the grid at a tall
-   row that spans all columns. `split_component_at_grid_gaps` must then look only at interior
-   verticals.
-8. The group-label rule (rules 11 and 12) comes from one example. Test it on more layouts.
-9. **Possible bug, not tested.** `cluster_h_segments` unions the x-ranges of rules at one y.
-   `rowspan_mask` can then miss a rowspan that has a gap in its rule.
-10. Add tests for side-by-side tables and for form text above a table.
-11. Do an independent check on documents that no version used, because the v8 to v11
-    decisions used ParseBench-2.
-12. `dense_table_443`: see section 5. `merge_continuation_rows` uses a row count, and the
-    header fold changes the count.
-13. `sampo`: a title in the header row takes the cell of the Q3/2024 column label.
-14. **Form grids, broken on `main` and on the branch (out of scope).** The pages are
+8. **Form grids that are wrong on `main` and on the branch.** The pages are
     `canada--30_ISP-1002--p1` and `--p3`, `canada--23_ISP-1300--p5`, `us--18_8822--p1`,
     `us--50_I-912--p8`, `uk--20_PA1P--p1` and `text_dense__livingWord`. The causes on the branch:
     - A form draws its own box edges at x positions that are not grid boundaries. The span test
@@ -441,10 +432,68 @@ The markdown changes on 206 pages outside the table subsets.
     - Header text without rules is cut at every column boundary (8822 items 1 and 2, I-912).
     Possible fix: no span when a raw vertical rule lies inside the merged cell's x-range in that
     row.
-15. **`canada--37_ISP-1610--p1` (out of scope):** the table ends at a different row on the
+9. **The issue layout.** The body under the framed header of the issue PDF is in reading
+   order now, but it is one spanning cell. The reporter prefers headings and paragraphs. Also,
+   a long body under a frame still rejects the whole table (synthetic cases 03 and 04). A fix
+   splits the grid at a tall row that spans all columns. Then `split_component_at_grid_gaps`
+   must look only at interior verticals.
+10. **Title rows.** A table title inside the grid becomes one spanning header row
+    (`SERFF_CA ... page96`, `SERFF_TX page706`, `test_page1`). `Block::Table` has only one
+    header row. On `1 timetable (1)_page27`, one title bar over all columns folds into the
+    column labels in `main` and on the branch.
+11. **Two header lines in one ruled row** (`SERFF_TX ... page1284`). The grid cannot separate
+    them, and `main` is also wrong there.
+
+### C. Pages that read worse on the branch (out of scope)
+
+12. **`canada--37_ISP-1610--p1`:** the table ends at a different row on the
     branch, and the ✓ leaves "Yes". The cause is not known yet.
+13. **`dense_table_443`** (0.001 to 0, tracked changes): see section 5. The header fold changes
+    the row count that `merge_continuation_rows` uses, so it joins separate rows.
+14. **`sampo-2026-08-13_page1`:** a title in the header row takes the cell of the Q3/2024
+    column label.
+
+### D. Benchmark problems to report to ParseBench
+
+The scorer gives a lower score on pages that the branch reads as well or better. Section 5
+gives the details, and the review pages (section 9) show the images.
+
+15. **Side-by-side tables in HTML** (`dense_table_289`, `290`, `041`). The scorer splits a
+    wide pipe table into its side-by-side parts with `split_side_by_side`
+    (`table_next.py`), but not the same table in HTML with `colspan`. It then reports 178
+    rows as missing on 289. This is the largest loss: 2.26 on 3 pages.
+16. **Folded headers.** The reference of `dense_table_313` has "Component" over columns A to M.
+    The folded header "Component A ... Component M" scores 0.95, and `main` with "Component"
+    over 2 columns scores 1.00. On `64a4c79de95f6871_p8`, the branch matches the reference
+    ("Coverage: Bodily Injury" over 3 columns), and the score goes down.
+17. **Forms: printed text in a whole caption counts as an invented value** (REFUND on
+    `740-2025__p3`, "( 7 )" on `mexico--09_SAT_Forma37--p3`, a caption half on
+    `ireland--02_Form12--p7`).
+18. **Answer-key review status.** The README says the v1 pages are human-verified. In
+    ParseBench-2, only `dense_tables` has review tags: 17 of 373 pages are `gt_reviewed`, and
+    281 are `gt_draft` only. The other subsets have no tag. 8 of the 29 table loss pages are
+    `gt_draft` pages. The references that were checked (313, `64a4c79de95f6871_p8`, 304) are
+    correct, so the evidence is against the scorer, not the labels.
+
+### E. Ideas and possible bugs
+
+19. **Speed.** A table with a merge is built twice (the build without merges decides). Reuse
+    the cell placement of the first build in the second. The cost now is about 1%.
+20. The group-label rules (11 and 12) come from few examples. Test them on more layouts.
+21. **Possible bug, not tested.** `cluster_h_segments` unions the x-ranges of rules at one y.
+    `rowspan_mask` can then miss a rowspan that has a gap in its rule.
+22. Add tests for side-by-side tables and for form text above a table.
 
 ## 9. How to continue
+
+**Review pages** (private, on claude.ai; share them from their Share menu):
+- Regression review: https://claude.ai/artifact/7mZoipsnyGhYsdZeSzs1bG. Each page that scores
+  lower than `main`, with the page image, both outputs and the scorer events.
+- Rule gallery: https://claude.ai/artifact/Q4nNX4L4gBr1duRwEm3JVE. One example for each
+  safeguard and header rule, with the output when that one rule is off.
+
+The scripts that made them are in the session scratch directory, not in this folder.
+`compare_v12.py <scratch> <run>`, `compare_other.py`, `why.py` and `why2.py` are here.
 
 ### Build and test
 

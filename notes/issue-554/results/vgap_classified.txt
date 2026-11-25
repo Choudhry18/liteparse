@@ -1,0 +1,157 @@
+Counter({'above': 90, 'below': 32, 'between': 13, 'above,below': 7, 'below,between': 6, 'above,between': 4, 'all-slivers': 2, 'above,below,between': 1})
+page                                                       sliver           main    v10    v11
+insurance_filing_tables/010b43388a0c67b0_p8                above           0.790  0.000  0.790  new
+insurance_filing_tables/02f7022a1f08f606_p8                above           0.720  0.290  0.290  new
+insurance_filing_tables/10eeb62c10e2abee_p9                above           0.720  0.290  0.290  new
+insurance_filing_tables/0211a1880172f065_p8                above           0.745  0.411  0.745  new
+tables/FBLB-134215544_page114                              above           0.590  0.333  0.333  v1_same_name
+tables/SERFF_CA_random_pages 1_page1261                    above           0.172  0.000  0.216  v1_same_name
+tables/SERFF_CA_random_pages 1_page1878                    above           0.283  0.269  0.369  v1_same_name
+complex_table_headers/complex_header_097                   above           0.000  0.000  0.000  new
+complex_table_headers/complex_header_021                   below           0.000  0.000  0.000  new
+complex_table_headers/complex_header_006                   between         0.116  0.116  0.116  v1_same_file
+complex_table_headers/complex_header_049                   above           0.000  0.000  0.000  new
+complex_table_headers/complex_header_098                   above           0.000  0.000  0.000  new
+complex_table_headers/complex_header_072                   below           0.583  0.583  0.583  new
+insurance_filing_tables/655c05d366587b86_p11               above           0.000  0.000  0.000  new
+insurance_filing_tables/00fe22d77bff0df7_p8                above           0.040  0.040  0.040  new
+insurance_filing_tables/2f2c782c0efd3479_p9                above           0.000  0.000  0.000  new
+insurance_filing_tables/34d6b4a53d441056_p2                above           0.148  0.148  0.148  new
+insurance_filing_tables/200f845eee70a397_p4                above           0.500  0.500  0.500  new
+insurance_filing_tables/bad9468664f5d4e0_p143              above           0.000  0.000  0.000  new
+insurance_filing_tables/b4dd261dd192264f_p9                below           0.000  0.000  0.000  new
+insurance_filing_tables/6edc679495556527_p7                above           0.600  0.600  0.600  new
+insurance_filing_tables/4c2dddf4f8897477_p2                above           0.500  0.500  0.500  new
+insurance_filing_tables/f2195809587e31bc_p10               above           0.000  0.000  0.000  new
+insurance_filing_tables/31cb3bc5575396c3_p5                above           0.500  0.500  0.500  new
+insurance_filing_tables/5528b2bed5224ae7_p9                above           0.822  0.822  0.822  new
+insurance_filing_tables/05feb05ac7e6f04c_p2                above           0.629  0.629  0.629  new
+insurance_filing_tables/294c274bfc7f6dd8_p3                above           0.500  0.500  0.500  new
+insurance_filing_tables/21357a5e594bdce3_p16               above           0.000  0.000  0.000  new
+insurance_filing_tables/326d73c3bb76cebc_p4                above           0.400  0.400  0.400  new
+insurance_filing_tables/150bc31d9c681a52_p4                above           0.500  0.500  0.500  new
+insurance_filing_tables/47fe533389bca57c_p18               above           0.053  0.053  0.053  new
+insurance_filing_tables/31cb3bc5575396c3_p9                above           0.600  0.600  0.600  new
+insurance_filing_tables/0db7ba4c0a46435b_p2                above,below     0.000  0.000  0.000  new
+insurance_filing_tables/0659c402b0541a3e_p18               above           0.570  0.570  0.570  new
+insurance_filing_tables/10eeb62c10e2abee_p5                above           0.000  0.000  0.000  new
+insurance_filing_tables/0db7ba4c0a46435b_p1                above,below     0.000  0.000  0.000  new
+insurance_filing_tables/c48887f5bb895ac2_p8                above           0.815  0.815  0.815  new
+insurance_filing_tables/285fac5b4f5be190_p10               above           0.000  0.000  0.000  new
+insurance_filing_tables/010b43388a0c67b0_p2                above           0.000  0.000  0.000  new
+insurance_filing_tables/010b43388a0c67b0_p6                above           0.600  0.600  0.600  new
+insurance_filing_tables/78d0d2cc22ee223e_p4                below           0.267  0.267  0.267  new
+insurance_filing_tables/010b43388a0c67b0_p4                above,below     0.000  0.000  0.000  new
+financial_tables/niti1-2026-08-14_page1                    above           1.000  1.000  1.000  new
+financial_tables/havas3-2026-08-14_page1                   above           0.000  0.000  0.000  new
+financial_tables/tata3-2026-08-14_page1                    between         0.000  0.000  0.000  new
+financial_tables/ppt4-2026-08-14_page1                     all-slivers     0.000  0.000  0.000  new
+financial_tables/qb-2026-08-13_page1                       below           0.875  0.875  0.875  new
+financial_tables/tata2-2026-08-14_page2                    below           0.573  0.573  0.573  new
+financial_tables/capital-2026-08-13_page1                  above           0.000  0.000  0.000  new
+financial_tables/Tata-Sons-Annual-Report-FY26v1-2026-08-21 below           0.000  0.000  0.000  new
+financial_tables/ppt-2026-08-14_page1                      below           0.000  0.000  0.000  new
+financial_tables/tata2-2026-08-14_page1                    below,between   0.145  0.145  0.145  new
+financial_tables/lshape-2026-08-13_page1                   above           0.000  0.000  0.000  new
+financial_tables/lshape2-2026-08-13_page1                  above           0.000  0.000  0.000  new
+financial_tables/aa-2026-08-13_page1                       above           0.000  0.000  0.000  new
+financial_tables/dividend-2026-08-13_page1                 above           0.000  0.000  0.000  new
+financial_tables/en-allianz-group-annual-report-2025-2026- above           0.000  0.000  0.000  new
+financial_tables/t2-2026-08-11_page1                       above           0.000  0.000  0.000  new
+financial_tables/mainmacro-2026-08-13_page1                above           0.000  0.000  0.000  new
+financial_tables/Stellantis-NV-20241231-Annual-Report-2026 below           0.500  0.500  0.500  new
+financial_tables/4t-2026-08-11_page1                       between         0.000  0.000  0.000  new
+financial_tables/chaos-2026-08-12_page1                    below           0.000  0.000  0.000  new
+financial_tables/infosys4-2026-08-14_page1                 below           0.783  0.783  0.783  new
+financial_tables/barclay-2026-08-14_page1                  above           0.000  0.000  0.000  new
+financial_tables/niti3-2026-08-14_page1                    above           0.990  0.990  0.990  new
+financial_tables/airnz4-2026-08-14_page1                   between         0.246  0.246  0.246  new
+financial_tables/marsh-2026-08-14_page1                    above,below     0.000  0.000  0.000  new
+financial_tables/dhl1-2026-08-14_page1                     below           0.813  0.813  0.813  new
+financial_tables/kf-2026-08-13_page1                       between         0.000  0.000  0.000  new
+financial_tables/asic-2026-08-14_page1                     above           0.000  0.000  0.000  new
+financial_tables/3p-2026-08-12_page3                       above,between   0.000  0.000  0.000  new
+financial_tables/incentive-2026-08-13_page1                above           0.000  0.000  0.000  new
+financial_tables/Tata-Sons-Annual-Report-FY26v1-2026-08-21 below           0.140  0.140  0.140  new
+financial_tables/3p-2026-08-12_page2                       above,between   0.000  0.000  0.000  new
+financial_tables/barclay2-2026-08-14_page1                 above           0.000  0.000  0.000  new
+financial_tables/niti2-2026-08-14_page1                    above           0.990  0.990  0.990  new
+financial_tables/3p-2026-08-12_page1                       between         0.000  0.000  0.000  new
+dense_tables/dense_table_447                               all-slivers     0.000  0.000  0.000  new
+dense_tables/dense_table_280                               above,below     0.000  0.000  0.000  new
+dense_tables/dense_table_483                               above,below,between  0.000  0.000  0.000  new
+dense_tables/dense_table_481                               above,below     0.000  0.000  0.000  new
+dense_tables/dense_table_426                               between         0.000  0.000  0.000  new
+dense_tables/dense_table_436                               above           0.066  0.066  0.066  new
+dense_tables/dense_table_350                               below           0.772  0.772  0.772  new
+dense_tables/dense_table_421                               above           0.000  0.000  0.000  new
+dense_tables/dense_table_412                               below           0.552  0.552  0.552  new
+dense_tables/dense_table_415                               above,between   0.268  0.268  0.268  new
+dense_tables/dense_table_414                               above           0.000  0.000  0.000  new
+dense_tables/dense_table_399                               above,below     0.827  0.827  0.827  new
+dense_tables/dense_table_300                               below           0.748  0.748  0.748  new
+dense_tables/dense_table_458                               above           0.931  0.931  0.931  new
+dense_tables/dense_table_470                               above           0.928  0.928  0.928  new
+dense_tables/dense_table_465                               above           0.000  0.000  0.000  new
+dense_tables/dense_table_461                               above           0.000  0.000  0.000  new
+tables/Home Depot 10-k unrestricted_page57                 below           0.000  0.000  0.000  v1_same_name
+tables/METLIFE-10Q-20240205 unrestricted_page16            below           0.000  0.000  0.000  v1_same_name
+tables/SERFF_TX_random_pages 1_page1212                    below           0.000  0.000  0.000  v1_same_name
+tables/Tables - Apple Def 14a_page8                        between         0.000  0.000  0.000  v1_same_name
+tables/Goldman Sachs 10-k_page106                          above           0.000  0.000  0.000  v1_same_name
+tables/corp-q1-2025__p13_page1                             below           0.000  0.000  0.000  new
+tables/JNPR.2011.page_82.pdf_110673_page1                  below           0.218  0.218  0.218  v1_same_name
+tables/Home_Depot_10-k_unrestricted__p45_page1             above           0.000  0.000  0.000  new
+tables/Home Depot 10-k unrestricted_page46                 below           0.000  0.000  0.000  v1_same_name
+tables/Goldman Sachs 10-k_page74                           between         0.000  0.000  0.000  v1_same_name
+tables/Home Depot 10-k unrestricted_page47                 below           0.323  0.323  0.323  v1_same_name
+tables/SERFF_CA_random_pages 1_page1262                    above           0.329  0.329  0.329  v1_same_name
+tables/USPS_10-k__p27_page1                                between         0.000  0.000  0.000  new
+tables/Home Depot 10-k unrestricted_page33                 below           0.164  0.164  0.164  v1_same_name
+tables/Home Depot 10-k unrestricted_page31                 below           0.000  0.000  0.000  v1_same_name
+tables/IT.2009.page_74.pdf_78635_page1                     above           0.000  0.000  0.000  v1_same_name
+tables/MAP-CategoryI-LON_page2                             between         0.990  0.990  0.990  v1_same_name
+tables/blackrock-funds-i-icav-annual-report-2022_page13    below,between   0.000  0.000  0.000  v1_same_name
+tables/SERFF_CA_random_pages 1_page2029                    above           0.000  0.000  0.000  v1_same_name
+tables/MAP-CategoryI-LON_page1                             below,between   0.990  0.990  0.990  v1_same_name
+tables/drill angle hierarchical table header_page7         between         0.088  0.088  0.088  v1_same_name
+tables/Goldman Sachs 10-k_page79                           above,between   0.065  0.065  0.065  v1_same_name
+tables/SERFF_CA_random_pages 1_page2139                    above           0.000  0.000  0.000  v1_same_name
+tables/SERFF_CA_random_pages 1_page2475                    below           0.055  0.055  0.055  v1_same_name
+tables/Goldman Sachs 10-k_page85                           above           0.000  0.000  0.000  v1_same_name
+tables/Goldman Sachs 10-k_page84                           between         0.000  0.000  0.000  v1_same_name
+tables/Home Depot 10-k unrestricted_page58                 below,between   0.000  0.000  0.000  v1_same_name
+tables/1653739079_page39                                   below           0.394  0.394  0.394  v1_same_name
+tables/Home Depot 10-k unrestricted_page71                 below,between   0.000  0.000  0.000  v1_same_name
+tables/Apple 10-k_page57                                   below           0.000  0.000  0.000  v1_same_name
+tables/Goldman Sachs 10-k_page122                          above           0.000  0.000  0.000  v1_same_name
+insurance_filing_tables/28a0eb817881b23e_p148              above           0.164  0.166  0.166  new
+insurance_filing_tables/28a0eb817881b23e_p3                above           0.094  0.108  0.108  new
+insurance_filing_tables/07125b1fc1357773_p31               above           0.189  0.215  0.215  new
+insurance_filing_tables/95f998691e73480a_p16               above           0.189  0.215  0.215  new
+insurance_filing_tables/c599a4fd2fa29382_p153              above           0.149  0.185  0.185  new
+insurance_filing_tables/0659c402b0541a3e_p4                below           0.148  0.190  0.148  new
+dense_tables/dense_table_348                               below           0.080  0.150  0.076  new
+financial_tables/Tata-Sons-Annual-Report-FY26v1-2026-08-21 below           0.833  0.950  0.950  new
+financial_tables/en-allianz-group-annual-report-2025-2026- above           0.796  0.940  0.796  new
+tables/SERFF_TX_random_pages 1_page830                     above           0.230  0.430  0.430  v1_same_name
+insurance_filing_tables/0211a1880172f065_p6                above           0.430  0.630  0.630  new
+insurance_filing_tables/02ea44a8ebe3afda_p8                above           0.800  1.000  1.000  new
+insurance_filing_tables/31cb3bc5575396c3_p8                above           0.431  0.685  0.524  new
+complex_table_headers/complex_header_053                   above           0.419  0.692  0.538  new
+insurance_filing_tables/0211a1880172f065_p5                above           0.419  0.692  0.538  new
+insurance_filing_tables/1c6c550a2f10e871_p7                above           0.419  0.692  0.538  new
+insurance_filing_tables/6c2139962c5dfc40_p5                above           0.419  0.692  0.538  new
+insurance_filing_tables/7cf15110b1c42912_p7                above           0.258  0.688  0.531  new
+financial_tables/qei-2026-08-12_page1                      above           0.052  0.485  0.062  new
+insurance_filing_tables/294c274bfc7f6dd8_p7                above           0.000  0.494  0.020  new
+insurance_filing_tables/6edc679495556527_p6                above           0.182  0.692  0.538  new
+insurance_filing_tables/010b43388a0c67b0_p5                above           0.182  0.692  0.538  new
+tables/Home Depot 10-k unrestricted_page72                 below           0.000  0.530  0.530  v1_same_name
+insurance_filing_tables/150bc31d9c681a52_p7                above           0.153  0.692  0.538  new
+insurance_filing_tables/150bc31d9c681a52_p10               above           0.000  0.589  0.000  new
+tables/637951191e7b35ae07dbd4c76a2e6690c370_pg2_pg1_page1  below,between   0.000  0.628  0.000  v1_same_name
+insurance_filing_tables/10eeb62c10e2abee_p8                above           0.000  0.731  0.020  new
+insurance_filing_tables/4c2dddf4f8897477_p5                above           0.000  0.731  0.020  new
+insurance_filing_tables/02ea44a8ebe3afda_p7                above           0.000  0.731  0.020  new
+insurance_filing_tables/02f7022a1f08f606_p7                above           0.000  0.731  0.020  new

@@ -1,0 +1,120 @@
+
+== charts
+   chart_next                   +0.0001 [+0.0000, +0.0002]  better 2 worse 0 of 568
+   chart_next_labels            no change on 35 pages
+   chart_next_precision         no change on 35 pages
+   chart_next_recall            +0.0000 [+0.0000, +0.0001]  better 2 worse 0 of 568
+   chart_next_strict_pass       +0.0000 [+0.0000, +0.0001]  better 1 worse 0 of 568
+   chart_next_title             +0.0004 [+0.0000, +0.0013]  better 1 worse 0 of 568
+   chart_next_values            no change on 35 pages
+
+== fillable_forms
+   form_kv_md_checkbox_f1       no change on 75 pages
+   form_kv_md_composite         no change on 100 pages
+   form_kv_md_core_kv_f1        no change on 100 pages
+   form_kv_md_core_kv_precision no change on 16 pages
+   form_kv_md_core_kv_recall    no change on 100 pages
+   form_kv_md_id_f1             no change on 50 pages
+   form_kv_md_id_f1_lenient     no change on 50 pages
+   form_kv_md_label_f1          no change on 100 pages
+   form_kv_md_label_f1_strict   no change on 100 pages
+   form_kv_md_spot_composite    no change on 100 pages
+   form_kv_md_spot_core_kv_recall no change on 100 pages
+   form_kv_md_spot_declared_precision no change on 13 pages
+   form_kv_md_structure         no change on 4 pages
+   form_kv_md_value_f1          no change on 100 pages
+   form_kv_md_value_f1_strict   no change on 100 pages
+   forms_v2                     +0.0039 [+0.0001, +0.0084]  better 10 worse 1 of 100
+        -0.090  0.850 -> 0.760  fillable_forms/740-2025__p3
+   forms_v2_checkboxes          no change on 75 pages
+   forms_v2_empty               +0.0051 [+0.0013, +0.0100]  better 11 worse 1 of 100
+        -0.025  0.983 -> 0.958  fillable_forms/740-2025__p3
+   forms_v2_extra               no change on 100 pages
+   forms_v2_filled              +0.0878 [+0.0000, +0.1835]  better 2 worse 0 of 5
+   forms_v2_ids                 +0.0263 [+0.0064, +0.0519]  better 5 worse 0 of 41
+   forms_v2_signatures          +0.0159 [+0.0000, +0.0432]  better 2 worse 0 of 44
+
+== forms
+   form_kv_md_checkbox_f1       no change on 1 pages
+   form_kv_md_composite         no change on 4 pages
+   form_kv_md_core_kv_f1        no change on 4 pages
+   form_kv_md_core_kv_precision no change on 1 pages
+   form_kv_md_core_kv_recall    no change on 4 pages
+   form_kv_md_id_f1             no change on 3 pages
+   form_kv_md_id_f1_lenient     no change on 3 pages
+   form_kv_md_label_f1          no change on 4 pages
+   form_kv_md_label_f1_strict   no change on 4 pages
+   form_kv_md_spot_composite    no change on 500 pages
+   form_kv_md_spot_core_kv_recall no change on 500 pages
+   form_kv_md_spot_declared_precision no change on 7 pages
+   form_kv_md_value_f1          no change on 4 pages
+   form_kv_md_value_f1_strict   no change on 4 pages
+   forms_v2                     +0.0092 [+0.0057, +0.0132]  better 50 worse 7 of 500
+        -0.118  0.618 -> 0.500  forms/filled__ireland--02_Form12--p7__typed
+        -0.081  0.664 -> 0.583  forms/filled__uk--30_SF200--p16__typed
+        -0.055  0.975 -> 0.920  forms/filled__uk--20_PA1P--p1__typed
+        -0.027  0.723 -> 0.696  forms/filled__canada--23_ISP-1300--p5__typed
+   forms_v2_checkboxes          +0.0004 [-0.0013, +0.0024]  better 5 worse 4 of 382
+        -0.167  0.867 -> 0.700  forms/filled__us--18_8822--p1__typed
+        -0.071  0.857 -> 0.786  forms/filled__canada--37_ISP-1610--p1__typed
+        -0.071  0.943 -> 0.871  forms/filled__uk--20_PA1P--p1__typed
+        -0.057  0.650 -> 0.593  forms/filled__canada--30_ISP-1002--p1__typed
+   forms_v2_empty               +0.0032 [+0.0010, +0.0056]  better 20 worse 5 of 415
+        -0.200  0.822 -> 0.622  forms/filled__canada--07_ISP1000--p5__typed
+        -0.074  0.926 -> 0.853  forms/filled__us--18_8822--p1__typed
+        -0.069  0.800 -> 0.731  forms/filled__ireland--02_Form12--p13__typed
+        -0.018  0.729 -> 0.712  forms/filled__mexico--09_SAT_Forma37--p3__typed
+   forms_v2_extra               no change on 4 pages
+   forms_v2_filled              +0.0170 [+0.0109, +0.0238]  better 49 worse 5 of 433
+        -0.267  0.867 -> 0.600  forms/filled__uk--30_SF200--p16__typed
+        -0.200  0.650 -> 0.450  forms/filled__canada--30_ISP-1002--p3__typed
+        -0.073  0.891 -> 0.818  forms/filled__canada--23_ISP-1300--p5__typed
+        -0.042  0.600 -> 0.558  forms/filled__singapore--02_FormV39A--p1__typed
+   forms_v2_signatures          -0.0004 [-0.0062, +0.0050]  better 1 worse 1 of 121
+        -0.250  0.750 -> 0.500  forms/filled__canada--36_ISP-3010--p4__typed
+
+== headings
+   formatting_v2                no change on 100 pages
+   formatting_v2_headings       no change on 92 pages
+
+== layout
+   layout_grounding_pass_rate   +0.0002 [-0.0002, +0.0009]  better 2 worse 2 of 535
+        -0.025  0.580 -> 0.555  layout/annotated__clinical-trial-results-ebc_p3
+        -0.018  0.178 -> 0.160  layout/annotated__integrated-annual-report-2023-24_p32
+
+== strikeout
+   formatting_v2                no change on 128 pages
+   formatting_v2_inline         no change on 114 pages
+   formatting_v2_strikeout      no change on 117 pages
+
+== text
+   formatting_v2                +0.0001 [+0.0000, +0.0002]  better 1 worse 0 of 480
+   formatting_v2_headings       no change on 347 pages
+   formatting_v2_inline         +0.0001 [+0.0000, +0.0003]  better 2 worse 0 of 435
+   formatting_v2_lists          no change on 228 pages
+   formatting_v2_strikeout      no change on 17 pages
+   formatting_v2_underline      no change on 135 pages
+   table_next                   no change on 12 pages
+   table_next_content           no change on 12 pages
+   table_next_row_order         no change on 12 pages
+   text_next                    +0.0005 [-0.0001, +0.0014]  better 4 worse 2 of 508
+        -0.047  0.495 -> 0.448  text/text_dense__livingWord
+        -0.014  0.714 -> 0.700  text/text_multicolumns__lotofcol
+   text_next_critical           +0.0008 [+0.0002, +0.0016]  better 6 worse 0 of 496
+   text_next_integrity          +0.0007 [+0.0001, +0.0015]  better 5 worse 2 of 409
+        -0.007  0.963 -> 0.956  text/text_multilang__french2
+        -0.001  0.859 -> 0.858  text/text_dense__livingWord
+   text_next_order              +0.0001 [+0.0000, +0.0002]  better 5 worse 2 of 418
+        -0.001  0.638 -> 0.637  text/text_multicolumns__article
+        -0.000  0.583 -> 0.583  text/text_multilang__french2
+   text_next_words              +0.0001 [+0.0000, +0.0002]  better 4 worse 0 of 508
+
+== underline
+   formatting_v2                no change on 125 pages
+   formatting_v2_inline         no change on 100 pages
+   formatting_v2_underline      no change on 103 pages
+   text_next                    no change on 1 pages
+   text_next_critical           no change on 1 pages
+   text_next_integrity          no change on 1 pages
+   text_next_order              no change on 1 pages
+   text_next_words              no change on 1 pages

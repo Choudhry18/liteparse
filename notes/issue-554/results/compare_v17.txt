@@ -1,0 +1,76 @@
+held-out pages: 1239   in-sample tables pages: 500
+
+subset (held out)               main       v10       v17
+complex_table_headers         0.0568    0.0589    0.0589
+financial_tables              0.2702    0.2831    0.2838
+insurance_filing_tables       0.3546    0.3755    0.3791
+dense_tables                  0.4700    0.4696    0.4735
+tables, equal weight          0.2879    0.2968    0.2988
+tables (in-sample subset)     0.4310    0.4453    0.4495
+
+v10   vs main, held-out  per page: +0.0104  95% CI [+0.0050, +0.0157]  better 102 worse 26  largest loss -0.929
+v10   vs main, in-sample per page: +0.0143  95% CI [+0.0078, +0.0219]  better 41 worse 9  largest loss -0.257
+v17   vs main, held-out  per page: +0.0129  95% CI [+0.0075, +0.0186]  better 108 worse 24  largest loss -0.929
+v17   vs main, in-sample per page: +0.0186  95% CI [+0.0115, +0.0265]  better 47 worse 5  largest loss -0.172
+
+pages where v17 differs from v10 (score main / v10 / v17):
+   -0.589   0.000 / 0.589 / 0.000   insurance_filing_tables/150bc31d9c681a52_p10
+   -0.140   0.890 / 0.890 / 0.750   tables/1 timetable (1)_page27
+   -0.050   1.000 / 1.000 / 0.950   dense_tables/dense_table_313
+   -0.035   0.322 / 0.329 / 0.294   insurance_filing_tables/b4dd261dd192264f_p10
+   -0.013   0.000 / 0.436 / 0.423   tables/hard_page2
+   -0.004   0.930 / 0.948 / 0.944   dense_tables/dense_table_170
+   +0.024   0.814 / 0.790 / 0.814   dense_tables/dense_table_071
+   +0.058   0.052 / 0.485 / 0.542   financial_tables/qei-2026-08-12_page1
+   +0.094   0.840 / 0.756 / 0.850   dense_tables/dense_table_074
+   +0.100   0.000 / 0.731 / 0.831   insurance_filing_tables/02ea44a8ebe3afda_p7
+   +0.100   0.000 / 0.731 / 0.831   insurance_filing_tables/02f7022a1f08f606_p7
+   +0.100   0.000 / 0.731 / 0.831   insurance_filing_tables/10eeb62c10e2abee_p8
+   +0.100   0.000 / 0.731 / 0.831   insurance_filing_tables/4c2dddf4f8897477_p5
+   +0.106   0.825 / 0.825 / 0.931   insurance_filing_tables/d300af4a8a8b142c_p13
+   +0.108   0.821 / 0.821 / 0.928   tables/SERFF_CA_random_pages 1_page2248
+   +0.123   0.814 / 0.814 / 0.937   dense_tables/dense_table_176
+   +0.159   0.830 / 0.791 / 0.950   tables/SERFF_TX_random_pages 1_page847
+   +0.161   0.631 / 0.789 / 0.950   dense_tables/dense_table_212
+   +0.161   0.789 / 0.789 / 0.950   financial_tables/en-allianz-group-annual-report-2025-2026-08-21_page322
+   +0.286   0.283 / 0.269 / 0.554   tables/SERFF_CA_random_pages 1_page1878
+   +0.304   0.360 / 0.564 / 0.868   tables/SERFF_TX_random_pages 1_page848
+   +0.329   0.619 / 0.619 / 0.948   dense_tables/dense_table_172
+   +0.396   0.000 / 0.494 / 0.891   insurance_filing_tables/294c274bfc7f6dd8_p7
+   +0.450   0.200 / 0.000 / 0.450   tables/Coca Cola 10-k_page48
+   +0.467   0.590 / 0.333 / 0.800   tables/FBLB-134215544_page114
+   +0.515   0.467 / 0.222 / 0.737   tables/Kimco-Realty-2023-Annual-Report-Web_page11
+   +0.600   0.720 / 0.290 / 0.890   insurance_filing_tables/02f7022a1f08f606_p8
+   +0.600   0.720 / 0.290 / 0.890   insurance_filing_tables/10eeb62c10e2abee_p9
+   +0.753   0.000 / 0.000 / 0.753   dense_tables/dense_table_253
+
+losses, v17 vs main:
+   -0.929  main 0.929  v10 0.000  v17 0.000  dense_tables/dense_table_289
+   -0.929  main 0.929  v10 0.000  v17 0.000  dense_tables/dense_table_290
+   -0.790  main 0.790  v10 0.000  v17 0.000  insurance_filing_tables/010b43388a0c67b0_p8
+   -0.617  main 0.756  v10 0.139  v17 0.139  insurance_filing_tables/1fea2f2540c835bf_p1
+   -0.401  main 0.499  v10 0.098  v17 0.098  dense_tables/dense_table_041
+   -0.333  main 0.745  v10 0.411  v17 0.411  insurance_filing_tables/0211a1880172f065_p8
+   -0.273  main 0.419  v10 0.146  v17 0.146  dense_tables/dense_table_304
+   -0.241  main 0.369  v10 0.128  v17 0.128  dense_tables/dense_table_344
+   -0.240  main 0.240  v10 0.000  v17 0.000  financial_tables/currency-2026-08-13_page1
+   -0.172  main 0.172  v10 0.000  v17 0.000  tables/SERFF_CA_random_pages 1_page1261
+   -0.150  main 0.244  v10 0.094  v17 0.094  tables/SERFF_TX_random_pages 1_page706
+   -0.150  main 0.490  v10 0.340  v17 0.340  insurance_filing_tables/64a4c79de95f6871_p8
+   -0.140  main 0.890  v10 0.890  v17 0.750  tables/1 timetable (1)_page27
+   -0.130  main 0.544  v10 0.414  v17 0.414  insurance_filing_tables/fa15a92da8391dd8_p26
+   -0.080  main 0.260  v10 0.180  v17 0.180  complex_table_headers/complex_header_084
+   -0.067  main 0.815  v10 0.747  v17 0.747  dense_tables/dense_table_246
+   -0.059  main 0.828  v10 0.769  v17 0.769  dense_tables/dense_table_233
+   -0.053  main 0.204  v10 0.151  v17 0.151  tables/test_page1
+   -0.050  main 1.000  v10 1.000  v17 0.950  dense_tables/dense_table_313
+   -0.050  main 0.660  v10 0.610  v17 0.610  insurance_filing_tables/51abb0b9601cd8df_p9
+   -0.050  main 0.850  v10 0.800  v17 0.800  insurance_filing_tables/4ef83fb72676cd65_p5
+   -0.035  main 0.035  v10 0.000  v17 0.000  financial_tables/sampo-2026-08-13_page1
+   -0.028  main 0.322  v10 0.329  v17 0.294  insurance_filing_tables/b4dd261dd192264f_p10
+   -0.017  main 0.460  v10 0.443  v17 0.443  insurance_filing_tables/2c5871845c5862a8_p2
+   -0.015  main 0.255  v10 0.240  v17 0.240  tables/SERFF_CA_random_pages 1_page844
+   -0.011  main 0.950  v10 0.939  v17 0.939  dense_tables/dense_table_047
+   -0.006  main 0.006  v10 0.000  v17 0.000  financial_tables/r-2026-08-12_page3
+   -0.001  main 0.001  v10 0.000  v17 0.000  dense_tables/dense_table_443
+   -0.001  main 0.302  v10 0.301  v17 0.301  dense_tables/dense_table_272

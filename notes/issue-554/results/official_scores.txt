@@ -1,0 +1,20 @@
+dimension        main   branch   change
+text           0.5510   0.5515  +0.0005
+formatting     0.6622   0.6623  +0.0000
+tables         0.3587   0.3734  +0.0147
+charts         0.0107   0.0108  +0.0001
+layout         0.4860   0.4862  +0.0002
+forms          0.6856   0.6942  +0.0086
+OVERALL        0.4590   0.4631  +0.0040
+
+   charts     charts                   chart_next             w=1.0    0.0107 -> 0.0108 (+0.0001)  n=568
+   formatting text                     formatting_v2          w=0.75   0.6474 -> 0.6474 (+0.0001)  n=508
+   forms      fillable_forms           forms_v2               w=0.125  0.8640 -> 0.8679 (+0.0039)  n=100
+   forms      forms                    forms_v2               w=0.875  0.6601 -> 0.6693 (+0.0092)  n=500
+   layout     layout                   layout_grounding_pass_rate w=1.0    0.4860 -> 0.4862 (+0.0002)  n=535
+   tables     complex_table_headers    table_next             w=0.125  0.0538 -> 0.0557 (+0.0020)  n=149
+   tables     dense_tables             table_next             w=0.125  0.4670 -> 0.4705 (+0.0034)  n=373
+   tables     financial_tables         table_next             w=0.125  0.2702 -> 0.2838 (+0.0136)  n=319
+   tables     insurance_filing_tables  table_next             w=0.125  0.3546 -> 0.3791 (+0.0245)  n=412
+   tables     tables                   table_next             w=0.5    0.4310 -> 0.4495 (+0.0186)  n=500
+   text       text                     text_next              w=1.0    0.5510 -> 0.5515 (+0.0005)  n=508
