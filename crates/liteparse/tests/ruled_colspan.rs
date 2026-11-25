@@ -585,41 +585,99 @@ async fn numbers_aligned_in_columns_do_not_glue_into_one_cell() {
 }
 
 #[tokio::test]
-async fn form_title_above_the_column_header_does_not_merge() {
-    // Row 0 is a full-width form title with no interior rules. Rows 1 to 3
-    // are form fields and row 4 the column header. Four rows above the
-    // header are too many for header folding, so without the rule the title
-    // stays a cell that spans the table. Merges above the header band are
-    // dropped, so these rows read the same as on main.
-    let rows: Rows = &[
-        None,
-        Some(["Completed by:", "", "Jane Doe"]),
-        Some(["Date completed:", "", "6/4/2024"]),
-        Some(["Line of business:", "", "Personal auto"]),
-        Some(["Line", "Description", "Amount"]),
-        Some(["(1)", "Written premium", "20,057"]),
-        Some(["(2)", "Earned premium", "19,880"]),
-        Some(["(3)", "Exposure units", "5,472"]),
+async fn merged_note_row_does_not_turn_data_rows_into_a_header() {
+    // Five data rows leave the Note column empty, so no row fills 90% of
+    // the columns. A tall note row at the bottom has no interior rules. Its
+    // marker is in column 0, and its text flows across columns 1-4.
+    const X5: [f32; 6] = [57.0, 150.0, 250.0, 340.0, 430.0, 520.0];
+    let rows = [
+        ["Europe", "", "2", "11", "3"],
+        ["Latin America", "", "3", "21", "11"],
+        ["North America", "", "1", "10", "11"],
+        ["Asia Pacific", "", "2", "2", "2"],
+        ["Global Ventures", "", "4", "3", "2"],
     ];
+    let note = "Rows may not add due to rounding; all values are in percent";
     let mut p = Page::new();
-    grid_hlines_and_frame(&mut p, rows.len());
-    for r in 1..rows.len() {
+    let note_top = row_y(rows.len()).0;
+    let note_bottom = note_top + 60.0;
+    for r in 0..=rows.len() {
+        p.line(X5[0], row_y(r).0, X5[5], row_y(r).0);
+    }
+    p.line(X5[0], note_bottom, X5[5], note_bottom);
+    p.line(X5[0], GRID_TOP, X5[0], note_bottom);
+    p.line(X5[5], GRID_TOP, X5[5], note_bottom);
+    for r in 0..rows.len() {
         let (y0, y1) = row_y(r);
-        for x in [XS[1], XS[2]] {
-            p.line(x, y0, x, y1);
+        for x in &X5[1..5] {
+            p.line(*x, y0, *x, y1);
         }
     }
-    grid_text(
-        &mut p,
-        rows,
-        "RATEMAKING DATA FOR THE PERSONAL AUTO PROGRAM FILING",
-    );
+    for (r, row) in rows.iter().enumerate() {
+        for (c, s) in row.iter().enumerate().filter(|(_, s)| !s.is_empty()) {
+            p.text(X5[c] + 4.0, row_y(r).0 + 15.0, s, false);
+        }
+    }
+    p.text(X5[0] + 4.0, note_top + 15.0, "(1)", false);
+    p.text(X5[1] + 4.0, note_top + 15.0, note, false);
 
     let result = parse(p).await;
     let md = markdown(&result);
     assert!(
-        !md.contains("colspan"),
-        "no merge above the header band:\n{md}"
+        md.contains(&format!("<td>(1)</td>\n<td colspan=\"4\">{note}</td>")),
+        "the note row is one cell:\n{md}"
     );
-    assert!(md.contains("| (1) | Written premium | 20,057 |"), "{md}");
+    for label in ["Europe", "Latin America", "Global Ventures"] {
+        assert!(
+            md.contains(&format!("<td>{label}</td>")),
+            "{label} stays a data row:\n{md}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn folded_header_splits_a_text_run_that_holds_several_column_labels() {
+    // Row 0 has group labels over columns 1-2 and 3-4, without rules between
+    // the grouped columns. Row 1 is the column header. Its four labels are
+    // one text run with normal word spacing, and the narrow columns put each
+    // word in its own column. Helvetica 10pt: "Low" is 18.3pt, "High" is
+    // 20.6pt, and a space is 2.8pt.
+    const X5: [f32; 6] = [57.0, 420.0, 443.7, 467.1, 488.2, 520.0];
+    let mut p = Page::new();
+    let n = 4;
+    for r in 0..=n {
+        p.line(X5[0], row_y(r).0, X5[5], row_y(r).0);
+    }
+    for x in [X5[0], X5[1], X5[3], X5[5]] {
+        p.line(x, GRID_TOP, x, row_y(n).0);
+    }
+    for r in 1..n {
+        let (y0, y1) = row_y(r);
+        for x in [X5[2], X5[4]] {
+            p.line(x, y0, x, y1);
+        }
+    }
+    let baseline = |r: usize| row_y(r).0 + 15.0;
+    p.text(431.0, baseline(0), "Basic", false);
+    p.text(480.0, baseline(0), "Pro", false);
+    p.text(X5[0] + 4.0, baseline(1), "Feature", false);
+    p.text(424.0, baseline(1), "Low High Low High", false);
+    for (r, row) in [
+        ["Storage", "1", "5", "20", "50"],
+        ["Users", "1", "2", "5", "9"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        for (c, s) in row.iter().enumerate() {
+            p.text(X5[c] + 4.0, baseline(r + 2), s, false);
+        }
+    }
+
+    let result = parse(p).await;
+    let md = markdown(&result);
+    assert!(
+        md.contains("| Feature | Basic Low | Basic High | Pro Low | Pro High |"),
+        "each column gets its own label:\n{md}"
+    );
 }

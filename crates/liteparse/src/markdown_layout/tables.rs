@@ -951,23 +951,38 @@ pub(super) fn run_text_kept(run: &TableRun, lines: &[ProjectedLine]) -> Option<f
 /// word from. The classifier skips the span, so these would be dropped. A
 /// line that shares even one word with the table stays with it, so nothing
 /// the table already shows is repeated.
+///
+/// When the cells record their source text items, a line stays with the
+/// table only when a cell holds one of its items. The words alone can be
+/// wrong: a folded header repeats its group label in each column, and a line
+/// below the table with the same word then looks taken.
 pub(super) fn lines_left_out(run: &TableRun, lines: &[ProjectedLine]) -> Vec<usize> {
     let Block::Table { header, rows } = &run.block else {
         return Vec::new();
     };
+    let cells = || {
+        header
+            .iter()
+            .flatten()
+            .chain(rows.iter().flatten())
+            .chain(&run.interstitials)
+    };
     let mut words: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for cell in header
-        .iter()
-        .flatten()
-        .chain(rows.iter().flatten())
-        .chain(&run.interstitials)
-    {
+    for cell in cells() {
         for w in cell.text.split_whitespace() {
             *words.entry(w).or_default() += 1;
         }
     }
+    let items: HashSet<usize> = cells()
+        .flat_map(|c| c.text_item_indices.iter().copied())
+        .collect();
     (run.start..run.end.min(lines.len()))
         .filter(|&i| {
+            let line_items = &lines[i].span_item_indices;
+            if !items.is_empty() && !line_items.is_empty() {
+                return !line_items.iter().any(|item| items.contains(item))
+                    && !lines[i].text.trim().is_empty();
+            }
             let mut taken = false;
             for w in lines[i].text.split_whitespace() {
                 if let Some(n) = words.get_mut(w)
@@ -3756,6 +3771,10 @@ const TABLE_AXIS_TOLERANCE_PT: f32 = 1.0;
 /// from different stroke widths.
 const TABLE_GRID_CLUSTER_PT: f32 = 2.0;
 
+/// A line may go this far past the grid's left or right edge and still be
+/// table text. A line that goes further is part of the text around the grid.
+const GRID_X_SLACK_PT: f32 = 6.0;
+
 /// Slack added when checking whether a V line "crosses" an H line. Helps
 /// when rules don't quite reach the corner because the PDF drew them as
 /// individual segments with small gaps.
@@ -4081,6 +4100,10 @@ struct CellGrid {
     /// Travels with the row/column collapses so the density gate forgives the
     /// empties that are actually here, not ones from a discarded row.
     spanned: Vec<Vec<bool>>,
+    /// Per-cell flag: the cell is in a merged group with drawn rules on both
+    /// sides. See `colspan_mask`. The header fold gives the group's label to
+    /// each column of the group.
+    ruled_group: Vec<Vec<bool>>,
     /// Fraction of raw spans that cross an interior column boundary. Recorded
     /// so `build_ruled_table` can tell whether dropping short vertical rules
     /// actually stopped the grid cutting through text.
@@ -4119,6 +4142,7 @@ impl CellGrid {
             repl: vec![vec![Cell::default(); n_cols]; n_rows],
             row_alpha_spanner: vec![false; n_rows],
             spanned: vec![vec![false; n_cols]; n_rows],
+            ruled_group: vec![vec![false; n_cols]; n_rows],
             straddle_frac: 0.0,
         }
     }
@@ -4153,6 +4177,7 @@ impl CellGrid {
         self.repl = filter_by(std::mem::take(&mut self.repl), keep);
         self.row_alpha_spanner = filter_by(std::mem::take(&mut self.row_alpha_spanner), keep);
         self.spanned = filter_by(std::mem::take(&mut self.spanned), keep);
+        self.ruled_group = filter_by(std::mem::take(&mut self.ruled_group), keep);
     }
 
     /// Keep only columns `c` where `keep[c]`; the per-cell layers filter, the
@@ -4175,6 +4200,10 @@ impl CellGrid {
             .map(|row| filter_by(row, keep))
             .collect();
         self.spanned = std::mem::take(&mut self.spanned)
+            .into_iter()
+            .map(|row| filter_by(row, keep))
+            .collect();
+        self.ruled_group = std::mem::take(&mut self.ruled_group)
             .into_iter()
             .map(|row| filter_by(row, keep))
             .collect();
@@ -4524,19 +4553,25 @@ fn text_flows_across(span: &TextItem, boundary: f32) -> bool {
 /// next to it, and stops at the first cell with text. Thus a spanning row
 /// whose text ends before the last column still spans the full width, but
 /// the growth never joins two cells that hold text.
+///
+/// The second result marks the cells of each merged group that has a drawn
+/// rule (or the grid edge) on its left and on its right, and that does not
+/// span all columns. The rules of such a group show the columns that its
+/// label is for ("Six Liability PMF's" over 4 columns).
 fn colspan_mask(
     raw_vs: &[VSeg],
     lines: &[ProjectedLine],
     xs: &[f32],
     ys: &[f32],
     dbg: bool,
-) -> Vec<Vec<bool>> {
+) -> (Vec<Vec<bool>>, Vec<Vec<bool>>) {
     const STRADDLE_MARGIN_PT: f32 = 3.0;
     let n_rows = ys.len() - 1;
     let n_cols = xs.len() - 1;
     let mut mask = vec![vec![false; n_cols]; n_rows];
+    let mut ruled_group = vec![vec![false; n_cols]; n_rows];
     if n_cols < 2 {
-        return mask;
+        return (mask, ruled_group);
     }
     // The words of each row, for the numeric glue guard below.
     let mut row_words: Vec<Vec<RowWord>> = vec![Vec::new(); n_rows];
@@ -4548,6 +4583,13 @@ fn colspan_mask(
     let mut splits = vec![vec![false; n_cols]; n_rows];
     let mut occupied = vec![vec![false; n_cols]; n_rows];
     for (line_idx, line) in lines.iter().enumerate() {
+        // `assign_cells` skips a line that goes past the grid's left or right
+        // edge, so such a line cannot make a merge either.
+        if line.bbox.x < xs[0] - GRID_X_SLACK_PT
+            || line.bbox.x + line.bbox.width > xs[n_cols] + GRID_X_SLACK_PT
+        {
+            continue;
+        }
         // Per row of this line: the columns it has text in, and the
         // boundaries its text flows across.
         let mut line_occ: Vec<(usize, Vec<bool>, Vec<bool>)> = Vec::new();
@@ -4597,7 +4639,7 @@ fn colspan_mask(
     // Most grids have no text that crosses a boundary. Stop before the rule
     // lookup, because `raw_vs` holds every vertical stroke on the page.
     if !crosses.iter().flatten().any(|c| *c) {
-        return mask;
+        return (mask, ruled_group);
     }
     // Put each vertical segment in the bucket of its nearest interior
     // boundary, in one pass. Segments outside the grid's height are skipped.
@@ -4655,6 +4697,20 @@ fn colspan_mask(
             }
         }
         unmerge_glued_numbers(&mut mask[r], r, xs, &row_words, dbg);
+        let mut head = 0;
+        while head < n_cols {
+            let mut end = head;
+            while end + 1 < n_cols && mask[r][end + 1] {
+                end += 1;
+            }
+            let left = head == 0 || ruled(r, head);
+            let right = end + 1 == n_cols || ruled(r, end + 1);
+            let all_columns = head == 0 && end + 1 == n_cols;
+            if end > head && left && right && !all_columns {
+                ruled_group[r][head..=end].fill(true);
+            }
+            head = end + 1;
+        }
         if dbg {
             let joins: Vec<f32> = (1..n_cols).filter(|&c| mask[r][c]).map(|c| xs[c]).collect();
             eprintln!(
@@ -4664,49 +4720,7 @@ fn colspan_mask(
             );
         }
     }
-    drop_merges_above_header(&mut mask, &occupied, dbg);
-    mask
-}
-
-/// Drop the merges in the rows above a table's header band.
-///
-/// A form often draws its fields and titles in the same grid as the table
-/// below them ("RATEMAKING DATA", "Completed by: ..."). Those rows are not
-/// table rows, and a merge there puts a form field in the place of the
-/// column header. The column header is the first dense row without merges.
-/// Above it, unmerged rows and group-label rows belong to the header band.
-/// The first merged row that is not a group label ends the band: that row
-/// and all rows above it keep no merges, so they read as before
-/// `colspan_mask` existed.
-fn drop_merges_above_header(mask: &mut [Vec<bool>], occupied: &[Vec<bool>], dbg: bool) {
-    let n_rows = mask.len();
-    let Some(n_cols) = mask.first().map(|m| m.len()) else {
-        return;
-    };
-    let merged = |m: &[Vec<bool>], r: usize| m[r].iter().any(|x| *x);
-    let fill = |r: usize| occupied[r].iter().filter(|o| **o).count() as f32 / n_cols as f32;
-    let Some(header) = (0..n_rows).find(|&r| !merged(mask, r) && fill(r) >= TABLE_ROW_MIN_FILL)
-    else {
-        return;
-    };
-    let group_label = |m: &[Vec<bool>], r: usize| {
-        let in_group = |c: usize| m[r][c] || (c + 1 < n_cols && m[r][c + 1]);
-        !m[r][1..].iter().all(|x| *x) && (1..n_cols).all(|c| !occupied[r][c] || in_group(c))
-    };
-    let Some(end) = (0..header)
-        .rev()
-        .find(|&r| merged(mask, r) && !group_label(mask, r))
-    else {
-        return;
-    };
-    for row in mask.iter_mut().take(end + 1) {
-        row.fill(false);
-    }
-    if dbg {
-        eprintln!(
-            "[ruled]   colspan: no merges in rows 0..={end}, above the header band of row {header}"
-        );
-    }
+    (mask, ruled_group)
 }
 
 /// One word of a grid row, for the numeric glue guard.
@@ -4908,7 +4922,6 @@ fn assign_cells(
         c
     };
     let mut consumed_indices: Vec<usize> = Vec::new();
-    const GRID_X_SLACK_PT: f32 = 6.0;
     // Straddle census: spans that cross an interior column boundary by a
     // clear margin on both sides. A real ruled table keeps text inside cells
     // (the occasional PDFium merged run aside); decorative slide/layout boxes
@@ -5197,18 +5210,30 @@ struct HeaderLayout {
     /// The row's text is only in cells that span columns ("North America"
     /// over "Revenue | Units", or "FREQUENCY BANDS" over 8 columns). Such a
     /// row is a header layer, never the dense row that ends the header band.
+    /// A row more than `GROUP_LABEL_MAX_HEIGHT` times the median row height
+    /// holds a paragraph, not a label, so it is not a group-label row.
     group_label: Vec<bool>,
 }
 
+/// See `HeaderLayout::group_label`.
+const GROUP_LABEL_MAX_HEIGHT: f32 = 3.0;
+
 impl HeaderLayout {
-    fn new(cells: &[Vec<Cell>], has_text: &[Vec<bool>]) -> Self {
+    fn new(cells: &[Vec<Cell>], has_text: &[Vec<bool>], row_heights: &[f32]) -> Self {
         let mut fill = Vec::with_capacity(cells.len());
         let mut group_label = Vec::with_capacity(cells.len());
-        for (row, has) in cells.iter().zip(has_text) {
+        let mut sorted = row_heights.to_vec();
+        sorted.sort_by(f32::total_cmp);
+        let max_height = sorted
+            .get(sorted.len() / 2)
+            .map_or(f32::INFINITY, |m| m * GROUP_LABEL_MAX_HEIGHT);
+        for (r, (row, has)) in cells.iter().zip(has_text).enumerate() {
             let n_cols = row.len().max(1);
             let spans_next = |c: usize| row.get(c + 1).is_some_and(|n| n.covered);
             let text_cols: Vec<usize> = (0..row.len()).filter(|&c| has[c]).collect();
-            let label = !text_cols.is_empty() && text_cols.iter().all(|&c| spans_next(c));
+            let label = !text_cols.is_empty()
+                && text_cols.iter().all(|&c| spans_next(c))
+                && row_heights.get(r).is_none_or(|h| *h <= max_height);
             let mut head_has_text = false;
             let mut filled = 0usize;
             for (c, cell) in row.iter().enumerate() {
@@ -5243,6 +5268,7 @@ fn flatten_header_band(
     cell_has_text: &[Vec<bool>],
     cells_repl: &[Vec<Cell>],
     row_alpha_spanner: &[bool],
+    ruled_group: &[Vec<bool>],
     layout: &HeaderLayout,
     n_rows: usize,
     n_cols: usize,
@@ -5274,13 +5300,35 @@ fn flatten_header_band(
             // Text comes from the colspan-replicated grid, but geometry comes
             // from the real cell grid: the flattened header cell covers every
             // band row 0..=b it was folded from.
+            // - A cell in a ruled group gives the label of its group to each
+            //   column of the group. The rules show the span of the label, and
+            //   the text can cover fewer columns ("Six Liability PMF's").
+            // - Row `b` is the dense bottom layer. Where it has no merged
+            //   cell, its text comes from the split grid, because one text
+            //   run can hold the labels of several columns ("Starter Growth
+            //   Scale").
+            let label = |r: usize, c: usize| -> &Cell {
+                let row = &cells[r];
+                let in_merge = row[c].covered || row.get(c + 1).is_some_and(|n| n.covered);
+                if ruled_group[r][c] {
+                    let mut head = c;
+                    while head > 0 && row[head].covered {
+                        head -= 1;
+                    }
+                    &row[head]
+                } else if r == b && !in_merge {
+                    &row[c]
+                } else {
+                    &cells_repl[r][c]
+                }
+            };
             let header: Vec<Cell> = (0..n_cols)
                 .map(|c| {
                     let mut parts: Vec<&str> = Vec::new();
                     let mut text_item_indices = Vec::new();
-                    for row in cells_repl.iter().take(b + 1) {
-                        let s = row[c].as_str();
-                        text_item_indices.extend_from_slice(&row[c].text_item_indices);
+                    for cell in (0..=b).map(|r| label(r, c)) {
+                        let s = cell.as_str();
+                        text_item_indices.extend_from_slice(&cell.text_item_indices);
                         if s.is_empty() || parts.last() == Some(&s) {
                             continue;
                         }
@@ -5335,6 +5383,9 @@ fn merge_stacked_header(
     let k = (0..n_rows)
         .find(|&r| layout.fill[r] >= TABLE_ROW_MIN_FILL)
         .unwrap_or(0);
+    // A data row has a value in each column. A row with a merged cell is a
+    // note or section row, so it does not show where the data starts.
+    let anchor_merged = k < n_rows && cells[k].iter().any(|cell| cell.covered);
     let union_cols = (0..n_cols)
         .filter(|c| (0..k).any(|r| cell_has_text[r][*c]))
         .count();
@@ -5356,7 +5407,12 @@ fn merge_stacked_header(
     } else {
         false
     };
-    if flattened || k < 2 || k >= n_rows || !band_tight || (union_cols as f32) < 0.7 * n_cols as f32
+    if flattened
+        || k < 2
+        || k >= n_rows
+        || anchor_merged
+        || !band_tight
+        || (union_cols as f32) < 0.7 * n_cols as f32
     {
         return (cells, cell_has_text, cell_is_bold, n_rows, false);
     }
@@ -5921,7 +5977,7 @@ fn build_ruled_table_from(
     // Assign text to cells, then reject if no lines landed inside the grid or
     // too many spans straddle interior column boundaries (decorative box, not
     // a table).
-    let merged = colspan_mask(raw_vs, lines, &xs, &ys, dbg);
+    let (merged, ruled_group) = colspan_mask(raw_vs, lines, &xs, &ys, dbg);
     // The merges must not change which grids become tables. The build
     // without merges decides that, the same as before `colspan_mask`
     // existed. The merges only change how an accepted table reads, so the
@@ -5931,6 +5987,9 @@ fn build_ruled_table_from(
         |merged: &[Vec<bool>], check_density: bool| -> Option<(TableRun, Vec<usize>, f32)> {
             let (mut grid, consumed_indices) =
                 assign_cells(lines, &xs, &ys, merged, pass == RuledPass::Global, dbg)?;
+            if !merged.is_empty() {
+                grid.ruled_group = ruled_group.clone();
+            }
             let straddle_frac = grid.straddle_frac;
             grid.spanned = rowspan_mask(hs, h_indices, vs, v_kept, &xs, &ys);
 
@@ -5967,15 +6026,17 @@ fn build_ruled_table_from(
                 repl: cells_repl,
                 row_alpha_spanner,
                 spanned,
+                ruled_group,
                 straddle_frac: _,
             } = grid;
 
-            let layout = HeaderLayout::new(&cells, &cell_has_text);
+            let layout = HeaderLayout::new(&cells, &cell_has_text, &kept_row_heights);
             let flattened_header = flatten_header_band(
                 &cells,
                 &cell_has_text,
                 &cells_repl,
                 &row_alpha_spanner,
+                &ruled_group,
                 &layout,
                 n_rows,
                 n_cols,
