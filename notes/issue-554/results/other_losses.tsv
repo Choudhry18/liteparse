@@ -1,0 +1,21 @@
+fillable_forms/740-2025__p3	forms_v2 0.850->0.760; forms_v2_empty 0.983->0.958
+forms/filled__canada--07_ISP1000--p5__typed	forms_v2_empty 0.822->0.622
+forms/filled__canada--23_ISP-1300--p5__typed	forms_v2 0.723->0.696; forms_v2_filled 0.891->0.818
+forms/filled__canada--30_ISP-1002--p1__typed	forms_v2_checkboxes 0.650->0.593
+forms/filled__canada--30_ISP-1002--p3__typed	forms_v2 0.520->0.500; forms_v2_filled 0.650->0.450
+forms/filled__canada--36_ISP-3010--p4__typed	forms_v2_signatures 0.750->0.500
+forms/filled__canada--37_ISP-1610--p1__typed	forms_v2_checkboxes 0.857->0.786
+forms/filled__ireland--02_Form12--p13__typed	forms_v2_empty 0.800->0.731
+forms/filled__ireland--02_Form12--p7__typed	forms_v2 0.618->0.500; forms_v2_empty 0.800->0.795
+forms/filled__mexico--09_SAT_Forma37--p3__typed	forms_v2_empty 0.729->0.712
+forms/filled__singapore--02_FormV39A--p1__typed	forms_v2 0.632->0.606; forms_v2_filled 0.600->0.558
+forms/filled__uk--20_PA1P--p1__typed	forms_v2 0.975->0.920; forms_v2_filled 1.000->0.960; forms_v2_checkboxes 0.943->0.871
+forms/filled__uk--30_SF200--p16__typed	forms_v2 0.664->0.583; forms_v2_filled 0.867->0.600
+forms/filled__us--18_8822--p1__typed	forms_v2_empty 0.926->0.853; forms_v2_checkboxes 0.867->0.700
+forms/filled__us--50_I-912--p8__typed	forms_v2 0.650->0.640
+layout/annotated__clinical-trial-results-ebc_p3	layout_grounding_pass_rate 0.580->0.555
+layout/annotated__integrated-annual-report-2023-24_p32	layout_grounding_pass_rate 0.178->0.160
+text/text_dense__livingWord	text_next 0.495->0.448; text_next_integrity 0.859->0.858
+text/text_multicolumns__article	text_next_order 0.638->0.637
+text/text_multicolumns__lotofcol	text_next 0.714->0.700
+text/text_multilang__french2	text_next_integrity 0.963->0.956; text_next_order 0.583->0.583

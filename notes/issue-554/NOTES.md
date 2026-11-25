@@ -2,11 +2,12 @@
 
 Work notes for https://github.com/run-llama/liteparse/issues/554.
 Branch: `fix/ruled-colspan-missing-vrule`, based on upstream `main` at `a684a4a` (v2.20.0).
-The code on the branch is **v11** (section 6 gives the history).
+The code on the branch is **v17** (section 6 gives the history). v17 is v10 plus regression
+fixes. The v11 rule (6b) is reverted, because it fixed pages that `main` also parsed wrongly.
 
-**Read this before you build on v11.** v11 gives up a large part of the v10 gains to fix pages
-that `main` also parsed wrongly. v10 has the higher average score (section 5). To return to v10,
-revert the v11 commit (`git log` shows it as "drop merges above the table's header band").
+**Scope.** This branch fixes issue 554 and the regressions that the fix causes. Problems that
+`main` also has are for later pull requests (section 8), for example boxes above a table that
+the grid pulls in.
 A persistent worktree for this branch is at `~/Desktop/Choudhry/liteparse-554`. Do not work
 in `/tmp`: macOS deletes files there that are older than 3 days.
 
@@ -65,13 +66,12 @@ For each row and each interior boundary `xs[c]`:
    number only as a digit-group pair: the gap is at most half the font size, the left part
    ends in 1 to 3 digits, and the right part is exactly 3 digits ("10 000"). The words come
    from the word boxes, or from the span split at whitespace.
-6b. **No merges above the header band** (`drop_merges_above_header`, v11). The column header
-   is the first row without merges that fills at least 90% of the columns. From that row up,
-   unmerged rows and group-label rows belong to the header band. The first merged row that is
-   not a group label ends the band. That row and all rows above it keep no merges, so they read
-   the same as on `main`. **Weakness:** a header that leaves the row-label columns empty does
-   not fill 90% of the columns. Then the rule finds the header too far down, and it drops
-   correct merges in body rows (section 5).
+6b. (v11 only, reverted in v12.) No merges above the header band.
+6c. **Lines outside the grid** (v17). A line that goes more than `GRID_X_SLACK_PT` (6pt) past
+   the grid's left or right edge makes no merge. `assign_cells` skips such a line, so before
+   v17 its row got an empty merged cell.
+6d. **Ruled groups** (v16). `colspan_mask` also marks each merged group that has a drawn rule or
+   the grid edge on its left and right, and that does not span all columns.
 
 Performance: the function stops early when no text crosses a boundary. It puts each raw
 segment in the bucket of its nearest boundary, in one pass. It checks only rows with a
@@ -96,6 +96,23 @@ crossing.
     row. A covered cell counts as filled when its group holds text. A row whose text is only in
     spanning cells is a group-label row. Its fill is 0, so it never ends the header band.
 12. `merge_stacked_header` does not apply its height test to group-label rows.
+12a. (v13) `merge_stacked_header` does not fold when its anchor row (the first dense row) has a
+    merged cell. A merged note row is not a data row. Before, a note row at the bottom of a
+    table made all the data rows above it into one header row (`Coca Cola 10-k_page48`).
+12b. (v14) In `flatten_header_band`, the bottom row of the band gives the split cells, not the
+    `repl` cells, where it has no merged cell. One text run can hold the labels of several
+    columns ("Starter Growth Scale"), and `repl` copied the full run into each column
+    (`dense_table_074`).
+12c. (v16) In `flatten_header_band`, a cell of a ruled group (rule 6d) gives its group's label
+    to each column of the group. The label text can cover fewer columns than its rules
+    ("Six Liability PMF's" over 4 columns, `SERFF_TX page847`).
+12d. (v17) A row is a group-label row only when its height is at most 3 times the median row
+    height (`GROUP_LABEL_MAX_HEIGHT`). A taller row holds a paragraph. Before, cover-page text
+    in a grid was folded into each column header (`Kimco ... page11`).
+12e. (v17) `lines_left_out` uses the source text items of the cells when they have them. A
+    line stays with the table only when a cell holds one of its items. Before, a folded header
+    that repeats "Premium" made a line below with the same word look taken, and the line was
+    lost (`4ef83fb72676cd65_p5`).
 
 ### Output: `blocks.rs` and `layout.rs`
 
@@ -115,8 +132,9 @@ crossing.
 
 ### Tests: `tests/ruled_colspan.rs`
 
-There are 11 tests with synthetic PDFs. The 11th (v11) is a form title above the column
-header (rule 6b). They cover: section rows in four drawing styles, the
+There are 12 tests with synthetic PDFs. The v11 test was removed with rule 6b. Two tests are
+from v13 and v14, and each fails without its fix: a merged note row under sparse data rows
+(rule 12a), and a header text run over narrow columns (rule 12b). The others cover: section rows in four drawing styles, the
 issue frame, a partial merge, dividers in the header only, a text run across a drawn rule, a
 joined run with a column gap, a spanning label next to separate values, a spanning label next
 to a footnote marker, a repeated group header (rules 16 and 17), and right-aligned numbers
@@ -265,6 +283,74 @@ pages that `main` also parsed wrongly:
   the body rows ("Countrywide direct earned premium for lines of business subject to
   Proposition 103 ($):" over 4 columns), and these rows are cut into pieces again.
 
+### v12 to v17: regression fixes on v10 (2026-11-25, `results/compare_v17.txt`)
+
+For each page that scores lower than `main`, a rendered image of the page was compared with
+both outputs. A subagent did 18 of these pages, and the main session did the others. The fixes
+are rules 6c, 6d and 12a to 12e.
+
+| | main | v10 | **v17** |
+|---|---|---|---|
+| Held-out Tables (4 subsets, equal weight) | 0.2879 | 0.2968 | **0.2988** |
+| Per-page change vs main, held out | | +0.0104 | **+0.0129** |
+| 95% CI | | [+0.0050, +0.0157] | [+0.0075, +0.0186] |
+| Pages better / worse, held out | | 102 / 26 | 108 / 24 |
+| In-sample `tables` subset | 0.4310 | 0.4453 | **0.4495** |
+| In-sample pages better / worse | | 41 / 9 | 47 / 5 |
+
+Versions that did not stay:
+- **v12** took the header fill from the cell placement without merges. It fixed Coca Cola,
+  but it lost the v10 header folds on 4 pages (`150bc31d9c681a52_p10`: 0.59 to 0). v13
+  replaced it with rule 12a.
+- **v15** gave a merged label to all columns of its merged group. It fixed `SERFF_TX page847`,
+  but a group that grew into empty cells is wider than its label (`dense_table_233`: 0.77 to
+  0.53). v16 replaced it with rule 12c, which uses only groups with drawn rules on both sides.
+
+**Image check of the losses that remain** (v13 output, the same on v17 unless noted):
+- **The branch reads the page better, and the scorer gives a lower score (13 pages).** Examples:
+  - `dense_table_289` and `290`: the scorer cannot split the HTML table of 3 side-by-side tax
+    tables. It splits the `main` pipe table and reports 178 rows as missing on the branch.
+  - `dense_table_041`: the same side-by-side problem. Both outputs have the 3 tables merged.
+  - `dense_table_304` and `344`: the county cells are whole.
+  - `currency-2026-08-13_page1`: the US $ and Yen rows are in reading order. `main`
+    interleaves the words of two lines.
+  - `64a4c79de95f6871_p8`: the group headers "Coverage: Bodily Injury" and "Coverage: Property
+    Damage" each span 3 columns. This agrees with the image.
+  - `SERFF_TX page706`, `test_page1`: the title becomes one `<th>` row. The data is identical.
+  - `dense_table_313` (v16): "Component A" to "Component M" agrees with the image.
+- **Neutral:** `51abb0b9601cd8df_p9` (5 tables are now 1 HTML table, and the section rows are
+  whole), `sampo` (the row labels are whole, but the title takes the Q3/2024 header cell),
+  `1 timetable (1)_page27` (one title bar "Sundays ... to Manhattan" over all columns; neither
+  version reads it as a title), `b4dd261dd192264f_p10` (title box above the table).
+- **Real regression that stays:** `dense_table_443` (0.001 to 0). The page has tracked changes
+  and comment marks on the table. The header fold moves 4 rows out of the body. Then
+  `merge_continuation_rows` passes its "half of the rows have a first cell" test, and it joins
+  separate rows. Also, "2 2/3*" share a cell across a rule that a comment connector hides.
+- **Boxes above the table** (`010b43388a0c67b0_p8` and others): this is a `main` bug. See
+  section 8, item 1.
+
+### The other ParseBench-2 subsets (2026-11-25, `results/compare_other.txt`)
+
+The markdown changes on 206 pages outside the table subsets.
+
+| Subset | Metric | Change vs main, per page | Better / worse |
+|---|---|---|---|
+| forms (500) | `forms_v2` | +0.0092 [+0.0059, +0.0129] | 50 / 7 |
+| fillable_forms (100) | `forms_v2` | +0.0039 [+0.0001, +0.0082] | 10 / 1 |
+| text (508) | `text_next` | +0.0005 | 4 / 2 |
+| charts, layout, headings, strikeout, underline | | about 0 | |
+
+21 pages score lower on some metric. A check against the page images gave this result:
+- **10 pages: the branch reads better.** The scorer reads leftover text in a caption cell that is
+  now whole as an "invented value" (for example REFUND on `740-2025__p3`).
+- **2 pages: neutral** (`singapore--02_FormV39A--p1`, `clinical-trial-results-ebc_p3`).
+- **8 pages: broken on `main` too, broken in a different way on the branch.** These are out of
+  scope. They are `main` bugs in form grids, for a later pull request (section 8, item 14).
+- **1 page where `main` is right and the branch is wrong:** `canada--37_ISP-1610--p1`.
+  `main` gives `Is this your first request? Yes ✓ | No ...`. On the branch, the table ends
+  before that row, the row prints as text, and the ✓ moves to the line "date of first request".
+  This is out of scope for this pull request (section 8, item 15).
+
 ## 6. Version history
 
 - **v1.** This was the first merge rule. The density gate excused covered cells, and the JSON used
@@ -297,6 +383,8 @@ pages that `main` also parsed wrongly:
 - **v11.** This is v10 plus rule 6b: no merges above the header band. It has fewer and smaller
   losses, but it gives up many gains (section 5). v11 does not cut rows from the table, so the
   affected rows read the same as on `main`.
+- **v12 to v17.** v11 is reverted. These versions fix regressions that the merges cause
+  (section 5). v17 has the best score.
 
 ## 7. The issue PDFs on the branch
 
@@ -308,22 +396,16 @@ pages that `main` also parsed wrongly:
 
 ## 8. Open items, by priority
 
-1. **Form fields above a table inside the grid** (`010b43388a0c67b0_p8`: 0.79 in `main`, 0 in
-   v10, 0.79 in v11). The form shares the table's grid, so the rows above the real header
-   ("RATEMAKING DATA", "Completed by: ...") are table rows. In v10, the merges make them
-   spanning cells at the top, and the real header becomes a body row. `main` also did not read
-   these rows: it cut them into pieces, but the scorer skips the pieces. Two attempts failed:
-   - The v9 form-band cut cut real rows on other pages (section 6).
-   - v11 (rule 6b) drops merges above the header, but it finds the header with a 90% fill test.
-     That test fails on headers with empty row-label columns, so v11 also drops correct body
-     merges (section 5).
-
-   **Next idea (1b):** find the form band from the top down, not by a search for the header.
-   From row 0, drop merges only while the rows look like form content: full-width titles,
-   label-and-value rows, empty rows. Stop at the first group-label row, or at the first row
-   that has the column structure of the table body. This keeps body rows safe, because the
-   walk stops before them. Another idea is to split the grid where the set of drawn vertical
-   rules changes, because form fields usually have their own boxes.
+1. **Boxes above a table join the grid (a `main` bug, for a later pull request).** Small boxes
+   above a table (the grey "CDI File #" box, an input box) have an edge at the same x as the
+   table's border. `cluster_v_segments` joins all vertical segments at one x into one line,
+   across any gap. `split_component_at_grid_gaps` finds the cut, but it keeps the grid whole
+   when one part has fewer than 3 horizontal lines, and a box has 2. Then the title and the
+   form text between the box and the table become table rows. 155 of 1,753 table pages have a
+   cancelled cut, 90 of them with the small part above the table (`vgap_classify.py`,
+   `results/vgap_classified.txt`). Fix: when the small part is at the top or bottom edge of the
+   grid, remove it and keep the cut. `1fea2f2540c835bf_p1` is a related case with a gap of
+   only 10pt, below the 30pt minimum.
 2. **Side-by-side tables in one grid** (`dense_table_289`, `dense_table_290`: 0.93 to 0). The
    output is more faithful, but the HTML form stops the scorer from splitting the two tables.
 3. **Text glued across a gap** (`dense_table_041`, `currency-2026-08-13_page1`). Rule 6a looks
@@ -343,7 +425,24 @@ pages that `main` also parsed wrongly:
 10. Add tests for side-by-side tables and for form text above a table.
 11. Do an independent check on documents that no version used, because the v8 to v11
     decisions used ParseBench-2.
-12. Decide between v10 and v11 before the pull request, or replace rule 6b with idea 1b.
+12. `dense_table_443`: see section 5. `merge_continuation_rows` uses a row count, and the
+    header fold changes the count.
+13. `sampo`: a title in the header row takes the cell of the Q3/2024 column label.
+14. **Form grids, broken on `main` and on the branch (out of scope).** The pages are
+    `canada--30_ISP-1002--p1` and `--p3`, `canada--23_ISP-1300--p5`, `us--18_8822--p1`,
+    `us--50_I-912--p8`, `uk--20_PA1P--p1` and `text_dense__livingWord`. The causes on the branch:
+    - A form draws its own box edges at x positions that are not grid boundaries. The span test
+      looks only for a rule at the grid boundary, so a span can cross a drawn edge (2A and 2B in
+      one cell, and then all captions before all marks).
+    - A merged cell that holds two text columns is read line by line, so the two columns mix
+      (the 22A date inside the note, the Adoration times).
+    - The header fold copies a title or note into 2 or 3 header cells, and it can pull in a data
+      row or a title above the box.
+    - Header text without rules is cut at every column boundary (8822 items 1 and 2, I-912).
+    Possible fix: no span when a raw vertical rule lies inside the merged cell's x-range in that
+    row.
+15. **`canada--37_ISP-1610--p1` (out of scope):** the table ends at a different row on the
+    branch, and the ✓ leaves "Yes". The cause is not known yet.
 
 ## 9. How to continue
 
